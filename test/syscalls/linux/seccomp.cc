@@ -599,7 +599,7 @@ TEST(SeccompTest, SeccompValidatesAllFilterFlags) {
   if (ret > 0) {
     close(ret);
   }
-  // LINT.ThenChange(../../../runsc/specutils/seccomp/seccomp.go)
+  // LINT.ThenChange(../../../runsc/specutils/seccomp.go)
 }
 
 }  // namespace
