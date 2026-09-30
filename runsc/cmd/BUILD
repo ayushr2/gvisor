@@ -67,7 +67,7 @@ go_library(
         "//pkg/sentry/control",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/platform",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/state/pretty",
         "//pkg/state/statefile",
         "//pkg/unet",
