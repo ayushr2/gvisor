@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -7,9 +7,31 @@ package(
 
 go_library(
     name = "api",
-    srcs = ["fs.go"],
+    srcs = [
+        "cgroups.go",
+        "fs.go",
+        "logging.go",
+        "metrics.go",
+        "pprof.go",
+        "proc.go",
+        "state.go",
+        "usage.go",
+    ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/log",
+        "//pkg/metric:metric_go_proto",
+        "//pkg/prometheus",
+        "//pkg/sentry/checkpoint",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sync",
         "//pkg/urpc",
     ],
+)
+
+go_test(
+    name = "api_test",
+    size = "small",
+    srcs = ["proc_test.go"],
+    library = ":api",
 )
