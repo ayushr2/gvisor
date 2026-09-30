@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -102,7 +103,7 @@ func (l *Loader) FSSave() error {
 	if err != nil {
 		return err
 	}
-	args := FSSaveArgs{
+	args := bootapi.FSSaveArgs{
 		ExitAfterSaving: !specutils.AnnotationToBool(l.root.spec, annotationFSCheckpointResume),
 		Paths:           paths,
 	}
@@ -150,7 +151,7 @@ func ParseFSCheckpointPaths(val string) ([]checkpoint.ResourceID, error) {
 	return paths, nil
 }
 
-func convertToKernelFSSaveOpts(args *FSSaveArgs) (kernel.FSSaveOpts, error) {
+func convertToKernelFSSaveOpts(args *bootapi.FSSaveArgs) (kernel.FSSaveOpts, error) {
 	opts := kernel.FSSaveOpts{
 		RunscVersion:    version.Version(),
 		ExitAfterSaving: args.ExitAfterSaving,
@@ -162,14 +163,14 @@ func convertToKernelFSSaveOpts(args *FSSaveArgs) (kernel.FSSaveOpts, error) {
 	return opts, nil
 }
 
-func setKernelFSSaveOptsFiles(args *FSSaveArgs, opts *kernel.FSSaveOpts) error {
+func setKernelFSSaveOptsFiles(args *bootapi.FSSaveArgs, opts *kernel.FSSaveOpts) error {
 	if args.UseCheckpointGofer {
 		return setKernelFSSaveOptsFilesForCheckpointGofer(args, opts)
 	}
 	return setKernelFSSaveOptsFilesForLocalCheckpoint(args, opts)
 }
 
-func setKernelFSSaveOptsFilesForLocalCheckpoint(args *FSSaveArgs, opts *kernel.FSSaveOpts) error {
+func setKernelFSSaveOptsFilesForLocalCheckpoint(args *bootapi.FSSaveArgs, opts *kernel.FSSaveOpts) error {
 	if len(args.FilePayload.Files) != 4 {
 		return fmt.Errorf("got %d files, want 4", len(args.FilePayload.Files))
 	}
@@ -196,7 +197,7 @@ func setKernelFSSaveOptsFilesForLocalCheckpoint(args *FSSaveArgs, opts *kernel.F
 	return nil
 }
 
-func setKernelFSSaveOptsFilesForCheckpointGofer(args *FSSaveArgs, opts *kernel.FSSaveOpts) error {
+func setKernelFSSaveOptsFilesForCheckpointGofer(args *bootapi.FSSaveArgs, opts *kernel.FSSaveOpts) error {
 	clientFD, err := unix.Dup(int(args.Files[0].Fd()))
 	if err != nil {
 		return fmt.Errorf("failed to dup checkpoint gofer client FD: %w", err)

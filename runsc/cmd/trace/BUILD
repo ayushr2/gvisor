@@ -21,7 +21,7 @@ go_library(
     deps = [
         "//pkg/log",
         "//pkg/sentry/seccheck",
-        "//runsc/boot",
+        "//runsc/boot/bootapi",
         "//runsc/cmd/util",
         "//runsc/config",
         "//runsc/container",
@@ -39,6 +39,6 @@ go_test(
     deps = [
         "//pkg/sentry/seccheck",
         "//pkg/test/testutil",
-        "//runsc/boot",
+        "//runsc/boot/bootapi",
     ],
 )
