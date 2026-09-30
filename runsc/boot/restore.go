@@ -63,74 +63,8 @@ const (
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
 
-	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
-
-	// annotationCheckpointPath is the path to the directory where the checkpoint files will be
-	// created. When present, it allows for the workload running inside to trigger a checkpoint
-	// without having to use the runsc CLI.
-	annotationCheckpointPath = annotationCheckpointPrefix + "path"
-
-	// annotationCheckpointResume indicates whether the sandbox should continue running after the
-	// checkpoint. Optional, defaults to false.
-	annotationCheckpointResume = annotationCheckpointPrefix + "resume"
-
-	// annotationCheckpointCompression is the compression to use for the checkpoint file. Optional,
-	// defaults to best speed compression.
-	annotationCheckpointCompression = annotationCheckpointPrefix + "compression"
-
-	// annotationCheckpointDirect indicates whether the checkpoint IOs should use O_DIRECT. Optional,
-	// defaults to false.
-	annotationCheckpointDirect = annotationCheckpointPrefix + "direct"
-
-	// annotationCheckpointExcludeCommittedZeroPages indicates whether the checkpoint should exclude
-	// committed zero pages. Optional, defaults to false.
-	annotationCheckpointExcludeCommittedZeroPages = annotationCheckpointPrefix + "exclude-committed-zero-pages"
-
-	// annotationCheckpointCudaCheckpointPath is the path to the cuda-checkpoint binary. It's required
-	// if the workload has CUDA processes.
-	annotationCheckpointCudaCheckpointPath = annotationCheckpointPrefix + "cuda-checkpoint-path"
-
-	// annotationCheckpointCudaCheckpointSequential indicates whether cuda-checkpoint should be run
-	// sequentially. Optional, defaults to false.
-	annotationCheckpointCudaCheckpointSequential = annotationCheckpointPrefix + "cuda-checkpoint-sequential"
-
-	// annotationCheckpointEnable indicates whether files under /proc/gvisor should be present in
-	// the container to allow the workload to trigger a checkpoint.
-	annotationCheckpointEnable = annotationCheckpointPrefix + "enable"
-
-	// annotationSaveRestoreExecArgv is the argv to use for the save/restore exec
-	// binary.
-	annotationSaveRestoreExecArgv = annotationCheckpointPrefix + "save-restore-exec-argv"
-
-	// annotationSaveRestoreExecTimeout is the timeout to use for the save/restore
-	// exec binary.
-	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
-
 	networkKey = "network"
 )
-
-// GetAnnotationCheckpointPath returns the checkpoint path specified in the
-// container annotation. Return empty string if no annotation is specified.
-func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string, error) {
-	path := spec.Annotations[annotationCheckpointPath]
-	if len(path) != 0 {
-		if len(conf.TestOnlyAutosaveImagePath) != 0 {
-			return "", fmt.Errorf("autosave is not supported with %q annotation", annotationCheckpointPath)
-		}
-	}
-	return path, nil
-}
-
-// GetAnnotationCheckpointCompression returns the checkpoint compression level
-// specified in the container annotation.
-func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
-	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
-}
-
-// GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
-func GetAnnotationCheckpointDirect(spec *specs.Spec) bool {
-	return specutils.AnnotationToBool(spec, annotationCheckpointDirect)
-}
 
 // SaveAsync starts a goroutine to save the kernel. Implements kernel.Saver.
 func (l *Loader) SaveAsync() (err error) {
@@ -182,22 +116,22 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 		}
 	}
 
-	comp, err := GetAnnotationCheckpointCompression(spec)
+	comp, err := bootapi.GetAnnotationCheckpointCompression(spec)
 	if err != nil {
 		return nil, err
 	}
 
 	saveOpts := &control.SaveOpts{
-		AppMFExcludeCommittedZeroPages: specutils.AnnotationToBool(spec, annotationCheckpointExcludeCommittedZeroPages),
+		AppMFExcludeCommittedZeroPages: specutils.AnnotationToBool(spec, bootapi.AnnotationCheckpointExcludeCommittedZeroPages),
 		FilePayload: urpc.FilePayload{
 			Files: files,
 		},
 		Metadata:                 comp.ToMetadata(),
 		HavePagesFile:            len(files) > 1,
-		Resume:                   specutils.AnnotationToBool(spec, annotationCheckpointResume),
-		CudaCheckpointSequential: specutils.AnnotationToBool(spec, annotationCheckpointCudaCheckpointSequential),
+		Resume:                   specutils.AnnotationToBool(spec, bootapi.AnnotationCheckpointResume),
+		CudaCheckpointSequential: specutils.AnnotationToBool(spec, bootapi.AnnotationCheckpointCudaCheckpointSequential),
 	}
-	if cudaPath, ok := spec.Annotations[annotationCheckpointCudaCheckpointPath]; ok {
+	if cudaPath, ok := spec.Annotations[bootapi.AnnotationCheckpointCudaCheckpointPath]; ok {
 		saveOpts.CudaCheckpointPath = cudaPath
 	}
 	if useCheckpointGofer {
@@ -207,16 +141,16 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 		}
 	}
 
-	if spec.Annotations[annotationSaveRestoreExecArgv] != "" {
+	if spec.Annotations[bootapi.AnnotationSaveRestoreExecArgv] != "" {
 		saveRestoreExecTimeout := control.DefaultSaveRestoreExecTimeout
-		if spec.Annotations[annotationSaveRestoreExecTimeout] != "" {
-			saveRestoreExecTimeout, err = time2.ParseDuration(spec.Annotations[annotationSaveRestoreExecTimeout])
+		if spec.Annotations[bootapi.AnnotationSaveRestoreExecTimeout] != "" {
+			saveRestoreExecTimeout, err = time2.ParseDuration(spec.Annotations[bootapi.AnnotationSaveRestoreExecTimeout])
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse save-restore-exec-timeout: %w", err)
 			}
 		}
 		saveOpts.ExecOpts = control.SaveRestoreExecOpts{
-			Argv:    spec.Annotations[annotationSaveRestoreExecArgv],
+			Argv:    spec.Annotations[bootapi.AnnotationSaveRestoreExecArgv],
 			Timeout: saveRestoreExecTimeout,
 		}
 	}
@@ -227,8 +161,8 @@ func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalDa
 	return &proc.InternalData{
 		GVisorMarkerFile:    conf.GVisorMarkerFile,
 		OverrideProcs:       procFiles(conf),
-		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, annotationCheckpointEnable),
-		FSCheckpointEnabled: specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, bootapi.AnnotationCheckpointEnable),
+		FSCheckpointEnabled: specutils.AnnotationToBool(spec, bootapi.AnnotationFSCheckpointEnable),
 	}
 }
 

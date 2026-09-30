@@ -50,14 +50,12 @@ import (
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/cgroup"
@@ -209,7 +207,7 @@ type Sandbox struct {
 
 	// MountHints provides extra information about container mounts that apply
 	// to the entire pod.
-	MountHints *boot.PodMountHints `json:"mountHints"`
+	MountHints *bootapi.PodMountHints `json:"mountHints"`
 
 	// FSRestore indicates whether filesystem restore files were donated to the
 	// sandbox during creation.
@@ -301,7 +299,7 @@ type Args struct {
 
 	// MountHints provides extra information about containers mounts that apply
 	// to the entire pod.
-	MountHints *boot.PodMountHints
+	MountHints *bootapi.PodMountHints
 
 	// MountsFile is a file container mount information from the spec. It's
 	// equivalent to the mounts from the spec, except that all paths have been
@@ -2167,7 +2165,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 }
 
 func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
-	path, err := boot.GetAnnotationCheckpointPath(conf, args.Spec)
+	path, err := bootapi.GetAnnotationCheckpointPath(conf, args.Spec)
 	if err != nil {
 		return err
 	}
@@ -2176,11 +2174,11 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 		return nil
 	}
 
-	comp, err := boot.GetAnnotationCheckpointCompression(args.Spec)
+	comp, err := bootapi.GetAnnotationCheckpointCompression(args.Spec)
 	if err != nil {
 		return err
 	}
-	direct := boot.GetAnnotationCheckpointDirect(args.Spec)
+	direct := bootapi.GetAnnotationCheckpointDirect(args.Spec)
 
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-checkpoint-writes")
 	if err != nil {
@@ -2202,7 +2200,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 }
 
 func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
-	path := boot.GetAnnotationFSCheckpointPath(args.Spec)
+	path := bootapi.GetAnnotationFSCheckpointPath(args.Spec)
 	if len(path) == 0 {
 		return nil
 	}
@@ -2216,7 +2214,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 		cmd.Args = append(cmd.Args, "-fs-save-checkpoint-gofer")
 		log.Infof("Enabling workload-trigger filesystem checkpoint saving to GCS via checkpoint gofer")
 	} else {
-		files, err := openFSCheckpointLocalFiles(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, boot.GetAnnotationFSCheckpointDirect(args.Spec))
+		files, err := openFSCheckpointLocalFiles(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, bootapi.GetAnnotationFSCheckpointDirect(args.Spec))
 		if err != nil {
 			return fmt.Errorf("failed to create auto fs save files: %w", err)
 		}
@@ -2759,7 +2757,7 @@ func SetUserMappings(spec *specs.Spec, pid int) error {
 func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 	var files []*os.File
 	switch fstype {
-	case erofs.Name:
+	case bootapi.Erofs:
 		if imageFile, err := os.Open(src); err != nil {
 			return fmt.Errorf("opening %s: %v", src, err)
 		} else {
