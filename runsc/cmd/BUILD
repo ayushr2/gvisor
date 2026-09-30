@@ -57,6 +57,7 @@ go_library(
     visibility = ["//runsc:__subpackages__"],
     deps = [
         "//pkg/cleanup",
+        "//pkg/control/api",
         "//pkg/coverage",
         "//pkg/cpuid",
         "//pkg/lisafs",
@@ -64,7 +65,6 @@ go_library(
         "//pkg/metric",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",
-        "//pkg/sentry/control",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/platform/platformdesc",
@@ -126,8 +126,8 @@ go_test(
     embed = [":cmd"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/control/api",
         "//pkg/log",
-        "//pkg/sentry/control",
         "//pkg/sentry/kernel/auth",
         "//pkg/sync",
         "//pkg/test/sandboxposture",
