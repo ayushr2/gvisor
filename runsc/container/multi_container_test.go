@@ -34,7 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/control/api"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -268,11 +268,11 @@ func createSharedMount(mount specs.Mount, name string, pod ...*specs.Spec) {
 		share = "pod"
 	}
 	for _, spec := range pod {
-		spec.Annotations[boot.MountPrefix+name+".source"] = mount.Source
-		spec.Annotations[boot.MountPrefix+name+".type"] = "tmpfs"
-		spec.Annotations[boot.MountPrefix+name+".share"] = share
+		spec.Annotations[bootapi.MountPrefix+name+".source"] = mount.Source
+		spec.Annotations[bootapi.MountPrefix+name+".type"] = "tmpfs"
+		spec.Annotations[bootapi.MountPrefix+name+".share"] = share
 		if len(mount.Options) > 0 {
-			spec.Annotations[boot.MountPrefix+name+".options"] = strings.Join(mount.Options, ",")
+			spec.Annotations[bootapi.MountPrefix+name+".options"] = strings.Join(mount.Options, ",")
 		}
 	}
 }
@@ -1934,7 +1934,7 @@ func TestMultiContainerSharedBindMount(t *testing.T) {
 				}
 
 				// Check that the filestore file is created and is not empty.
-				filestoreFile := boot.SelfFilestorePath(sourceDir, containers[0].sandboxID())
+				filestoreFile := bootapi.SelfFilestorePath(sourceDir, containers[0].sandboxID())
 				var stat unix.Stat_t
 				if err := unix.Stat(filestoreFile, &stat); err != nil {
 					t.Fatalf("unix.Stat(%q) failed for submount filestore: %v", filestoreFile, err)
@@ -2868,7 +2868,7 @@ func TestMultiContainerOverlayLeaks(t *testing.T) {
 		}
 
 		// Stat filestoreFile to see its usage. It should have been cleaned up.
-		filestoreFile := boot.SelfFilestorePath(s.Root.Path, sandboxID)
+		filestoreFile := bootapi.SelfFilestorePath(s.Root.Path, sandboxID)
 		var stat unix.Stat_t
 		if err := unix.Stat(filestoreFile, &stat); err != nil {
 			t.Errorf("unix.Stat(%q) failed for rootfs filestore: %v", filestoreFile, err)
