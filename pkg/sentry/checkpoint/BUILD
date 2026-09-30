@@ -7,7 +7,10 @@ licenses(["notice"])
 go_library(
     name = "checkpoint",
     srcs = ["checkpoint.go"],
-    visibility = ["//pkg/sentry:internal"],
+    visibility = [
+        "//pkg/control/api:__pkg__",
+        "//pkg/sentry:internal",
+    ],
 )
 
 go_test(

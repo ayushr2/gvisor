@@ -55,12 +55,12 @@ go_library(
     visibility = ["//runsc:__subpackages__"],
     deps = [
         "//pkg/cleanup",
+        "//pkg/control/api",
         "//pkg/cpuid",
         "//pkg/lisafs",
         "//pkg/log",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",
-        "//pkg/sentry/control",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/platform/platformdesc",
         "//pkg/state/pretty",
@@ -121,8 +121,8 @@ go_test(
     library = ":cmd",
     deps = [
         "//pkg/abi/linux",
+        "//pkg/control/api",
         "//pkg/log",
-        "//pkg/sentry/control",
         "//pkg/sentry/kernel/auth",
         "//pkg/sync",
         "//pkg/test/sandboxposture",
