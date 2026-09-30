@@ -138,6 +138,7 @@ go_test(
         "//runsc/config",
         "//runsc/container",
         "//runsc/flag",
+        "//runsc/gvisorbinaries",
         "//runsc/mitigate",
         "//runsc/specutils",
         "//sandboxexec/proto:sandbox_options_go_proto",

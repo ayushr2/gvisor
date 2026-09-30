@@ -14,8 +14,8 @@
 
 // gvisor-sentry-prewarmer grows its host file descriptor table, then execs
 // the binary at argv[1], handing it argv[2:] as its argv (so argv[2] is the
-// target's argv[0]). It runs just before `runsc boot` (the Sentry) does, and
-// is meant to be invoked as such, i.e.:
+// target's argv[0]). It runs just before the Sentry (`gvisor_sentry boot`)
+// does, and is meant to be invoked as such, i.e.:
 //   `gvisor-sentry-prewarmer /path/to/gvisor_sentry runsc-sandbox <flags...>
 //   boot <flags...>`
 //
@@ -44,8 +44,8 @@
 //   indexes (see `startingStdioFD` in `//runsc/boot/loader.go`).
 //
 // You can see where this is going. We need a single-threaded program that
-// runs before `runsc boot` does that inflates its FD table to be large enough
-// so that `runsc boot` never hits the FD table expansion RCU grace period
+// runs before the Sentry does that inflates its FD table to be large enough
+// so that the Sentry never hits the FD table expansion RCU grace period
 // that the kernel would hit it with otherwise.
 // That's what this prewarmer program does.
 // It's written in C with very minimal dependencies and fitting in a single

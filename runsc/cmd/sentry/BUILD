@@ -15,6 +15,7 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//runsc/cli",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
@@ -35,6 +36,7 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//runsc/cli",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
@@ -90,6 +92,7 @@ go_binary(
     deps = [
         "//pkg/sentry/socket/plugin/stack",
         "//runsc/cli",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
