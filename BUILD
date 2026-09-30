@@ -186,6 +186,7 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
         "//sandboxexec/sandbox",
+        "//tools/xdp/cmd",
     ],
 )
 
