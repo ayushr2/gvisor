@@ -25,7 +25,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -58,7 +58,7 @@ func benchmarkConfigs(b *testing.B) map[string]*config.Config {
 	if *runtimeName != "" {
 		ps = []string{*runtimeName}
 	} else if *testPlatforms == "" {
-		ps = platform.List()
+		ps = platformdesc.List()
 	} else {
 		ps = strings.Split(*testPlatforms, ",")
 	}

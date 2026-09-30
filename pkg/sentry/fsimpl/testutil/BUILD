@@ -30,6 +30,7 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/kvm",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/platform/ptrace",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/time",
