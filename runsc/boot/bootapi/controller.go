@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package bootapi defines the interface between runsc and the sandbox's
-// control server: control RPC names and the types they exchange.
+// Package bootapi defines the interface between runsc and the sandbox: the
+// control RPC names and the types they exchange, and the spec annotations,
+// filesystem types and file names that both sides interpret.
 package bootapi
 
 import (
