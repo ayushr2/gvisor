@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -511,7 +512,7 @@ func (c *Container) Start(conf *config.Config) error {
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool, networkArgs *bootapi.CreateLinksAndRoutesArgs) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 	if err := c.checkpointRestoreSupported("restore"); err != nil {
 		return err
@@ -692,7 +693,7 @@ func (c *Container) Execute(conf *config.Config, args *api.ExecArgs) (int32, err
 }
 
 // Event returns events for the container.
-func (c *Container) Event() (*boot.EventOut, error) {
+func (c *Container) Event() (*bootapi.EventOut, error) {
 	log.Debugf("Getting events for container, cid: %s", c.ID)
 	if err := c.requireStatus("get events for", Created, Running, Paused); err != nil {
 		return nil, err
@@ -709,7 +710,7 @@ func (c *Container) Event() (*boot.EventOut, error) {
 }
 
 // PortForward starts port forwarding to the container.
-func (c *Container) PortForward(opts *boot.PortForwardOpts) error {
+func (c *Container) PortForward(opts *bootapi.PortForwardOpts) error {
 	if err := c.requireStatus("port forward", Running); err != nil {
 		return err
 	}
@@ -2108,7 +2109,7 @@ func setOOMScoreAdj(pid int, scoreAdj int) error {
 
 // populateStats populates event with stats estimates based on cgroups and the
 // sentry's accounting.
-func (c *Container) populateStats(event *boot.EventOut) {
+func (c *Container) populateStats(event *bootapi.EventOut) {
 	// The events command, when run for all running containers, should
 	// account for the full cgroup CPU usage. We split cgroup usage
 	// proportionally according to the sentry-internal usage measurements,
@@ -2577,7 +2578,7 @@ func (c *Container) CheckStopped() error {
 			c.changeStatus(Stopped)
 		}
 	} else {
-		if state == boot.RuntimeStateStopped {
+		if state == bootapi.RuntimeStateStopped {
 			log.Warningf("Container %v is stopped", c.ID)
 			c.changeStatus(Stopped)
 		}
@@ -2586,7 +2587,7 @@ func (c *Container) CheckStopped() error {
 }
 
 // GetNetworkConfig returns the network configuration.
-func (c *Container) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
+func (c *Container) GetNetworkConfig() (*bootapi.CreateLinksAndRoutesArgs, error) {
 	log.Debugf("Returns network config, cid: %s", c.ID)
 	if err := c.CheckSandboxRunning(); err != nil {
 		return nil, err
