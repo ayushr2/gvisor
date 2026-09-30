@@ -12,11 +12,9 @@ go_library(
         "chroot.go",
         "nvproxy.go",
         "syscalls.go",
-        "umount_unsafe.go",
     ],
     visibility = ["//runsc:__subpackages__"],
     deps = [
-        "//pkg/abi/linux",
         "//pkg/abi/tpu",
         "//pkg/coretag",
         "//pkg/cpuid",

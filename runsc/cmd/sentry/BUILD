@@ -16,6 +16,7 @@ go_binary(
     deps = [
         "//runsc/cli",
         "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
@@ -39,6 +40,7 @@ go_binary(
     deps = [
         "//runsc/cli",
         "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
@@ -97,6 +99,7 @@ go_binary(
         "//pkg/sentry/socket/plugin/stack",
         "//runsc/cli",
         "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",

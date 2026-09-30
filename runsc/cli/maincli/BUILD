@@ -19,6 +19,7 @@ go_library(
         "//runsc/cmd",
         "//runsc/cmd/alias",
         "//runsc/cmd/profile",
+        "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/trace",
         "//runsc/cmd/util",
