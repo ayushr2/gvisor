@@ -36,8 +36,9 @@ go_binary(
     ],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
-        "//pkg/sentry/socket/plugin/stack",
+        "//pkg/sentry/socket/plugin/cgo",
         "//runsc/cli/maincli",
+        "//runsc/sandbox",
         "//runsc/version",
     ],
 )
