@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
@@ -648,14 +649,14 @@ func TestNetworkConfig(t *testing.T) {
 		l.ctrl.manager.startResultChan <- nil
 	}()
 
-	args := &CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{
+	args := &bootapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []bootapi.LoopbackLink{
 			{
 				Name: "lo",
-				Addresses: []IPWithPrefix{
+				Addresses: []bootapi.IPWithPrefix{
 					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
 				},
-				Routes: []Route{
+				Routes: []bootapi.Route{
 					{
 						Destination: net.IPNet{
 							IP:   net.IP{127, 0, 0, 0},
@@ -669,7 +670,7 @@ func TestNetworkConfig(t *testing.T) {
 	if err := l.ctrl.manager.SetNetworkArgs(args, nil); err != nil {
 		t.Errorf("error calling SetNetworkConfig: %v", err)
 	}
-	var networkArgs CreateLinksAndRoutesArgs
+	var networkArgs bootapi.CreateLinksAndRoutesArgs
 	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
 		t.Errorf("error calling NetworkConfig: %v", err)
 	}

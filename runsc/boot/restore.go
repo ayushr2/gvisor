@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -668,7 +669,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		}
 	}
 
-	var s Savings
+	var s bootapi.Savings
 	if err := r.calculateCPUSavings(&s); err != nil {
 		log.Warningf("Failed to calculate CPU savings: %v", err)
 	}
@@ -682,7 +683,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 }
 
 // Calculate the CPU time saved for restore.
-func (r *restorer) calculateCPUSavings(s *Savings) error {
+func (r *restorer) calculateCPUSavings(s *bootapi.Savings) error {
 	t, err := state.CPUTime()
 	if err != nil {
 		return fmt.Errorf("failed to get CPU time usage for restore, err: %w", err)
@@ -702,7 +703,7 @@ func (r *restorer) calculateCPUSavings(s *Savings) error {
 }
 
 // Calculate the walltime saved for restore.
-func (r *restorer) calculateWallTimeSavings(s *Savings) error {
+func (r *restorer) calculateWallTimeSavings(s *bootapi.Savings) error {
 	savedWtStr, ok := r.metadata[state.GvisorWallTimeKey]
 	if !ok {
 		return fmt.Errorf("failed to retrieve walltime from the metadata")

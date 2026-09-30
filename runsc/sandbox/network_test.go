@@ -23,11 +23,11 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
-func fdbasedLinkEqual(a, b boot.FDBasedLink) bool {
+func fdbasedLinkEqual(a, b bootapi.FDBasedLink) bool {
 	if a.Name != b.Name {
 		return false
 	}
@@ -77,7 +77,7 @@ func fdbasedLinkEqual(a, b boot.FDBasedLink) bool {
 	return true
 }
 
-func fdbasedLinksEqual(a, b []boot.FDBasedLink) bool {
+func fdbasedLinksEqual(a, b []bootapi.FDBasedLink) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -89,7 +89,7 @@ func fdbasedLinksEqual(a, b []boot.FDBasedLink) bool {
 	return true
 }
 
-func defaultRouteEqual(a, b boot.DefaultRoute) bool {
+func defaultRouteEqual(a, b bootapi.DefaultRoute) bool {
 	if a.Name != b.Name {
 		return false
 	}
@@ -102,7 +102,7 @@ func defaultRouteEqual(a, b boot.DefaultRoute) bool {
 	return true
 }
 
-func loopbackLinksEqual(a, b []boot.LoopbackLink) bool {
+func loopbackLinksEqual(a, b []bootapi.LoopbackLink) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -280,15 +280,15 @@ func setupLoopback(t *testing.T) {
 
 // defaultLoopbackLinks returns the expected loopback links for a standard
 // loopback interface with 127.0.0.1/8 and ::1/128.
-func defaultLoopbackLinks() []boot.LoopbackLink {
-	return []boot.LoopbackLink{
+func defaultLoopbackLinks() []bootapi.LoopbackLink {
+	return []bootapi.LoopbackLink{
 		{
 			Name: "lo",
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("127.0.0.1"), PrefixLen: 8},
 				{Address: net.ParseIP("::1"), PrefixLen: 128},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{127, 0, 0, 0},
@@ -323,16 +323,16 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
 
-	wantFDLinks := []boot.FDBasedLink{
+	wantFDLinks := []bootapi.FDBasedLink{
 		{
 			Name:        "testveth0",
 			MTU:         1500,
 			LinkAddress: link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("10.0.0.1"), PrefixLen: 24},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{10, 0, 0, 0},
@@ -347,7 +347,7 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 					Gateway: net.ParseIP("10.0.0.2"),
 				},
 			},
-			Neighbors: []boot.Neighbor{
+			Neighbors: []bootapi.Neighbor{
 				{IP: net.ParseIP("10.0.0.2"), HardwareAddr: mustParseMAC("00:11:22:33:44:55")},
 			},
 		},
@@ -357,9 +357,9 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 		t.Errorf("FDBasedLinks mismatch:\ngot  %+v\nwant %+v", args.FDBasedLinks, wantFDLinks)
 	}
 
-	wantGW := boot.DefaultRoute{
+	wantGW := bootapi.DefaultRoute{
 		Name: "testveth0",
-		Route: boot.Route{
+		Route: bootapi.Route{
 			Destination: net.IPNet{
 				IP:   net.IPv4zero,
 				Mask: net.IPMask(net.IPv4zero),
@@ -395,14 +395,14 @@ func TestCollectLinksAndRoutes_LoopbackOnly(t *testing.T) {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
 
-	wantLoopbackLinks := []boot.LoopbackLink{
+	wantLoopbackLinks := []bootapi.LoopbackLink{
 		{
 			Name: "lo",
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("127.0.0.1"), PrefixLen: 8},
 				{Address: net.ParseIP("::1"), PrefixLen: 128},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{127, 0, 0, 0},
@@ -454,16 +454,16 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
 
-	wantFDLinks := []boot.FDBasedLink{
+	wantFDLinks := []bootapi.FDBasedLink{
 		{
 			Name:        "testveth0",
 			MTU:         1500,
 			LinkAddress: veth0Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("10.0.0.1"), PrefixLen: 24},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{10, 0, 0, 0},
@@ -477,10 +477,10 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 			MTU:         1500,
 			LinkAddress: veth1Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("192.168.1.1"), PrefixLen: 24},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{192, 168, 1, 0},
@@ -494,9 +494,9 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 		t.Errorf("FDBasedLinks mismatch:\ngot  %+v\nwant %+v", args.FDBasedLinks, wantFDLinks)
 	}
 
-	wantGW := boot.DefaultRoute{
+	wantGW := bootapi.DefaultRoute{
 		Name: "testveth0",
-		Route: boot.Route{
+		Route: bootapi.Route{
 			Destination: net.IPNet{
 				IP:   net.IPv4zero,
 				Mask: net.IPMask(net.IPv4zero),
@@ -539,16 +539,16 @@ func TestCollectLinksAndRoutes_IPv6Disabled(t *testing.T) {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
 
-	wantFDLinks := []boot.FDBasedLink{
+	wantFDLinks := []bootapi.FDBasedLink{
 		{
 			Name:        "testveth0",
 			MTU:         1500,
 			LinkAddress: veth0Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("10.0.0.1"), PrefixLen: 24},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{10, 0, 0, 0},
@@ -567,13 +567,13 @@ func TestCollectLinksAndRoutes_IPv6Disabled(t *testing.T) {
 		t.Errorf("Defaultv6Gateway.Route should be empty, got %+v", args.Defaultv6Gateway.Route)
 	}
 
-	wantLoopbackLinks := []boot.LoopbackLink{
+	wantLoopbackLinks := []bootapi.LoopbackLink{
 		{
 			Name: "lo",
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("127.0.0.1"), PrefixLen: 8},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{127, 0, 0, 0},
@@ -673,14 +673,14 @@ func TestCollectLinksAndRoutes_LoopbackExtraRoutes(t *testing.T) {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
 
-	wantLoopbackLinks := []boot.LoopbackLink{
+	wantLoopbackLinks := []bootapi.LoopbackLink{
 		{
 			Name: "lo",
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("127.0.0.1"), PrefixLen: 8},
 				{Address: net.IPv6loopback, PrefixLen: 128},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{127, 0, 0, 0},
@@ -707,16 +707,16 @@ func TestCollectLinksAndRoutes_LoopbackExtraRoutes(t *testing.T) {
 		t.Errorf("LoopbackLinks mismatch:\ngot  %+v\nwant %+v", args.LoopbackLinks, wantLoopbackLinks)
 	}
 
-	wantFDLinks := []boot.FDBasedLink{
+	wantFDLinks := []bootapi.FDBasedLink{
 		{
 			Name:        "testveth0",
 			MTU:         1500,
 			LinkAddress: vethLink.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
-			Addresses: []boot.IPWithPrefix{
+			Addresses: []bootapi.IPWithPrefix{
 				{Address: net.ParseIP("10.0.0.1"), PrefixLen: 24},
 			},
-			Routes: []boot.Route{
+			Routes: []bootapi.Route{
 				{
 					Destination: net.IPNet{
 						IP:   net.IP{10, 0, 0, 0},
