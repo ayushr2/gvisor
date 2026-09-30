@@ -43,9 +43,11 @@ go_test(
     srcs = [
         "checkpoint_test.go",
         "mount_hints_test.go",
+        "seccheck_test.go",
     ],
     library = ":bootapi",
     deps = [
+        "//pkg/sentry/seccheck",
         "//runsc/config",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
