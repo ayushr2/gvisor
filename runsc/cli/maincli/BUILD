@@ -20,7 +20,6 @@ go_library(
         "//runsc/cmd/alias",
         "//runsc/cmd/profile",
         "//runsc/cmd/sandboxsetup",
-        "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/trace",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries/embed",
@@ -34,6 +33,7 @@ go_test(
     library = ":maincli",
     deps = [
         "//runsc/cmd",
+        "//runsc/cmd/sentry/sentrycmd",
         "//runsc/flag",
         "@com_github_google_subcommands//:go_default_library",
     ],

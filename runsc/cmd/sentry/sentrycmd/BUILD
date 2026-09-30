@@ -13,7 +13,10 @@ go_library(
         "nvproxy.go",
         "syscalls.go",
     ],
-    visibility = ["//runsc:__subpackages__"],
+    visibility = [
+        "//:__pkg__",
+        "//runsc:__subpackages__",
+    ],
     deps = [
         "//pkg/abi/tpu",
         "//pkg/coretag",

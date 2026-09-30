@@ -904,8 +904,7 @@ func (s *Sandbox) connError(err error) error {
 }
 
 type sandboxProcessEnvOptions struct {
-	enforceRelease bool
-	sentryUsesCgo  bool
+	sentryUsesCgo bool
 }
 
 func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []string {
@@ -922,9 +921,7 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 			env = append(env, "TMPDIR="+tmpDir)
 		}
 	}
-	if opts.enforceRelease {
-		env = gvisorbinaries.WithEnforceRelease(env)
-	}
+	env = gvisorbinaries.WithEnforceRelease(env)
 	if opts.sentryUsesCgo {
 		// Platforms that use stub processes are not compatible with
 		// the glibc rseq, because they unmap everything from a process
@@ -950,7 +947,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// a time. Try to make RLIMIT_MEMLOCK unlimited so that it can do so. runsc
 	// expects to run in a memory cgroup that limits its memory usage as
 	// required.
-	// This needs to be done before exec'ing `runsc boot`, as that subcommand
+	// This needs to be done before exec'ing the Sentry, as the Sentry
 	// runs as an unprivileged user that will not be able to call `setrlimit`
 	// by itself. Calling `setrlimit` here will have the side-effect of setting
 	// the limit on the currently-running `runsc` process as well, but that
@@ -1003,7 +1000,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	lfOpts.Command = "boot" // Revert command to "boot".
 
-	sentryBin := &gvisorbinaries.GvisorSentry
+	sentryBin := sentryBinary(conf)
 	// runsc cannot tell whether the Sentry sidecar uses cgo, so assume it
 	// does if runsc does: race builds pair a race runsc with a race Sentry.
 	// Caveats: a cgo runsc booting a pure Sentry (e.g. a cgo test binary)
@@ -1012,18 +1009,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// so that Sentry's stubs would crash; no build pairs them today.
 	sentryUsesCgo := config.CgoEnabled
 	if conf.Network == config.NetworkPlugin {
-		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
 	}
-	bootBinPath := specutils.ExePath
-	if p, err := sentryBin.Path(); err == nil {
-		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
-		bootBinPath = p
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
+	bootBinPath, err := sentryBin.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable (%v); install it per https://gvisor.dev/docs/user_guide/install/ instructions", sentryBin.Name, err)
 	}
+	log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, bootBinPath)
 
 	// Relay all the config flags to the sandbox process.
 	cmd := exec.Command(bootBinPath, conf.ToFlags()...)
@@ -1062,8 +1054,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
 
 	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
-		enforceRelease: bootBinPath != specutils.ExePath,
-		sentryUsesCgo:  sentryUsesCgo,
+		sentryUsesCgo: sentryUsesCgo,
 	})
 
 	// If there is a gofer, sends all socket ends to the sandbox.
@@ -2558,8 +2549,16 @@ func getNvproxyDriverVersion(conf *config.Config) (string, error) {
 	}
 }
 
+// sentryBinary returns the Sentry sidecar binary that boots the sandbox.
+func sentryBinary(conf *config.Config) *gvisorbinaries.Binary {
+	if conf.Network == config.NetworkPlugin {
+		return &gvisorbinaries.GvisorSentryPluginStack
+	}
+	return &gvisorbinaries.GvisorSentry
+}
+
 // checkBinaryPermissions verifies that the required binary bits are set on
-// the runsc executable.
+// the Sentry executable, which re-executes itself as an unprivileged user.
 func checkBinaryPermissions(conf *config.Config) error {
 	// All platforms need the other exe bit
 	neededBits := os.FileMode(0001)
@@ -2568,12 +2567,12 @@ func checkBinaryPermissions(conf *config.Config) error {
 		neededBits |= os.FileMode(0004)
 	}
 
-	exePath, err := os.Executable()
+	exePath, err := sentryBinary(conf).Path()
 	if err != nil {
-		return fmt.Errorf("getting exe path: %v", err)
+		return fmt.Errorf("getting Sentry path: %v", err)
 	}
 
-	// Check the permissions of the runsc binary and print an error if it
+	// Check the permissions of the Sentry binary and print an error if it
 	// doesn't match expectations.
 	info, err := os.Stat(exePath)
 	if err != nil {

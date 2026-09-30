@@ -16,14 +16,12 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 
 	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/runsc/cmd/nvproxy"
 	"gvisor.dev/gvisor/runsc/cmd/sentry/forwardcmd"
-	"gvisor.dev/gvisor/runsc/cmd/sentry/sentrycmd"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
@@ -32,18 +30,8 @@ import (
 // execSentry replaces the current process with the Sentry binary, running the
 // same command line that runsc was invoked with. It is used by commands that
 // report on code linked into the Sentry binary.
-//
-// If the Sentry binary is missing and the sidecar usage policy allows embedded
-// fallbacks, execSentry runs the command with inProcess instead.
-//
-// TODO(gvisor.dev/issue/13718): Remove inProcess once runsc no longer links
-// the Sentry.
-func execSentry(inProcess func() subcommands.ExitStatus) subcommands.ExitStatus {
+func execSentry() subcommands.ExitStatus {
 	sentry := &gvisorbinaries.GvisorSentry
-	if _, err := sentry.Path(); err != nil && gvisorbinaries.UsagePolicy.AllowEmbeddedFallback() {
-		sentry.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): running command in runsc itself", sentry.Name, err))
-		return inProcess()
-	}
 	err := sentry.Exec(gvisorbinaries.Options{Argv: os.Args, Envv: os.Environ()})
 	// Unreachable unless `sentry.Exec` fails.
 	return util.Errorf("Failed to run %q in sidecar %q: %v", strings.Join(flag.CommandLine.Args(), " "), sentry.Name, err)
@@ -56,10 +44,8 @@ type MetricMetadata struct {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (m *MetricMetadata) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	return execSentry(func() subcommands.ExitStatus {
-		return m.MetricMetadata.Execute(ctx, f, args...)
-	})
+func (*MetricMetadata) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
+	return execSentry()
 }
 
 // Nvproxy implements subcommands.Command for the "nvproxy" command. It runs
@@ -69,11 +55,8 @@ type Nvproxy struct {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (n *Nvproxy) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	return execSentry(func() subcommands.ExitStatus {
-		n.Nvproxy.SupportedDrivers = sentrycmd.NvproxySupportedDrivers
-		return n.Nvproxy.Execute(ctx, f, args...)
-	})
+func (*Nvproxy) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
+	return execSentry()
 }
 
 // Symbolize implements subcommands.Command for the "symbolize" command. It
@@ -83,10 +66,8 @@ type Symbolize struct {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Symbolize) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	return execSentry(func() subcommands.ExitStatus {
-		return c.Symbolize.Execute(ctx, f, args...)
-	})
+func (*Symbolize) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
+	return execSentry()
 }
 
 // Syscalls implements subcommands.Command for the "syscalls" help topic. It
@@ -96,8 +77,6 @@ type Syscalls struct {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (s *Syscalls) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	return execSentry(func() subcommands.ExitStatus {
-		return (&sentrycmd.Syscalls{Syscalls: s.Syscalls}).Execute(ctx, f, args...)
-	})
+func (*Syscalls) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
+	return execSentry()
 }

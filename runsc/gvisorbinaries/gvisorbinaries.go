@@ -17,10 +17,10 @@
 //
 // A sidecar is resolved on disk in a "gvisor-bin/" directory located next to
 // the main binary.
-// TODO(gvisor.dev/issue/13718): Each binary is also embedded in this package
-// itself, which can be extracted and exec'd when the on-disk copy is not
-// available. This will go away after some time in order to lighten up the
-// size of the runsc binary.
+// TODO(gvisor.dev/issue/13718): The checkpoint gofer and the metric server are
+// also embedded in the runsc binary, which can extract and exec them when the
+// on-disk copy is not available. This will go away after some time in order
+// to lighten up the size of the runsc binary.
 //
 // # Release enforcement
 //
@@ -350,7 +350,7 @@ func (b *Binary) notAvailableError() error {
 	if err != nil {
 		return err
 	}
-	if UsagePolicy == config.SidecarUsageStrict {
+	if UsagePolicy == config.SidecarUsageStrict && (b.embeddedExec != nil || b.embeddedForkExec != nil) {
 		return fmt.Errorf("sidecar binary %q not found (expected at %q) and --sidecar-usage-policy is set to STRICT; install it per https://gvisor.dev/docs/user_guide/install/ instructions", b.Name, p)
 	}
 	return fmt.Errorf("sidecar binary %q not found (expected at %q); install it per https://gvisor.dev/docs/user_guide/install/ instructions", b.Name, p)

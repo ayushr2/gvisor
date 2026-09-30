@@ -21,8 +21,6 @@ package main
 
 import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin/cgo"
-	// Registers the plugin stack with the embedded Sentry (runsc boot).
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/plugin/stack"
 	"gvisor.dev/gvisor/runsc/cli/maincli"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/version"
