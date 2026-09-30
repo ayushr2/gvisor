@@ -15,9 +15,12 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//runsc/cli",
+        "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
+        "@com_github_google_subcommands//:go_default_library",
     ],
 )
 
@@ -35,9 +38,12 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//runsc/cli",
+        "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
+        "@com_github_google_subcommands//:go_default_library",
     ],
 )
 
@@ -90,9 +96,12 @@ go_binary(
     deps = [
         "//pkg/sentry/socket/plugin/stack",
         "//runsc/cli",
+        "//runsc/cmd/nvproxy",
+        "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/gvisorbinaries",
+        "@com_github_google_subcommands//:go_default_library",
     ],
 )
 
@@ -102,7 +111,9 @@ deps_test(
     # Keep this tight.
     allowed = [
         "//runsc/cli",
+        "//runsc/cmd/nvproxy",
         "//runsc/cmd/sandboxsetup",
+        "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
         "//runsc/config",

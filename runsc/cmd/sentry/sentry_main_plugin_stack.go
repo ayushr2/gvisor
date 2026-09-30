@@ -20,8 +20,11 @@
 package main
 
 import (
+	"github.com/google/subcommands"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/plugin/stack"
 	"gvisor.dev/gvisor/runsc/cli"
+	"gvisor.dev/gvisor/runsc/cmd/nvproxy"
+	"gvisor.dev/gvisor/runsc/cmd/sentry/forwardcmd"
 	"gvisor.dev/gvisor/runsc/cmd/sentry/sentrycmd"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
@@ -29,8 +32,12 @@ import (
 
 func main() {
 	cli.Run(&gvisorbinaries.GvisorSentryPluginStack, map[util.SubCommand]string{
-		new(sentrycmd.Boot):      "internal use only",
-		new(sentrycmd.Symbolize): "internal use only",
-		new(sentrycmd.Umount):    "internal use only",
-	}, nil)
+		new(sentrycmd.Boot):            "internal use only",
+		new(forwardcmd.MetricMetadata): "internal use only",
+		new(forwardcmd.Symbolize):      "internal use only",
+		new(sentrycmd.Umount):          "internal use only",
+		&nvproxy.Nvproxy{SupportedDrivers: sentrycmd.NvproxySupportedDrivers}: "internal use only",
+	}, []subcommands.Command{
+		new(sentrycmd.Syscalls),
+	})
 }
