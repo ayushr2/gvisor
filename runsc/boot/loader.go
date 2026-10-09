@@ -86,6 +86,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/timing"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -104,21 +105,6 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
-)
-
-// ContainerRuntimeState is the runtime state of a container.
-type ContainerRuntimeState int
-
-const (
-	// RuntimeStateInvalid used just in case of error.
-	RuntimeStateInvalid ContainerRuntimeState = iota
-	// RuntimeStateCreating indicates that the container is being
-	// created, but has not started running yet.
-	RuntimeStateCreating
-	// RuntimeStateRunning indicates that the container is running.
-	RuntimeStateRunning
-	// RuntimeStateStopped indicates that the container has stopped.
-	RuntimeStateStopped
 )
 
 type containerInfo struct {
@@ -347,7 +333,7 @@ type Loader struct {
 	// savings contains the restore savings (eg CPU and wall time saved).
 	//
 	// +checklocks:mu
-	savings Savings
+	savings bootapi.Savings
 
 	fsRestore *fsRestore
 
@@ -355,7 +341,7 @@ type Loader struct {
 	// host network namespace during sandbox creation.
 	//
 	// +checklocks:mu
-	networkArgs *CreateLinksAndRoutesArgs
+	networkArgs *bootapi.CreateLinksAndRoutesArgs
 
 	// pinRing accumulates host FDs to pin before seccomp filters are
 	// installed.
@@ -453,14 +439,6 @@ type fdMapping struct {
 	host  *fd.FD
 }
 
-// FDMapping is a helper type to represent a mapping from guest to host file
-// descriptors. In contrast to the unexported fdMapping type, it does not imply
-// file ownership.
-type FDMapping struct {
-	Guest int
-	Host  int
-}
-
 // Args are the arguments for New().
 type Args struct {
 	// Id is the sandbox ID.
@@ -494,7 +472,7 @@ type Args struct {
 	StdioFDs []int
 	// PassFDs are user-supplied FD mappings from host to guest descriptors.
 	// The Loader takes ownership of these FDs and may close them at any time.
-	PassFDs []FDMapping
+	PassFDs []bootapi.FDMapping
 	// ExecFD is the host file descriptor used for program execution.
 	ExecFD int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
@@ -1470,12 +1448,12 @@ func (l *Loader) run() error {
 		}
 
 		// Otherwise forward to root container.
-		deliveryMode := DeliverToProcess
+		deliveryMode := bootapi.DeliverToProcess
 		if l.root.spec.Process.Terminal {
 			// Since we are running with a console, we should forward the signal to
 			// the foreground process group so that job control signals like ^C can
 			// be handled properly.
-			deliveryMode = DeliverToForegroundProcessGroup
+			deliveryMode = bootapi.DeliverToForegroundProcessGroup
 		}
 		log.Infof("Received external signal %d, mode: %s", sig, deliveryMode)
 		if err := l.signal(l.sandboxID, 0, int32(sig), deliveryMode); err != nil {
@@ -2212,7 +2190,7 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 	if nicID != linux.LOOPBACK_IFINDEX {
 		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
 	}
-	link := DefaultLoopbackLink
+	link := bootapi.DefaultLoopbackLink
 	linkEP := ethernet.New(loopback.New())
 	opts := stack.NICOptions{
 		Name:               link.Name,
@@ -2233,25 +2211,25 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 // relative to the root PID namespace, not the container's.
 //
 // +checklocksexclude:l.mu
-func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) error {
+func (l *Loader) signal(cid string, pid, signo int32, mode bootapi.SignalDeliveryMode) error {
 	if pid < 0 {
 		return fmt.Errorf("PID (%d) must be positive", pid)
 	}
 
 	switch mode {
-	case DeliverToProcess:
+	case bootapi.DeliverToProcess:
 		if err := l.signalProcess(cid, kernel.ThreadID(pid), signo); err != nil {
 			return fmt.Errorf("signaling process in container %q PID %d: %w", cid, pid, err)
 		}
 		return nil
 
-	case DeliverToForegroundProcessGroup:
+	case bootapi.DeliverToForegroundProcessGroup:
 		if err := l.signalForegrondProcessGroup(cid, kernel.ThreadID(pid), signo); err != nil {
 			return fmt.Errorf("signaling foreground process group in container %q PID %d: %w", cid, pid, err)
 		}
 		return nil
 
-	case DeliverToAllProcesses:
+	case bootapi.DeliverToAllProcesses:
 		if pid != 0 {
 			return fmt.Errorf("PID (%d) cannot be set when signaling all processes", pid)
 		}
@@ -2264,7 +2242,7 @@ func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) e
 		}
 		return nil
 
-	case DeliverToProcessGroup:
+	case bootapi.DeliverToProcessGroup:
 		if pid == 0 {
 			return fmt.Errorf("PGID must be set when signaling a process group")
 		}
@@ -2464,7 +2442,7 @@ func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD, passFDs
 // is broken.
 //
 // +checklocksexclude:l.mu
-func (l *Loader) portForward(opts *PortForwardOpts) error {
+func (l *Loader) portForward(opts *bootapi.PortForwardOpts) error {
 	// Validate that we have a stream FD to write to. If this happens then
 	// it means there is a misbehaved urpc client or a bug has occurred.
 	if len(opts.Files) != 1 {
@@ -2585,15 +2563,15 @@ func (l *Loader) pidsCount(cid string) (int, error) {
 	return l.k.TaskSet().Root.NumTasksPerContainer(cid), nil
 }
 
-func (l *Loader) networkStats() ([]*NetworkInterface, error) {
-	var stats []*NetworkInterface
+func (l *Loader) networkStats() ([]*bootapi.NetworkInterface, error) {
+	var stats []*bootapi.NetworkInterface
 	stack := l.k.RootNetworkNamespace().Stack()
 	for _, i := range stack.Interfaces() {
 		var stat inet.StatDev
 		if err := stack.Statistics(&stat, i.Name); err != nil {
 			return nil, err
 		}
-		stats = append(stats, &NetworkInterface{
+		stats = append(stats, &bootapi.NetworkInterface{
 			Name:      i.Name,
 			RxBytes:   stat[0],
 			RxPackets: stat[1],
@@ -2663,31 +2641,31 @@ func (l *Loader) SpecEnviron(containerName string) []string {
 }
 
 // +checklocksexclude:l.mu
-func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
+func (l *Loader) containerRuntimeState(cid string) bootapi.ContainerRuntimeState {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	exec, ok := l.processes[execID{cid: cid}]
 	if !ok {
 		// Can't distinguish between invalid CID and stopped container, assume that
 		// CID is valid.
-		return RuntimeStateStopped
+		return bootapi.RuntimeStateStopped
 	}
 	if exec.tg == nil {
 		if l.state == restoreFailed {
-			return RuntimeStateStopped
+			return bootapi.RuntimeStateStopped
 		}
 		if _, ok := l.failedToStart[cid]; ok {
-			return RuntimeStateStopped
+			return bootapi.RuntimeStateStopped
 		}
 		// Container has no thread group assigned, so it has not started yet.
-		return RuntimeStateCreating
+		return bootapi.RuntimeStateCreating
 	}
 	if exec.tg.HasNonExitingTasks() {
 		// Init process thread group is still running.
-		return RuntimeStateRunning
+		return bootapi.RuntimeStateRunning
 	}
 	// Init process has stopped, but no one has called wait on it yet.
-	return RuntimeStateStopped
+	return bootapi.RuntimeStateStopped
 }
 
 // GetContainerSpecs returns the container specs map.
