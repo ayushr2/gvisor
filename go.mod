@@ -1,6 +1,6 @@
 module gvisor.dev/gvisor
 
-go 1.26.3
+go 1.27.1
 
 require (
 	cloud.google.com/go/auth v0.20.0
@@ -27,6 +27,7 @@ require (
 	github.com/gofrs/flock v0.8.0
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/btree v1.1.2
+	github.com/google/go-github/v84 v84.0.0
 	github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8
 	github.com/mattbaird/jsonpatch v0.0.0-20171005235357-81af80346b1a
 	github.com/moby/sys/capability v0.4.0
@@ -35,11 +36,11 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/vishvananda/netlink v1.3.1-0.20250303224720-0e7078ed04c8
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
-	golang.org/x/mod v0.36.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.44.0
+	golang.org/x/mod v0.41.0
+	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/time v0.15.0
-	golang.org/x/tools v0.45.0
+	golang.org/x/tools v0.51.0
 	google.golang.org/api v0.274.0
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
@@ -79,6 +80,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/gnostic-models v0.6.8 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -111,12 +113,12 @@ require (
 	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
-	golang.org/x/net v0.54.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
-	golang.org/x/term v0.43.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
