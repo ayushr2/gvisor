@@ -28,6 +28,7 @@ go_test(
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
         "//pkg/tcpip/link/sniffer",
+        "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/seqnum",
@@ -191,7 +192,6 @@ go_test(
     # so exclude them from gotsan runs.
     tags = ["nogotsan"],
     deps = [
-        ":e2e",
         "//pkg/refs",
         "//pkg/tcpip",
         "//pkg/tcpip/header",

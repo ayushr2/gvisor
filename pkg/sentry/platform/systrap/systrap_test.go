@@ -74,7 +74,7 @@ func newSystrapTest(t *testing.T) (*Systrap, platform.AddressSpace, *platformCon
 		t.Fatalf("failed to create Systrap platform: %v", err)
 	}
 
-	as, err := s.NewAddressSpace()
+	as, err := s.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		t.Fatalf("failed to create address space: %v", err)
 	}
@@ -153,5 +153,13 @@ func TestSwitchThreadIDVisibility(t *testing.T) {
 		t.Errorf("sampler observed %d acked contexts with an invalid ThreadID; "+
 			"the stub published acked_time before ThreadID or cleared ThreadID "+
 			"before publishing the context state", n)
+	}
+}
+
+func TestSpinningQueueLayout(t *testing.T) {
+	newSystrapTest(t)
+	queueStart := stubContextQueueRegion + stubContextQueueRegionLen
+	if stubSpinningThreadQueueAddr < queueStart || stubSpinningThreadQueueAddr+sysmsg.SpinningQueueMemSize > stubContextRegion {
+		t.Errorf("spinning queue %#x not in [%#x, %#x)", stubSpinningThreadQueueAddr, queueStart, stubContextRegion)
 	}
 }

@@ -365,12 +365,19 @@ func (l *listenContext) performHandshake(s *segment, opts header.TCPSynOptions, 
 // +checklocks:e.mu
 // +checklocks:n.mu
 func (e *Endpoint) propagateInheritableOptionsLocked(n *Endpoint) {
+	if e.ccSetBySockOpt {
+		n.cc = e.cc
+		n.ccSetBySockOpt = true
+	}
 	n.userTimeout = e.userTimeout
 	n.portFlags = e.portFlags
 	n.boundBindToDevice = e.boundBindToDevice
 	n.boundPortFlags = e.boundPortFlags
 	n.userMSS = e.userMSS
 	n.ops.SetMark(e.ops.GetMark())
+	// n is not yet connected, so there is no delayed data for the handler to
+	// flush. The handler also acquires n.mu, which is already held.
+	n.ops.SetDelayOptionNoNotify(e.ops.GetDelayOption())
 }
 
 // reserveTupleLocked reserves an accepted endpoint's tuple.
@@ -712,7 +719,6 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			mss:                 rcvdSynOptions.MSS,
 			sampleRTTWithTSOnly: true,
 		}
-		h.ep.AssertLockHeld(n)
 		h.transitionToStateEstablishedLocked(s)
 		n.mu.Unlock()
 

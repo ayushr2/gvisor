@@ -203,10 +203,6 @@ type Config struct {
 	// must match `runsc`'s build label.
 	SidecarReleaseEnforcementPolicy SidecarReleasePolicy `flag:"sidecar-release-enforcement-policy"`
 
-	// SidecarUsagePolicy controls when to use sidecar binaries vs embedded
-	// fallbacks.
-	SidecarUsagePolicy SidecarUsagePolicy `flag:"sidecar-usage-policy"`
-
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
 	FinalMetricsLog string `flag:"final-metrics-log"`
@@ -258,6 +254,10 @@ type Config struct {
 	// PanicSignal registers signal handling that panics. Usually set to
 	// SIGUSR2(12) to troubleshoot hangs. -1 disables it.
 	PanicSignal int `flag:"panic-signal"`
+
+	// DumpGoroutinesSignal registers signal handling that dumps all goroutine
+	// stacks without exiting. -1 disables it.
+	DumpGoroutinesSignal int `flag:"dump-goroutines-signal"`
 
 	// ProfileEnable is set to prepare the sandbox to be profiled.
 	ProfileEnable bool `flag:"profile"`
@@ -1237,12 +1237,10 @@ func setOverlay2Err(v string) error {
 const overlay2SizeEq = "size="
 
 // Set implements flag.Value. Set(String()) should be idempotent.
+// On error, the receiver is unchanged.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
-		o.rootMount = false
-		o.subMounts = false
-		o.medium = NoOverlay
-		o.size = ""
+		*o = Overlay2{}
 		return nil
 	}
 	parts := strings.Split(v, ",")
@@ -1255,34 +1253,34 @@ func (o *Overlay2) Set(v string) error {
 		return setOverlay2Err(v)
 	}
 
+	var next Overlay2
 	switch mount := vs[0]; mount {
 	case "root":
-		o.rootMount = true
+		next.rootMount = true
 	case "all":
-		o.rootMount = true
-		o.subMounts = true
+		next.rootMount = true
+		next.subMounts = true
 	default:
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	err := o.medium.Set(vs[1])
+	err := next.medium.Set(vs[1])
 	if err != nil {
 		return err
 	}
 
-	if len(parts) == 1 {
-		o.size = ""
-	} else if len(parts) == 2 {
+	if len(parts) == 2 {
 		sizeArg := parts[1]
 		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
 		if !cut {
 			return setOverlay2Err(v)
 		}
-		o.size = size
-	} else {
+		next.size = size
+	} else if len(parts) > 2 {
 		return setOverlay2Err(v)
 	}
 
+	*o = next
 	return nil
 }
 
@@ -1476,56 +1474,6 @@ func (p SidecarReleasePolicy) String() string {
 // Applies returns whether the policy is in effect for this runsc build.
 func (p SidecarReleasePolicy) Applies() bool {
 	return p == SidecarReleaseAlways || (p == SidecarReleaseIfReleaseBuild && IsReleaseVersion(version.Version()))
-}
-
-// SidecarUsagePolicy controls when to use sidecar binaries vs embedded fallbacks.
-type SidecarUsagePolicy string
-
-// SidecarUsagePolicy values.
-const (
-	SidecarUsageDefault        SidecarUsagePolicy = "DEFAULT"
-	SidecarUsageStrict         SidecarUsagePolicy = "STRICT"
-	SidecarUsageLegacyEmbedded SidecarUsagePolicy = "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (p *SidecarUsagePolicy) Set(v string) error {
-	sp := SidecarUsagePolicy(strings.ToUpper(v))
-	switch sp {
-	case SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded:
-		*p = sp
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded)
-}
-
-// Ptr returns a pointer to `p`.
-// Useful in flag declaration line.
-func (p SidecarUsagePolicy) Ptr() *SidecarUsagePolicy {
-	return &p
-}
-
-// Get implements flag.Get.
-func (p *SidecarUsagePolicy) Get() any {
-	return *p
-}
-
-// String implements flag.String.
-func (p SidecarUsagePolicy) String() string {
-	return string(p)
-}
-
-// AllowEmbeddedFallback returns whether embedded fallback binaries can be used
-// if the on-disk sidecar binaries are not found.
-func (p SidecarUsagePolicy) AllowEmbeddedFallback() bool {
-	switch p {
-	case SidecarUsageDefault, SidecarUsageStrict:
-		return false
-	case SidecarUsageLegacyEmbedded:
-		return true
-	default:
-		panic(fmt.Sprintf("invalid sidecar usage policy: %q", p))
-	}
 }
 
 // releaseVersionRE matches the version strings of production release builds:

@@ -107,6 +107,7 @@ type DriverABIInfo struct {
 	UvmInfos        map[uint32]IoctlInfo
 	ControlInfos    map[uint32]IoctlInfo
 	AllocationInfos map[nvgpu.ClassID]IoctlInfo
+	UvmConstants    map[string]uint64
 }
 
 // IoctlName is the name of the constant used by the Nvidia driver to define
@@ -221,6 +222,7 @@ func Init() {
 				controlCmd: map[uint32]controlCmdHandler{
 					nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               ctrlHandler(rmControlSimple, compUtil),
@@ -551,6 +553,7 @@ func Init() {
 						ControlInfos: map[uint32]IoctlInfo{
 							nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE", "NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY", "NV0000_CTRL_CLIENT_SET_INHERITED_SHARE_POLICY_PARAMS"),
+							nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           simpleIoctlInfo("NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION", "NV0000_CTRL_EVENT_SET_NOTIFICATION_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS", "NV0000_CTRL_GPU_GET_ATTACHED_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS", "NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2", "NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS"),
@@ -817,6 +820,7 @@ func Init() {
 							nvgpu.NV04_DISPLAY_COMMON:        simpleIoctlInfo("NV04_DISPLAY_COMMON"),       // No params
 							nvgpu.NV20_SUBDEVICE_DIAG:        simpleIoctlInfo("NV20_SUBDEVICE_DIAG"),       // No params
 						},
+						UvmConstants: map[string]uint64{},
 					}
 				},
 			}
@@ -1027,9 +1031,39 @@ func Init() {
 			abi := v560_28_03()
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
 			abi.allocationClass[nvgpu.MAXWELL_PROFILER_CONTEXT] = allocHandler(rmAllocSimple[nvgpu.NVB1CC_ALLOC_PARAMETERS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER] = uvmHandler(uvmToolsInitEventTracker, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_ENABLE_COUNTERS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_DISABLE_COUNTERS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE] = uvmHandler(uvmToolsGetProcessorUUIDTable, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_FLUSH_EVENTS] = uvmHandler(uvmIoctlSimple[nvgpu.UVM_TOOLS_FLUSH_EVENTS_PARAMS], nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_V2] = uvmHandler(uvmToolsInitEventTracker, nvconf.CapProfiling)
+			abi.uvmIoctl[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2] = uvmHandler(uvmToolsGetProcessorUUIDTable, nvconf.CapProfiling)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.UvmInfos[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER] = ioctlInfo("UVM_TOOLS_INIT_EVENT_TRACKER", nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS{}, nvgpu.UvmEventEntry{}, nvgpu.UvmToolsEventControlData{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD] = ioctlInfo("UVM_TOOLS_SET_NOTIFICATION_THRESHOLD", nvgpu.UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS] = ioctlInfoWithStructName("UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_EVENT_QUEUE_ENABLE_EVENTS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS] = ioctlInfoWithStructName("UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_EVENT_QUEUE_DISABLE_EVENTS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_ENABLE_COUNTERS] = ioctlInfoWithStructName("UVM_TOOLS_ENABLE_COUNTERS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_ENABLE_COUNTERS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_DISABLE_COUNTERS] = ioctlInfoWithStructName("UVM_TOOLS_DISABLE_COUNTERS", nvgpu.UVM_TOOLS_TYPE_FLAGS_PARAMS{}, "UVM_TOOLS_DISABLE_COUNTERS_PARAMS")
+				info.UvmInfos[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE] = ioctlInfo("UVM_TOOLS_GET_PROCESSOR_UUID_TABLE", nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_FLUSH_EVENTS] = ioctlInfo("UVM_TOOLS_FLUSH_EVENTS", nvgpu.UVM_TOOLS_FLUSH_EVENTS_PARAMS{})
+				info.UvmInfos[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_V2] = IoctlInfo{
+					Name: "UVM_TOOLS_INIT_EVENT_TRACKER_V2",
+					Structs: []DriverStruct{
+						newDriverStruct(reflect.TypeFor[nvgpu.UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS](), "UVM_TOOLS_INIT_EVENT_TRACKER_V2_PARAMS"),
+						newDriverStruct(reflect.TypeFor[nvgpu.UvmEventEntry_V2](), "UvmEventEntry_V2"),
+						newDriverStruct(reflect.TypeFor[nvgpu.UvmToolsEventControlData](), "UvmToolsEventControlData"),
+					},
+				}
+				info.UvmInfos[nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2] = ioctlInfoWithStructName("UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2", nvgpu.UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_PARAMS{}, "UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2_PARAMS")
+				info.UvmConstants["UVM_TOTAL_COUNTERS"] = nvgpu.UVM_TOTAL_COUNTERS
+				info.UvmConstants["UVM_MAX_PROCESSORS_V1"] = nvgpu.UVM_MAX_PROCESSORS_V1
+				info.UvmConstants["UVM_MAX_PROCESSORS"] = nvgpu.UVM_MAX_PROCESSORS
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION] = simpleIoctlInfo("NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION", "NV2080_CTRL_GPU_GET_RECOVERY_ACTION_PARAMS")
 				info.AllocationInfos[nvgpu.MAXWELL_PROFILER_CONTEXT] = ioctlInfo("MAXWELL_PROFILER_CONTEXT", nvgpu.NVB1CC_ALLOC_PARAMETERS{})
 				return info
@@ -1161,7 +1195,14 @@ func Init() {
 		v580_167_08 := addDriverABI(580, 167, 8, "eeaf59b4939aa7283e7883e208fb874a3f71f5a3479df324d500d1abf1bc9cef", ChecksumNoDriver, v580_159_04)
 		v580_173_02 := addDriverABI(580, 173, 02, "8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b", "d65bd56087ef4d78f04a808da7883c35a5901c5fd37e95d150a7602eba97aa80", v580_167_08)
 		v580_173_10 := addDriverABI(580, 173, 10, ChecksumNoDriver, "01756a4a5a239e07be1a042ef423829fc0dd66f3688e72060f97ae527f353000", v580_173_02)
-		_ = addDriverABI(580, 178, 04, "5975a86ee45bffcb626f51ae33d1169b108186a2ea47ad651e72f13fa4b6d6f9", "ef59ec5d24850e12d6f7550ec1f7cf84db53a84ce9c63eb3ba55ef5ed0c4f049", v580_173_10)
+		// Drivers only handle the application-provided flags and attributes of
+		// NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR safely starting with 580.178.04 in
+		// the 580 branch and 610.57.04 in the 610 branch.
+		_ = addDriverABI(580, 178, 04, "5975a86ee45bffcb626f51ae33d1169b108186a2ea47ad651e72f13fa4b6d6f9", "ef59ec5d24850e12d6f7550ec1f7cf84db53a84ce9c63eb3ba55ef5ed0c4f049", func() *driverABI {
+			abi := v580_173_10()
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_VID_HEAP_CONTROL] = feHandler(rmVidHeapControlWithOSDescriptor, compUtil)
+			return abi
+		})
 
 		v590_44_01 := addUnsupportedDriverABI(590, 44, 01, func() *driverABI {
 			abi := v580_105_08()
@@ -1246,7 +1287,11 @@ func Init() {
 			}
 			return abi
 		})
-		v610_57_04 := addDriverABI(610, 57, 04, "b2e935c66b83bb00c0c857bc8e0ee0fd52de9286b40c9cc1eec29a7ce7eb116d", "40279facc0429a93b0b8ec97bf59391a3d2207609894f8271b7253a14c3f8f9e", v610_43_02)
+		v610_57_04 := addDriverABI(610, 57, 04, "b2e935c66b83bb00c0c857bc8e0ee0fd52de9286b40c9cc1eec29a7ce7eb116d", "40279facc0429a93b0b8ec97bf59391a3d2207609894f8271b7253a14c3f8f9e", func() *driverABI {
+			abi := v610_43_02()
+			abi.frontendIoctl[nvgpu.NV_ESC_RM_VID_HEAP_CONTROL] = feHandler(rmVidHeapControlWithOSDescriptor, compUtil)
+			return abi
+		})
 
 		// 615.15.00 and 615.62.00 are pre-release builds without public source.
 		// 615.71.09's ABI changes likely apply to them too, but are only
@@ -1300,7 +1345,9 @@ func Init() {
 			}
 			return abi
 		})
-		_ = addDriverABI(620, 51, 0, ChecksumNoDriver, "cf761f39bffc561f6529171e342b5ecfdb4fabcc8dff4159f9400432bf7dc2e8", v620_30_00)
+		v620_32_00 := addDriverABI(620, 32, 00, ChecksumNoDriver, "48b576150f3d25219162912a4a1e457c678ab13761350ef770f6ef6e8c44483b", v620_30_00)
+		v620_47_00 := addDriverABI(620, 47, 00, ChecksumNoDriver, "866b5775ee3bb95c07b90252fa238b538aeabda038a0566590c16b13e16193cc", v620_32_00)
+		_ = addDriverABI(620, 51, 0, ChecksumNoDriver, "cf761f39bffc561f6529171e342b5ecfdb4fabcc8dff4159f9400432bf7dc2e8", v620_47_00)
 	})
 }
 

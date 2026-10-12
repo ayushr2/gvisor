@@ -48,8 +48,9 @@ go_library(
 
 go_test(
     name = "config_test",
+    size = "large",
     srcs = ["config_test.go"],
-    library = ":config",
+    embed = [":config"],
     deps = [
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",

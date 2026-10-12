@@ -267,14 +267,19 @@ func TestInvalidFlags(t *testing.T) {
 			error: "expected format is --overlay2",
 		},
 		{
-			name:  "sidecar-usage-policy",
-			value: "invalid",
-			error: "invalid value \"invalid\"; must be DEFAULT, STRICT, or LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
-		},
-		{
 			name:  "sidecar-release-enforcement-policy",
 			value: "invalid",
 			error: "invalid value \"invalid\"; must be NEVER, ALWAYS, or IF_RELEASE_BUILD",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "invalid",
+			error: "invalid value \"invalid\"; must be DEFAULT or STRICT",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
+			error: "the embedded sidecar fallback has been removed",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1026,6 +1031,32 @@ func TestParseSerializeOverlay2(t *testing.T) {
 		}
 		if o.String() != "root:memory,size=1g" {
 			t.Fatalf("String mismatch, expecting ll:memory,size=1g, got %q", o.String())
+		}
+	})
+	t.Run("Repeated Set", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("all:memory,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Set("root:self"); err != nil {
+			t.Fatal(err)
+		}
+		want := Overlay2{rootMount: true, medium: SelfOverlay}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
+	t.Run("Invalid Set preserves value", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("root:self,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		want := o
+		if err := o.Set("all:memory,invalid=1g"); err == nil {
+			t.Fatal("Set succeeded, want error")
+		}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
 		}
 	})
 }

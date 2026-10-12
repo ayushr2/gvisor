@@ -153,6 +153,9 @@ const (
 )
 
 const (
+	// NetworkCreateLinksAndRoutes synchronously creates links and routes.
+	NetworkCreateLinksAndRoutes = "Network.CreateLinksAndRoutes"
+
 	// NetworkInitPluginStack initializes third-party network stack.
 	NetworkInitPluginStack = "Network.InitPluginStack"
 
@@ -964,6 +967,7 @@ func (cm *containerManager) WaitRestore(*struct{}, *struct{}) error {
 	return err
 }
 
+// +checklocksexclude:cm.l.k.fsSaveMu
 func (cm *containerManager) WaitFSCheckpoint(*struct{}, *struct{}) error {
 	log.Debugf("containerManager.WaitFSCheckpoint")
 	err := cm.l.k.WaitForFSSave()
@@ -1230,6 +1234,8 @@ type FSSaveArgs struct {
 }
 
 // FSSave collects a filesystem checkpoint.
+//
+// +checklocksexclude:cm.l.k.fsSaveMu
 func (cm *containerManager) FSSave(args *FSSaveArgs, _ *struct{}) error {
 	log.Debugf("containerManager.FSSave")
 	kopts, err := convertToKernelFSSaveOpts(args)

@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -61,6 +62,7 @@
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 #include "test/util/time_util.h"
+#include "test/util/timer_util.h"
 
 ABSL_FLAG(bool, ptrace_test_execve_child, false,
           "If true, run the "
@@ -113,10 +115,6 @@ namespace {
 // definitions)").
 constexpr auto kPtraceGetSigMask = static_cast<__ptrace_request>(0x420a);
 constexpr auto kPtraceSetSigMask = static_cast<__ptrace_request>(0x420b);
-
-// PTRACE_SYSEMU is not defined until glibc 2.27 (c48831d0eebf "linux/x86: sync
-// sys/ptrace.h with Linux 4.14 [BZ #22433]").
-constexpr auto kPtraceSysemu = static_cast<__ptrace_request>(31);
 
 // PTRACE_EVENT_STOP is not defined until glibc 2.26 (3f67d1a7021e "Add Linux
 // PTRACE_EVENT_STOP").
@@ -848,14 +846,20 @@ TEST(PtraceTest, PrctlSetPtracerDoesNotPersistPastTracerThreadExit) {
   });
   t.Join();
 
-  // Sleep for a bit before verifying the invalidation. The thread exit above
-  // should cause the ptrace exception to be invalidated, but in Linux, this is
-  // not done immediately. The YAMA exception is dropped during
-  // __put_task_struct(), which occurs (at the earliest) one RCU grace period
-  // after exit_notify() ==> release_task().
-  SleepSafe(absl::Milliseconds(100));
+  // The YAMA exception is dropped during __put_task_struct(), after an RCU
+  // grace period. Joining the thread does not wait for that cleanup, so wait
+  // for the observable denial rather than assuming a fixed delay is enough.
+  const absl::Time deadline = Now(CLOCK_MONOTONIC) + absl::Seconds(5);
+  int ret;
+  do {
+    ret = CheckPtraceAttach(tracee_tid);
+    if (ret < 0) {
+      break;
+    }
+    SleepSafe(absl::Milliseconds(10));
+  } while (Now(CLOCK_MONOTONIC) < deadline);
 
-  TEST_CHECK(CheckPtraceAttach(tracee_tid) == -1);
+  TEST_CHECK(ret == -1);
   TEST_PCHECK(errno == EPERM);
   _exit(0);
 }
@@ -972,6 +976,9 @@ TEST(PtraceTest, PrctlClearPtracerDoesNotAffectCurrentTracer) {
   pid_t const tracee_pid = fork();
   if (tracee_pid == 0) {
     TEST_PCHECK(close(sockets[1]) == 0);
+    // /proc/PID/mem checks the tracer's effective capabilities against the
+    // tracee's permitted set. AutoCapability only cleared the effective bit.
+    TEST_CHECK(DropPermittedCapability(CAP_SYS_PTRACE).ok());
     TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
     MaybeSave();
     // Indicate that the prctl has been set.
@@ -2012,6 +2019,10 @@ TEST(PtraceTest, Int3) {
 }
 
 TEST(PtraceTest, Sysemu_PokeUser) {
+  // PTRACE_SYSEMU is not defined until glibc 2.27 (c48831d0eebf "linux/x86:
+  // sync sys/ptrace.h with Linux 4.14 [BZ #22433]").
+  constexpr auto kPtraceSysemu = static_cast<__ptrace_request>(31);
+
   constexpr int kSysemuHelperFirstExitCode = 126;
   constexpr uint64_t kSysemuInjectedExitGroupReturn = 42;
 
