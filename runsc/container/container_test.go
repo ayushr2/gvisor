@@ -44,13 +44,12 @@ import (
 	"gvisor.dev/gvisor/pkg/control/api"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -4786,7 +4785,7 @@ func TestMountEROFS(t *testing.T) {
 	targetDir := "/mnt"
 	for _, i := range env.images {
 		// Mount the EROFS image in the container.
-		if err := c.Sandbox.Mount(c.ID, erofs.Name, i.path, targetDir); err != nil {
+		if err := c.Sandbox.Mount(c.ID, bootapi.Erofs, i.path, targetDir); err != nil {
 			t.Fatalf("error mounting EROFS image %q at %q, err: %v", i.path, targetDir, err)
 		}
 
@@ -4828,7 +4827,7 @@ func TestMountEROFSConfig(t *testing.T) {
 			spec.Mounts = append(spec.Mounts, specs.Mount{
 				Source:      i.path,
 				Destination: targetDir,
-				Type:        erofs.Name,
+				Type:        bootapi.Erofs,
 				Options:     []string{"ro"},
 			})
 
@@ -4921,11 +4920,11 @@ func TestRootfsEROFS(t *testing.T) {
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
-	spec.Annotations[boot.RootfsPrefix+"type"] = erofs.Name
-	spec.Annotations[boot.RootfsPrefix+"source"] = rootfsImage
+	spec.Annotations[bootapi.RootfsPrefix+"type"] = bootapi.Erofs
+	spec.Annotations[bootapi.RootfsPrefix+"source"] = rootfsImage
 	// Disable the overlay, as we want to be sure that rootfs will always be
 	// shown as EROFS in mountinfo.
-	spec.Annotations[boot.RootfsPrefix+"overlay"] = config.NoOverlay.String()
+	spec.Annotations[bootapi.RootfsPrefix+"overlay"] = config.NoOverlay.String()
 
 	conf := testutil.TestConfig(t)
 	mountDir, err := os.MkdirTemp(testutil.TmpDir(), "mount_dir")
@@ -4951,7 +4950,7 @@ func TestRootfsEROFS(t *testing.T) {
 		// in goferless mode and requires donating both EROFS image FDs.
 		{
 			{
-				Type:        erofs.Name,
+				Type:        bootapi.Erofs,
 				Destination: "/data",
 				Source:      rootfsImage,
 				Options:     []string{"ro"},
@@ -5072,7 +5071,7 @@ func TestLookupEROFS(t *testing.T) {
 		}
 
 		// Mount the EROFS image in the container.
-		if err := c.Sandbox.Mount(c.ID, erofs.Name, imageFile, targetDir); err != nil {
+		if err := c.Sandbox.Mount(c.ID, bootapi.Erofs, imageFile, targetDir); err != nil {
 			t.Fatalf("error mounting EROFS image %q at %q, err: %v", imageFile, targetDir, err)
 		}
 

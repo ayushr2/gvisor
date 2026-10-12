@@ -16,10 +16,14 @@ package boot
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/runsc/boot/bootapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -33,67 +37,127 @@ func TestGetMountAccessType(t *testing.T) {
 		{
 			name: "container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				bootapi.MountPrefix + "mount1.source": source,
+				bootapi.MountPrefix + "mount1.type":   "bind",
+				bootapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "pod=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "pod",
+				bootapi.MountPrefix + "mount1.source": source,
+				bootapi.MountPrefix + "mount1.type":   "bind",
+				bootapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "share=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "shared",
+				bootapi.MountPrefix + "mount1.source": source,
+				bootapi.MountPrefix + "mount1.type":   "bind",
+				bootapi.MountPrefix + "mount1.share":  "shared",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "default=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source + "mismatch",
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				bootapi.MountPrefix + "mount1.source": source + "mismatch",
+				bootapi.MountPrefix + "mount1.type":   "bind",
+				bootapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "tmpfs+container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "container",
+				bootapi.MountPrefix + "mount1.source": source,
+				bootapi.MountPrefix + "mount1.type":   "tmpfs",
+				bootapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "tmpfs+pod=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "pod",
+				bootapi.MountPrefix + "mount1.source": source,
+				bootapi.MountPrefix + "mount1.type":   "tmpfs",
+				bootapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessExclusive,
 		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
 			spec := &specs.Spec{Annotations: tst.annotations}
-			podHints, err := NewPodMountHints(spec)
+			podHints, err := bootapi.NewPodMountHints(spec)
 			if err != nil {
 				t.Fatalf("newPodMountHints failed: %v", err)
 			}
 			conf := &config.Config{FileAccessMounts: config.FileAccessShared}
 			if got := getMountAccessType(conf, podHints.FindMount(source)); got != tst.want {
 				t.Errorf("getMountAccessType(), got: %v, want: %v", got, tst.want)
+			}
+		})
+	}
+}
+
+func TestHintsCheckCompatible(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		masterOpts  []string
+		replicaOpts []string
+		err         string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:        "same",
+			masterOpts:  []string{"ro", "noatime", "noexec"},
+			replicaOpts: []string{"ro", "noatime", "noexec"},
+		},
+		{
+			name:        "compatible",
+			masterOpts:  []string{"rw", "atime", "exec"},
+			replicaOpts: []string{"ro", "noatime", "noexec"},
+		},
+		{
+			name:        "unsupported",
+			masterOpts:  []string{"nofoo", "nodev"},
+			replicaOpts: []string{"foo", "dev"},
+		},
+		{
+			name:        "incompatible-ro",
+			masterOpts:  []string{"ro"},
+			replicaOpts: []string{"rw"},
+			err:         "read-write",
+		},
+		{
+			name:        "incompatible-atime",
+			masterOpts:  []string{"noatime"},
+			replicaOpts: []string{"atime"},
+			err:         "noatime",
+		},
+		{
+			name:        "incompatible-exec",
+			masterOpts:  []string{"noexec"},
+			replicaOpts: []string{"exec"},
+			err:         "noexec",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			master := bootapi.MountHint{Mount: specs.Mount{Options: tc.masterOpts}}
+			replica := specs.Mount{Options: tc.replicaOpts}
+			if err := checkHintCompatible(&master, &replica); err != nil {
+				if !strings.Contains(err.Error(), tc.err) {
+					t.Fatalf("wrong error, want: %q, got: %q", tc.err, err)
+				}
+			} else {
+				if len(tc.err) > 0 {
+					t.Fatalf("error %q expected", tc.err)
+				}
 			}
 		})
 	}
@@ -182,91 +246,6 @@ func TestCgroupfsCPUDefaults(t *testing.T) {
 	}
 }
 
-func TestParseFSCheckpointPaths(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		in      string
-		wantErr bool
-		wantLen int
-	}{
-		{
-			name:    "empty",
-			in:      "",
-			wantErr: false,
-			wantLen: 0,
-		},
-		{
-			name:    "all-tmpfs",
-			in:      "all-tmpfs",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "clean absolute path",
-			in:      "/data",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "container and clean absolute path",
-			in:      "c1:/data",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "multiple clean paths",
-			in:      "c1:/data, c2:/tmp, all-tmpfs",
-			wantErr: false,
-			wantLen: 3,
-		},
-		{
-			name:    "uncleaned trailing slash",
-			in:      "/data/",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned redundant slash",
-			in:      "/data//dir",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned root slashes",
-			in:      "//",
-			wantErr: true,
-		},
-		{
-			name:    "relative path",
-			in:      "data",
-			wantErr: true,
-		},
-		{
-			name:    "container with empty path",
-			in:      "c1:",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned dot",
-			in:      "/data/./sub",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned dot dot",
-			in:      "/data/../sub",
-			wantErr: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			paths, err := ParseFSCheckpointPaths(tc.in)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("ParseFSCheckpointPaths(%q) error = %v, wantErr %v", tc.in, err, tc.wantErr)
-			}
-			if err == nil && len(paths) != tc.wantLen {
-				t.Errorf("ParseFSCheckpointPaths(%q) len = %d, want %d", tc.in, len(paths), tc.wantLen)
-			}
-		})
-	}
-}
-
 func TestFindByResourceID(t *testing.T) {
 	type testItem struct {
 		id checkpoint.ResourceID
@@ -307,5 +286,16 @@ func TestFindByResourceID(t *testing.T) {
 	}
 	if got, ok, err := findByResourceID(ambiguousMap, checkpoint.ResourceID{ContainerName: "", Path: "/multi"}, getID, "Test"); err == nil || ok {
 		t.Errorf("findByResourceID ambiguous match got (%v, %v, %v), want zero, false, error", got, ok, err)
+	}
+}
+
+// TestFilesystemNames checks that the filesystem names that runsc uses match
+// the names that the Sentry registers.
+func TestFilesystemNames(t *testing.T) {
+	if bootapi.Tmpfs != tmpfs.Name {
+		t.Errorf("bootapi.Tmpfs = %q, want %q", bootapi.Tmpfs, tmpfs.Name)
+	}
+	if bootapi.Erofs != erofs.Name {
+		t.Errorf("bootapi.Erofs = %q, want %q", bootapi.Erofs, erofs.Name)
 	}
 }

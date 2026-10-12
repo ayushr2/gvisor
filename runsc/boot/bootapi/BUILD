@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -8,8 +8,11 @@ package(
 go_library(
     name = "bootapi",
     srcs = [
+        "checkpoint.go",
         "controller.go",
         "events.go",
+        "fs.go",
+        "mount_hints.go",
         "network.go",
         "seccheck.go",
     ],
@@ -19,13 +22,31 @@ go_library(
         "//test:__subpackages__",
     ],
     deps = [
+        "//pkg/fsutil",
+        "//pkg/log",
         "//pkg/sentry/checkpoint",
+        "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/sinks/null",
         "//pkg/sentry/seccheck/sinks/remote",
+        "//pkg/state/statefile",
         "//pkg/urpc",
         "//runsc/config",
         "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+go_test(
+    name = "bootapi_test",
+    size = "small",
+    srcs = [
+        "checkpoint_test.go",
+        "mount_hints_test.go",
+    ],
+    library = ":bootapi",
+    deps = [
+        "//runsc/config",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )
