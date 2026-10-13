@@ -64,6 +64,11 @@ const (
 	NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY = 0xd04
 )
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
+const (
+	NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION = 0x501
+)
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
 const (
 	NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS      = 0x201
@@ -631,6 +636,11 @@ const (
 	NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES = 64
 )
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fla.h:
+const (
+	NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS = 0x20803504
+)
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080flcn.h:
 const (
 	NV2080_CTRL_CMD_FLCN_GET_CTX_BUFFER_SIZE = 0x20803125
@@ -814,6 +824,7 @@ type NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS struct {
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080perf.h:
 const (
+	NV2080_CTRL_CMD_PERF_RATED_TDP_SET_CONTROL              = 0x2080206f
 	NV2080_CTRL_CMD_PERF_BOOST                              = 0x2080200a
 	NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE                 = 0x20802068
 	NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2 = 0x20802096
@@ -954,6 +965,7 @@ const (
 	NVB0CC_CTRL_CMD_RELEASE_PM_AREA_PC_SAMPLER = 0xb0cc010c
 	NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS       = 0xb0cc010d
 	NVB0CC_CTRL_CMD_SET_HS_CREDITS             = 0xb0cc010e
+	NVB0CC_CTRL_CMD_RESERVE_HES                = 0xb0cc0113
 	NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL = 0xb0cc0115
 	NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING     = 0xb0cc0116
 	NVB0CC_CTRL_CMD_RESERVE_CCU_PROF           = 0xb0cc0119
@@ -967,6 +979,12 @@ const (
 	NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE       = 0xcb330104
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS = 0xcb33010b
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_KEY_ROTATION_STATE  = 0xcb33010c
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl00fe.h:
+const (
+	NV00FE_CTRL_CMD_SUBMIT_OPERATIONS = 0xfe0101
+	NV00FE_CTRL_CMD_RESIZE_QUEUE      = 0xfe0102
 )
 
 // The following IOCTLs are not found in the OSS repo.

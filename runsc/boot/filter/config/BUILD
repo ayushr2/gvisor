@@ -31,6 +31,7 @@ go_library(
         "//pkg/log",
         "//pkg/seccomp",
         "//pkg/seccomp/precompiledseccomp",
+        "//pkg/sentry/devices/amdgpuproxy",
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/devices/rdmaproxy",
@@ -48,8 +49,9 @@ go_library(
 
 go_test(
     name = "config_test",
+    size = "large",
     srcs = ["config_test.go"],
-    library = ":config",
+    embed = [":config"],
     deps = [
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",

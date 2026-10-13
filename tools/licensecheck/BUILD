@@ -8,6 +8,7 @@ package(
 go_library(
     name = "licensecheck",
     srcs = ["licensecheck.go"],
+    importpath = "gvisor.dev/gvisor/tools/licensecheck",
     marshal = False,
     stateify = False,
     visibility = ["//tools/licensecheck:__subpackages__"],
@@ -27,5 +28,10 @@ go_test(
         "dependencies.yaml",
         "//governance:licensing.yaml",
     ],
-    library = ":licensecheck",
+    embed = [":licensecheck"],
+    embedsrcs = [
+        "testdata/overflow-readme.txt",
+        "testdata/udiff-bsd.txt",
+        "testdata/udiff-mit.txt",
+    ],
 )

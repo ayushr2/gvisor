@@ -1,3 +1,4 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools:defs.bzl", "go_binary", "go_cov")
 
 package(
@@ -35,8 +36,10 @@ go_binary(
     ],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
+        "//pkg/sentry/socket/plugin/cgo",
         "//pkg/sentry/socket/plugin/stack",
         "//runsc/cli/maincli",
+        "//runsc/sandbox",
         "//runsc/version",
     ],
 )

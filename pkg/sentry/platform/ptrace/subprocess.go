@@ -20,7 +20,9 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
@@ -530,7 +532,10 @@ func (s *subprocess) switchToApp(c *context, ac *arch.Context64) (bool, error) {
 	tls := uint64(ac.TLS())
 
 	// Check for interrupts, and ensure that future interrupts will signal t.
-	if !c.interrupt.Enable(t) {
+	if c.thread.Load() != t {
+		c.thread.Store(t)
+	}
+	if !c.interrupt.Enable() {
 		// Pending interrupt; simulate.
 		c.signalInfo = linux.SignalInfo{Signo: int32(platform.SignalInterrupt)}
 		return false, nil
@@ -689,3 +694,8 @@ func (s *subprocess) PreFork() {}
 
 // PostFork implements platform.AddressSpace.PostFork.
 func (s *subprocess) PostFork() {}
+
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
+func (s *subprocess) UserModifiedGS(ctx pkgcontext.Context, mm platform.MemoryManager) error {
+	return nil
+}

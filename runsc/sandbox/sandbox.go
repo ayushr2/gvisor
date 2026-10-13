@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -47,10 +48,9 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/prometheus"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
+	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -150,8 +150,10 @@ func (p *Pid) MarshalJSON() ([]byte, error) {
 // gofers), as well as for running and manipulating containers inside a running
 // sandbox.
 //
-// Note: Sandbox must be immutable because a copy of it is saved for each
-// container and changes would not be synchronized to all of them.
+// A copy is saved for each container; configuration changes are not
+// synchronized across copies. Mutable caches such as restore-time savings
+// are synchronized within each instance. Saving or loading an instance
+// requires exclusive access to its serialized fields.
 type Sandbox struct {
 	// ID is the id of the sandbox (immutable). By convention, this is the same
 	// ID as the first container run in the sandbox.
@@ -216,6 +218,10 @@ type Sandbox struct {
 	// StartTime is the time the sandbox was started.
 	StartTime time.Time `json:"startTime"`
 
+	// NoRootContainer records how the sandbox was booted. See
+	// Args.NoRootContainer.
+	NoRootContainer bool `json:"noRootContainer"`
+
 	// rootDir is the same as config.Config.RootDir. It represents the runtime
 	// root directory being used by the current runsc invocation. It's not saved
 	// to json, because the RootDir can change across runsc invocations.
@@ -243,10 +249,17 @@ type Sandbox struct {
 	// Restored will be true when the sandbox has been restored.
 	Restored bool `json:"restored"`
 
+	// savingsMu protects the cached time saved by restoration.
+	savingsMu sync.Mutex `nojson:"true"`
+
 	// CPUTimeSaved contains the CPU time saved when the sandbox has been restored.
+	//
+	// +checklocks:savingsMu
 	CPUTimeSaved time.Duration `json:"cpuTimeSaved"`
 
 	// WallTimeSaved contains the wall time saved when the sandbox has been restored.
+	//
+	// +checklocks:savingsMu
 	WallTimeSaved time.Duration `json:"wallTimeSaved"`
 }
 
@@ -326,6 +339,10 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// NoRootContainer boots without a root container: no gofer FDs, no root
+	// process. See container.Args.NoRootContainer.
+	NoRootContainer bool
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -342,6 +359,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		MetricServerAddress: conf.MetricServer,
 		MountHints:          args.MountHints,
 		StartTime:           starttime.Get(),
+		NoRootContainer:     args.NoRootContainer,
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -548,12 +566,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
-	if !s.FSRestore && imagePath != "" {
-		fsDir := filepath.Join(imagePath, checkpointfiles.FSCheckpointDir)
-		manifestPath := filepath.Join(fsDir, checkpointfiles.FSCheckpointManifestFileName)
-		if _, err := os.Stat(manifestPath); err == nil {
-			return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
-		}
+	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
 	opt := boot.RestoreOpts{
@@ -570,7 +584,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDevicePath); err != nil {
+	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return err
 	} else if deviceFile != nil {
 		defer deviceFile.Close()
@@ -896,6 +910,41 @@ func (s *Sandbox) connError(err error) error {
 	return fmt.Errorf("connecting to control server at PID %d: %v", s.Pid.Load(), err)
 }
 
+type sandboxProcessEnvOptions struct {
+	sentryUsesCgo bool
+}
+
+func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []string {
+	var env []string
+	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		// --TESTONLY-unsafe-nonroot is set, so keep env.
+		env = os.Environ()
+	} else {
+		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
+		// Clear it, except for TMPDIR which must match the parent runsc process
+		// because the sandbox uses os.TempDir() to set up its chroot.
+		env = []string{}
+		if tmpDir := os.Getenv("TMPDIR"); tmpDir != "" {
+			env = append(env, "TMPDIR="+tmpDir)
+		}
+	}
+	env = gvisorbinaries.WithEnforceRelease(env)
+	if opts.sentryUsesCgo {
+		// Platforms that use stub processes are not compatible with
+		// the glibc rseq, because they unmap everything from a process
+		// address space.
+		env = append(env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
+	}
+	return env
+}
+
+// sentryExeFD is the FD at which the prewarmer inherits the Sentry binary.
+// Must match `SENTRY_EXE_FD` in `runsc/prewarmer/prewarmer.c`.
+// LINT.IfChange
+const sentryExeFD = 3
+
+// LINT.ThenChange(../prewarmer/prewarmer.c)
+
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
@@ -966,23 +1015,38 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	lfOpts.Command = "boot" // Revert command to "boot".
 
 	sentryBin := &gvisorbinaries.GvisorSentry
-	sentryUsesCgo := false
+	// runsc cannot tell whether the Sentry sidecar uses cgo, so assume it
+	// does if runsc does: race builds pair a race runsc with a race Sentry.
+	// Caveats: a cgo runsc booting a pure Sentry (e.g. a cgo test binary)
+	// sets GLIBC_TUNABLES needlessly, which is harmless. A pure runsc
+	// booting a cgo Sentry other than the plugin stack does not set it,
+	// so that Sentry's stubs would crash; no build pairs them today.
+	sentryUsesCgo := config.CgoEnabled
 	if conf.Network == config.NetworkPlugin {
 		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
 	}
-	bootBinPath := specutils.ExePath
-	if p, err := sentryBin.Path(); err == nil {
-		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
-		bootBinPath = p
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
+	bootBinPath, err := sentryBin.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable: %w", sentryBin.Name, err)
 	}
+	log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, bootBinPath)
+	// Open with `O_PATH`, which is sufficient for exec and makes the FD
+	// effectively execute-only (no read/write).
+	bootBin, err := os.OpenFile(bootBinPath, unix.O_PATH, 0)
+	if err != nil {
+		return fmt.Errorf("cannot open boot binary %q: %w", bootBinPath, err)
+	}
+	defer bootBin.Close()
+	prewarmerPath, err := gvisorbinaries.GvisorSentryPrewarmer.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable: %w", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+	}
+	log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, prewarmerPath)
 
 	// Relay all the config flags to the sandbox process.
-	cmd := exec.Command(bootBinPath, conf.ToFlags()...)
+	cmd := exec.Command(prewarmerPath, conf.ToFlags()...)
+	cmd.ExtraFiles = []*os.File{bootBin} // Gets FD number `sentryExeFD`.
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from this session, otherwise cmd will get SIGHUP and SIGCONT
 		// when re-parented.
@@ -996,43 +1060,20 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// Set Args[0] to make easier to spot the sandbox process.
 	cmd.Args[0] = "runsc-sandbox"
 
-	// If the prewarmer sidecar is available, exec it ahead of the boot binary.
-	// Its argv is `gvisor-prewarmer <binary> <argv[0]> [argv[1:]...]`.
-	if p, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
-		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
-		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
-		cmd.Path = p
-	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
-		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
-	}
-
 	// Transfer FDs that need to be present before the "boot" command.
-	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
-	nextFD := donations.Transfer(cmd, 3)
+	nextFD := donations.Transfer(cmd, sentryExeFD+1)
 
 	// Add the "boot" command to the args.
 	//
 	// All flags after this must be for the boot command
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
+	if args.NoRootContainer {
+		cmd.Args = append(cmd.Args, "--no-root-container")
+	}
 
-	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-		// --TESTONLY-unsafe-nonroot is set, so keep env.
-		cmd.Env = os.Environ()
-	} else {
-		// Clear environment variables, unless --TESTONLY-unsafe-nonroot is set.
-		cmd.Env = []string{}
-	}
-	if bootBinPath != specutils.ExePath {
-		cmd.Env = gvisorbinaries.WithEnforceRelease(cmd.Env)
-	}
-	if sentryUsesCgo {
-		// Platforms that use stub processes are not compatible with
-		// the glibc rseq, because they unmap everything from a process
-		// address space.
-		cmd.Env = append(cmd.Env, "GLIBC_TUNABLES=glibc.pthread.rseq=0")
-	}
+	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
+		sentryUsesCgo: sentryUsesCgo,
+	})
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
@@ -1064,7 +1105,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// Pass gofer mount configs.
-	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	if len(args.GoferMountConfs) > 0 {
+		cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	}
 
 	// Create a socket for the control server and donate it to the sandbox.
 	controlSocketPath, sockFD, err := createControlSocket(conf.RootDir, s.ID)
@@ -1114,7 +1157,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err != nil {
 		return fmt.Errorf("cannot look up platform: %w", err)
 	}
-	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDevicePath); err != nil {
+	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return fmt.Errorf("opening device file for platform %q: %v", conf.Platform, err)
 	} else if deviceFile != nil {
 		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
@@ -1290,7 +1333,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If the console control socket file is provided, then create a new
 	// pty master/replica pair and set the TTY on the sandbox process.
-	if args.Spec.Process.Terminal && args.ConsoleSocket != "" {
+	if args.Spec.Process != nil && args.Spec.Process.Terminal && args.ConsoleSocket != "" {
 		// console.NewWithSocket will send the master on the given
 		// socket, and return the replica.
 		tty, err := console.NewWithSocket(args.ConsoleSocket)
@@ -1363,34 +1406,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	mem := totalSysMem
 	if s.CgroupJSON.Cgroup != nil {
-		cpuNum, err := s.CgroupJSON.Cgroup.NumCPU()
+		cpuNum, cpuQuota, cpuPeriod, err := calculateCPUNum(s.CgroupJSON.Cgroup, conf.CPUNumFromQuota)
 		if err != nil {
-			return fmt.Errorf("getting cpu count from cgroups: %v", err)
-		}
-		cpuQuota, err := s.CgroupJSON.Cgroup.CPUQuota()
-		if err != nil {
-			return fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
-		}
-		cpuPeriod, err := s.CgroupJSON.Cgroup.CPUPeriod()
-		if err != nil {
-			return fmt.Errorf("getting raw cpu period from cgroups: %v", err)
-		}
-		if conf.CPUNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
-			// Dropping below 2 CPUs can trigger application to disable
-			// locks that can lead do hard to debug errors, so just
-			// leaving two cores as reasonable default.
-			const minCPUs = 2
-
-			quota := float64(cpuQuota) / float64(cpuPeriod)
-			if n := int(math.Ceil(quota)); n > 0 {
-				if n < minCPUs {
-					n = minCPUs
-				}
-				if n < cpuNum {
-					// Only lower the cpu number.
-					cpuNum = n
-				}
-			}
+			return err
 		}
 		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(cpuNum))
 		if cpuQuota > 0 {
@@ -1505,6 +1523,42 @@ func spawnFDParking(ring *os.File, pid int) error {
 	return nil
 }
 
+// calculateCPUNum calculates the number of CPUs to configure for the sandbox,
+// along with the cgroup CPU quota and period.
+func calculateCPUNum(cg cgroup.Cgroup, cpuNumFromQuota bool) (int, int64, int64, error) {
+	cpuNum, err := cg.NumCPU()
+	if err != nil {
+		log.Warningf("Failed to get cpu count from cgroups: %v. Falling back to runtime.NumCPU()", err)
+		cpuNum = runtime.NumCPU()
+	}
+	cpuQuota, err := cg.CPUQuota()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
+	}
+	cpuPeriod, err := cg.CPUPeriod()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("getting raw cpu period from cgroups: %v", err)
+	}
+	if cpuNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
+		// Dropping below 2 CPUs can trigger application to disable
+		// locks that can lead do hard to debug errors, so just
+		// leaving two cores as reasonable default.
+		const minCPUs = 2
+
+		quota := float64(cpuQuota) / float64(cpuPeriod)
+		if n := int(math.Ceil(quota)); n > 0 {
+			if n < minCPUs {
+				n = minCPUs
+			}
+			if n < cpuNum {
+				// Only lower the cpu number.
+				cpuNum = n
+			}
+		}
+	}
+	return cpuNum, cpuQuota, cpuPeriod, nil
+}
+
 func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
 	for _, idMap := range IDMap {
 		if idMap.ContainerID == 0 {
@@ -1517,6 +1571,10 @@ func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
 func SandboxUserGroupIDs(spec *specs.Spec) (uint32, uint32) {
 	uid := uint32(0)
 	gid := uint32(0)
+
+	if spec.Process == nil {
+		return uid, gid
+	}
 
 	if !rootMappedInContainer(spec.Linux.UIDMappings) {
 		uid = spec.Process.User.UID
@@ -1574,6 +1632,9 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 		return unix.WaitStatus(0), err
 	}
 	if !s.child {
+		if s.NoRootContainer && s.IsRootContainer(cid) {
+			return unix.WaitStatus(0), nil
+		}
 		return unix.WaitStatus(0), fmt.Errorf("sandbox no longer running and its exit status is unavailable")
 	}
 
@@ -1732,7 +1793,7 @@ type CheckpointOpts struct {
 	SaveRestoreExecArgv        string
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecContainerID string
-	SplitFSCheckpointPaths     []checkpoint.ResourceID
+	SplitFSCheckpointPaths     []string
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1740,7 +1801,16 @@ type CheckpointOpts struct {
 func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, opts CheckpointOpts) error {
 	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	if len(opts.SplitFSCheckpointPaths) > 0 {
+	bundles, err := fscheckpoint.ParseBundles(opts.SplitFSCheckpointPaths)
+	if err != nil {
+		return fmt.Errorf("parsing filesystem checkpoint paths: %w", err)
+	}
+	for i := range bundles {
+		if bundles[i].Prefix == "" {
+			bundles[i].Prefix = checkpointfiles.FSCheckpointDir
+		}
+	}
+	if len(bundles) > 0 {
 		// Verify we are not using GCS/gofer.
 		gcsOptsPath := filepath.Join(imagePath, checkpointGCSOptsFileName)
 		if _, err := os.Stat(gcsOptsPath); err == nil {
@@ -1754,19 +1824,15 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
-		SplitFSCheckpointPaths:         opts.SplitFSCheckpointPaths,
+		SplitFSCheckpointPaths:         bundles,
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
 	}
-	defer func() {
-		for _, f := range opt.FilePayload.Files {
-			_ = f.Close()
-		}
-	}()
-	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, &opt); err != nil {
+	defer opt.FilePayload.Close()
+	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
 		return err
 	}
 
@@ -1782,13 +1848,13 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	return nil
 }
 
-func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, bundles []fscheckpoint.Bundle, opt *control.SaveOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-writes")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, opt)
+		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, bundles, opt)
 	}
 	log.Infof("Saving to GCS via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
@@ -1797,7 +1863,7 @@ func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, 
 	return nil
 }
 
-func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, bundles []fscheckpoint.Bundle, opt *control.SaveOpts) error {
 	files, err := createSaveFiles(imagePath, opts.Direct, opts.Compression)
 	if err != nil {
 		return err
@@ -1805,7 +1871,7 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
 
-	if len(opts.SplitFSCheckpointPaths) > 0 {
+	if len(bundles) > 0 {
 		cleanLocalFiles := cleanup.Make(func() {
 			for _, f := range files {
 				_ = f.Close()
@@ -1814,11 +1880,7 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 		})
 		defer cleanLocalFiles.Clean()
 
-		fsImagePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointDir)
-		if err := os.MkdirAll(fsImagePath, 0755); err != nil {
-			return fmt.Errorf("creating fs checkpoint directory: %w", err)
-		}
-		fsFiles, err := openFSCheckpointLocalFiles(fsImagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, opts.Direct)
+		fsFiles, err := openFSCheckpointLocalFiles(imagePath, bundles[0].Prefix, os.O_CREATE|os.O_EXCL|os.O_RDWR, opts.Direct)
 		if err != nil {
 			return fmt.Errorf("creating fs checkpoint files: %w", err)
 		}
@@ -1877,7 +1939,64 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 	return files, nil
 }
 
+// HasFSCheckpointManifest returns true if dir contains any filesystem
+// checkpoint manifest (fscheckpoint.pb, <prefix>_fscheckpoint.pb, or
+// <prefix>/fscheckpoint.pb).
+func HasFSCheckpointManifest(dir string) bool {
+	prefixes, err := discoverFSCheckpointPrefixes(dir)
+	return err == nil && len(prefixes) > 0
+}
+
+func discoverFSCheckpointPrefixes(dir string) ([]string, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var prefixes []string
+	suffix := "_" + checkpointfiles.FSCheckpointManifestFileName
+	for _, e := range entries {
+		if e.IsDir() {
+			subManifest := filepath.Join(dir, e.Name(), checkpointfiles.FSCheckpointManifestFileName)
+			if _, err := os.Stat(subManifest); err == nil {
+				prefixes = append(prefixes, e.Name()+"/")
+			}
+			continue
+		}
+		if e.Name() == checkpointfiles.FSCheckpointManifestFileName {
+			prefixes = append(prefixes, "")
+		} else if pfx, ok := strings.CutSuffix(e.Name(), suffix); ok && pfx != "" {
+			prefixes = append(prefixes, pfx)
+		}
+	}
+	return prefixes, nil
+}
+
+func hasGCSOpts(imagePath string) bool {
+	_, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName))
+	return err == nil
+}
+
+// isGCSRestorePath checks whether p refers to a GCS checkpoint directory
+// directly (isPrefixed=false) or to a <gcsdir>/<prefix> bundle path inside a
+// GCS checkpoint directory (isPrefixed=true).
+func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
+	fi, err := os.Stat(p)
+	if err == nil && fi.IsDir() {
+		return hasGCSOpts(p), false
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return hasGCSOpts(filepath.Dir(strings.TrimSuffix(p, "/"))), true
+	}
+	return false, false
+}
+
 func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, direct bool, cmd *exec.Cmd) ([]*os.File, error) {
+	if isGCS, isPrefixed := isGCSRestorePath(imagePath); isGCS && isPrefixed {
+		return nil, fmt.Errorf("prefixed filesystem checkpoint restore (%q) is not supported with GCS checkpoint gofer", imagePath)
+	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-reads")
 	if err != nil {
 		return nil, err
@@ -1891,7 +2010,31 @@ func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, dire
 }
 
 func openFSRestoreFilesForLocalCheckpoint(imagePath string, direct bool) ([]*os.File, error) {
-	return openFSCheckpointLocalFiles(imagePath, os.O_RDONLY, direct)
+	fi, err := os.Stat(imagePath)
+	if err == nil {
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("fs restore image path %q is a file, expected a directory or <dir>/<prefix>", imagePath)
+		}
+		prefixes, err := discoverFSCheckpointPrefixes(imagePath)
+		if err != nil {
+			return nil, fmt.Errorf("reading fs restore directory %q: %w", imagePath, err)
+		}
+		if len(prefixes) > 1 {
+			return nil, fmt.Errorf("multiple filesystem checkpoint bundles found in %q", imagePath)
+		}
+		var prefix string
+		if len(prefixes) == 1 {
+			prefix = prefixes[0]
+		}
+		return openFSCheckpointLocalFiles(imagePath, prefix, os.O_RDONLY, direct)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("stat fs restore image path %q: %w", imagePath, err)
+	}
+	if strings.HasSuffix(imagePath, "/") {
+		return nil, fmt.Errorf("fs restore image directory %q does not exist: %w", imagePath, err)
+	}
+	return openFSCheckpointLocalFiles(filepath.Dir(imagePath), filepath.Base(imagePath), os.O_RDONLY, direct)
 }
 
 // FSSaveOpts holds options to FSSave.
@@ -1905,24 +2048,30 @@ type FSSaveOpts struct {
 	// provided for parity with that feature.
 	ExitAfterSaving bool
 
-	// Paths is the list of paths inside the containers to save.
-	Paths []checkpoint.ResourceID
+	// Paths is the list of [<prefix>=][<container>:]<path> specifications to
+	// save. Both prefixed (e.g., "rootfs=/") and unprefixed (e.g., "/",
+	// "all-tmpfs", "c1:/data") formats are supported.
+	Paths []string
 }
 
 // FSSave sends the filesystem checkpointing call to the sandbox.
 func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts FSSaveOpts) error {
 	log.Debugf("Checkpoint filesystem for sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
+	bundles, err := fscheckpoint.ParseBundles(opts.Paths)
+	if err != nil {
+		return fmt.Errorf("parsing filesystem checkpoint paths: %w", err)
+	}
+	if len(bundles) == 0 {
+		bundles = []fscheckpoint.Bundle{{}}
+	}
+
 	args := boot.FSSaveArgs{
 		ExitAfterSaving: opts.ExitAfterSaving,
-		Paths:           opts.Paths,
+		Paths:           bundles,
 	}
-	defer func() {
-		for _, f := range args.FilePayload.Files {
-			_ = f.Close()
-		}
-	}()
-	if err := s.setFSSaveArgs(conf, imagePath, opts.Direct, &args); err != nil {
+	defer args.FilePayload.Close()
+	if err := s.setFSSaveArgs(conf, imagePath, opts.Direct, bundles[0].Prefix, &args); err != nil {
 		return err
 	}
 
@@ -1937,13 +2086,17 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 	return nil
 }
 
-func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, args *boot.FSSaveArgs) error {
+func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, prefix string, args *boot.FSSaveArgs) error {
+	// TODO(b/541219576): Support prefixed filesystem checkpoint with GCS/gofer.
+	if prefix != "" && hasGCSOpts(imagePath) {
+		return fmt.Errorf("prefixed filesystem checkpoint is not supported with GCS/gofer")
+	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-writes")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return setFSSaveArgsForLocalCheckpointFiles(conf, imagePath, direct, args)
+		return setFSSaveArgsForLocalCheckpointFiles(conf, imagePath, direct, prefix, args)
 	}
 	log.Infof("Saving filesystem checkpoint to GCS via checkpoint gofer")
 	args.FilePayload.Files = append(args.FilePayload.Files, clientSockFile)
@@ -1951,8 +2104,8 @@ func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bo
 	return nil
 }
 
-func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, args *boot.FSSaveArgs) error {
-	files, err := openFSCheckpointLocalFiles(imagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, direct)
+func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, prefix string, args *boot.FSSaveArgs) error {
+	files, err := openFSCheckpointLocalFiles(imagePath, prefix, os.O_CREATE|os.O_EXCL|os.O_RDWR, direct)
 	if err != nil {
 		return err
 	}
@@ -1960,7 +2113,7 @@ func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string,
 	return nil
 }
 
-func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([]*os.File, error) {
+func openFSCheckpointLocalFiles(imagePath, prefix string, openFlags int, direct bool) ([]*os.File, error) {
 	var files [4]*os.File
 	closeCleanup := cleanup.Make(func() {
 		for _, f := range files {
@@ -1999,28 +2152,35 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		maybeODirect = unix.O_DIRECT
 	}
 
-	manifestFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointManifestFileName)
+	if openFlags&os.O_CREATE != 0 && strings.HasSuffix(prefix, "/") {
+		subDir := filepath.Join(imagePath, prefix)
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			return nil, fmt.Errorf("creating fs checkpoint directory %q: %w", subDir, err)
+		}
+	}
+
+	manifestFilePath := filepath.Join(imagePath, checkpointfiles.PrefixFileName(prefix, checkpointfiles.FSCheckpointManifestFileName))
 	manifestFile, err := os.OpenFile(manifestFilePath, openFlags, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening manifest file %q: %w", manifestFilePath, err)
 	}
 	files[0] = manifestFile
 
-	multiTarFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointMultiTarFileName)
+	multiTarFilePath := filepath.Join(imagePath, checkpointfiles.PrefixFileName(prefix, checkpointfiles.FSCheckpointMultiTarFileName))
 	multiTarFile, err := os.OpenFile(multiTarFilePath, openFlags, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening multi-tar file %q: %w", multiTarFilePath, err)
 	}
 	files[1] = multiTarFile
 
-	pagesMetadataFilePath := filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName)
+	pagesMetadataFilePath := filepath.Join(imagePath, checkpointfiles.PrefixFileName(prefix, checkpointfiles.PagesMetadataFileName))
 	pagesMetadataFile, err := os.OpenFile(pagesMetadataFilePath, openFlags, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesMetadataFilePath, err)
 	}
 	files[2] = pagesMetadataFile
 
-	pagesFilePath := filepath.Join(imagePath, checkpointfiles.PagesFileName)
+	pagesFilePath := filepath.Join(imagePath, checkpointfiles.PrefixFileName(prefix, checkpointfiles.PagesFileName))
 	pagesFileFD, err := unix.Open(pagesFilePath, openFlags|maybeODirect, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("opening pages file %q: %w", pagesFilePath, err)
@@ -2181,6 +2341,17 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 	if len(path) == 0 {
 		return nil
 	}
+	bundles, err := fscheckpoint.ParseBundles(boot.GetAnnotationFSCheckpointPaths(args.Spec))
+	if err != nil {
+		return fmt.Errorf("parsing dev.gvisor.internal.fscheckpoint.paths annotation: %w", err)
+	}
+	if len(bundles) == 0 {
+		bundles = []fscheckpoint.Bundle{{}}
+	}
+	// TODO(b/541219576): Support prefixed filesystem checkpoint with GCS/gofer.
+	if bundles[0].Prefix != "" && hasGCSOpts(path) {
+		return fmt.Errorf("prefixed filesystem checkpoint is not supported with GCS/gofer")
+	}
 
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-fscheckpoint-writes")
 	if err != nil {
@@ -2191,7 +2362,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 		cmd.Args = append(cmd.Args, "-fs-save-checkpoint-gofer")
 		log.Infof("Enabling workload-trigger filesystem checkpoint saving to GCS via checkpoint gofer")
 	} else {
-		files, err := openFSCheckpointLocalFiles(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, boot.GetAnnotationFSCheckpointDirect(args.Spec))
+		files, err := openFSCheckpointLocalFiles(path, bundles[0].Prefix, os.O_CREATE|os.O_EXCL|os.O_RDWR, boot.GetAnnotationFSCheckpointDirect(args.Spec))
 		if err != nil {
 			return fmt.Errorf("failed to create auto fs save files: %w", err)
 		}
@@ -2257,20 +2428,40 @@ func (s *Sandbox) GetRegisteredMetrics() (*metricpb.MetricRegistration, error) {
 	return s.RegisteredMetrics, nil
 }
 
+// TimeSaved returns the cached CPU and wall time saved by restoration.
+//
+// +checklocksexclude:s.savingsMu
+func (s *Sandbox) TimeSaved() (cpu, wall time.Duration) {
+	s.savingsMu.Lock()
+	defer s.savingsMu.Unlock()
+	return s.CPUTimeSaved, s.WallTimeSaved
+}
+
 // ExportMetrics returns a snapshot of metric values from the sandbox in Prometheus format.
+//
+// +checklocksexclude:s.savingsMu
 func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Snapshot, error) {
 	log.Debugf("Metrics export sandbox %q", s.ID)
 
 	// Update time saved metrics before exporting, if not exported already for
 	// restored sandboxes.
-	if s.Restored && s.CPUTimeSaved == 0 && s.WallTimeSaved == 0 {
-		var savings boot.Savings
-		err := s.call(boot.ContMgrGetSavings, nil, &savings)
-		if err != nil {
-			log.Warningf("Failed to get time saved metrics")
-		} else {
-			s.CPUTimeSaved = savings.CPUTimeSaved
-			s.WallTimeSaved = savings.WallTimeSaved
+	if s.Restored {
+		cpu, wall := s.TimeSaved()
+		if cpu == 0 && wall == 0 {
+			var savings boot.Savings
+			if err := s.call(boot.ContMgrGetSavings, nil, &savings); err != nil {
+				log.Warningf("Failed to get time saved metrics")
+			} else {
+				// Do not hold savingsMu across the RPC: another export may
+				// time out and still need to read the cached pair. Publish
+				// only if a concurrent export has not already populated it.
+				s.savingsMu.Lock()
+				if s.CPUTimeSaved == 0 && s.WallTimeSaved == 0 {
+					s.CPUTimeSaved = savings.CPUTimeSaved
+					s.WallTimeSaved = savings.WallTimeSaved
+				}
+				s.savingsMu.Unlock()
+			}
 		}
 	}
 
@@ -2493,14 +2684,13 @@ func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 }
 
 // getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
-// nvproxy.
+// nvproxy, or "latest", which the sentry resolves to the newest supported ABI.
 func getNvproxyDriverVersion(conf *config.Config) (string, error) {
 	switch conf.NVProxyDriverVersion {
 	case "":
-		return nvproxy.HostDriverVersion()
+		return nvconf.HostDriverVersion()
 	case "latest":
-		nvproxy.Init()
-		return nvproxy.LatestDriver().String(), nil
+		return conf.NVProxyDriverVersion, nil
 	default:
 		version, err := nvconf.DriverVersionFrom(conf.NVProxyDriverVersion)
 		return version.String(), err

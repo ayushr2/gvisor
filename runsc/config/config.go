@@ -175,12 +175,19 @@ type Config struct {
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
 
+	// NetworkProxyPath, if set, is the path of an external UDS that the
+	// sentry attaches its primary network interface to instead of creating
+	// an AF_PACKET socket.
+	NetworkProxyPath string `flag:"network-proxy-path"`
+
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
-	// PlatformDevicePath is the path to the device file used by the platform.
-	// e.g. "/dev/kvm" for the KVM platform.
-	// If unset, a sane platform-specific default will be used.
+	// PlatformDevicePath is the raw value of --platform_device_path: either a
+	// single device file path, which applies to any platform, or
+	// comma-separated platform=path pairs, which apply only to the named
+	// platforms. Use PlatformDeviceFor to read it. If unset, a sane
+	// platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
 
 	// MetricServer, if set, indicates that metrics should be exported on this address.
@@ -197,10 +204,6 @@ type Config struct {
 	// SidecarReleaseEnforcementPolicy controls when spawned sidecar binaries
 	// must match `runsc`'s build label.
 	SidecarReleaseEnforcementPolicy SidecarReleasePolicy `flag:"sidecar-release-enforcement-policy"`
-
-	// SidecarUsagePolicy controls when to use sidecar binaries vs embedded
-	// fallbacks.
-	SidecarUsagePolicy SidecarUsagePolicy `flag:"sidecar-usage-policy"`
 
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
@@ -253,6 +256,10 @@ type Config struct {
 	// PanicSignal registers signal handling that panics. Usually set to
 	// SIGUSR2(12) to troubleshoot hangs. -1 disables it.
 	PanicSignal int `flag:"panic-signal"`
+
+	// DumpGoroutinesSignal registers signal handling that dumps all goroutine
+	// stacks without exiting. -1 disables it.
+	DumpGoroutinesSignal int `flag:"dump-goroutines-signal"`
 
 	// ProfileEnable is set to prepare the sandbox to be profiled.
 	ProfileEnable bool `flag:"profile"`
@@ -362,6 +369,9 @@ type Config struct {
 
 	// AppHugePages enables support for application huge pages.
 	AppHugePages bool `flag:"app-huge-pages"`
+
+	// AMDGPUProxy controls support for AMD GPUs.
+	AMDGPUProxy AMDGPUProxyMode `flag:"amdgpuproxy"`
 
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
@@ -492,11 +502,69 @@ type Config struct {
 	SharedRootDir string `flag:"shared-root"`
 }
 
+// UseNetworkProxy reports whether the primary sandbox network interface should
+// be attached to a unix domain socket instead of AF_PACKET socket.
+func (c *Config) UseNetworkProxy() bool {
+	return c.NetworkProxyPath != ""
+}
+
+// platformDevicePaths is the parsed value of --platform_device_path.
+type platformDevicePaths struct {
+	// any is the device file path for every platform. The single-path form
+	// sets it.
+	any string
+	// byPlatform maps a platform name to its device file path. The
+	// platform=path form sets it.
+	byPlatform map[string]string
+}
+
+// parsePlatformDevicePaths parses v, a --platform_device_path value. A value
+// without "=" is a single path. Otherwise it is comma-separated platform=path
+// pairs.
+func parsePlatformDevicePaths(v string) (platformDevicePaths, error) {
+	if !strings.Contains(v, "=") {
+		return platformDevicePaths{any: v}, nil
+	}
+	paths := platformDevicePaths{byPlatform: make(map[string]string)}
+	for _, pair := range strings.Split(v, ",") {
+		name, path, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || path == "" {
+			return platformDevicePaths{}, fmt.Errorf("expected format is --platform_device_path={path} or --platform_device_path={platform}={path}[,{platform}={path}...], got %q", v)
+		}
+		if _, dup := paths.byPlatform[name]; dup {
+			return platformDevicePaths{}, fmt.Errorf("--platform_device_path=%q names platform %q more than once", v, name)
+		}
+		paths.byPlatform[name] = path
+	}
+	return paths, nil
+}
+
+// PlatformDeviceFor returns the device file path that --platform_device_path
+// assigns to platform, or "" if it assigns none, in which case the platform
+// uses its default. Validate rejects malformed values, which this treats as
+// unset.
+func (c *Config) PlatformDeviceFor(platform string) string {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return ""
+	}
+	if path, ok := paths.byPlatform[platform]; ok {
+		return path
+	}
+	return paths.any
+}
+
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	if _, err := parsePlatformDevicePaths(c.PlatformDevicePath); err != nil {
+		return err
+	}
+	if c.AMDGPUProxy != AMDGPUProxyDisabled && c.Platform != "kvm" {
+		return fmt.Errorf("--amdgpuproxy=%v requires --platform=kvm", c.AMDGPUProxy)
+	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
@@ -509,6 +577,17 @@ func (c *Config) Validate() error {
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
+	}
+	if c.UseNetworkProxy() {
+		if !filepath.IsAbs(c.NetworkProxyPath) {
+			return fmt.Errorf("network-proxy-path must be an absolute path, got %q", c.NetworkProxyPath)
+		}
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("network-proxy-path flag is only supported with sandbox networking")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
+		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
 		return fmt.Errorf("qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.TBFBurst)
@@ -1215,12 +1294,10 @@ func setOverlay2Err(v string) error {
 const overlay2SizeEq = "size="
 
 // Set implements flag.Value. Set(String()) should be idempotent.
+// On error, the receiver is unchanged.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
-		o.rootMount = false
-		o.subMounts = false
-		o.medium = NoOverlay
-		o.size = ""
+		*o = Overlay2{}
 		return nil
 	}
 	parts := strings.Split(v, ",")
@@ -1233,34 +1310,34 @@ func (o *Overlay2) Set(v string) error {
 		return setOverlay2Err(v)
 	}
 
+	var next Overlay2
 	switch mount := vs[0]; mount {
 	case "root":
-		o.rootMount = true
+		next.rootMount = true
 	case "all":
-		o.rootMount = true
-		o.subMounts = true
+		next.rootMount = true
+		next.subMounts = true
 	default:
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	err := o.medium.Set(vs[1])
+	err := next.medium.Set(vs[1])
 	if err != nil {
 		return err
 	}
 
-	if len(parts) == 1 {
-		o.size = ""
-	} else if len(parts) == 2 {
+	if len(parts) == 2 {
 		sizeArg := parts[1]
 		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
 		if !cut {
 			return setOverlay2Err(v)
 		}
-		o.size = size
-	} else {
+		next.size = size
+	} else if len(parts) > 2 {
 		return setOverlay2Err(v)
 	}
 
+	*o = next
 	return nil
 }
 
@@ -1305,6 +1382,7 @@ func (o *Overlay2) RootOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+// RootOverlaySize returns the overlay size config of the root mount.
 func (o *Overlay2) RootOverlaySize() string {
 	if !o.rootMount {
 		return ""
@@ -1320,6 +1398,7 @@ func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+// SubMountOverlaySize returns the overlay size config of submounts.
 func (o *Overlay2) SubMountOverlaySize() string {
 	if !o.subMounts {
 		return ""
@@ -1452,56 +1531,6 @@ func (p SidecarReleasePolicy) String() string {
 // Applies returns whether the policy is in effect for this runsc build.
 func (p SidecarReleasePolicy) Applies() bool {
 	return p == SidecarReleaseAlways || (p == SidecarReleaseIfReleaseBuild && IsReleaseVersion(version.Version()))
-}
-
-// SidecarUsagePolicy controls when to use sidecar binaries vs embedded fallbacks.
-type SidecarUsagePolicy string
-
-// SidecarUsagePolicy values.
-const (
-	SidecarUsageDefault        SidecarUsagePolicy = "DEFAULT"
-	SidecarUsageStrict         SidecarUsagePolicy = "STRICT"
-	SidecarUsageLegacyEmbedded SidecarUsagePolicy = "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (p *SidecarUsagePolicy) Set(v string) error {
-	sp := SidecarUsagePolicy(strings.ToUpper(v))
-	switch sp {
-	case SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded:
-		*p = sp
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded)
-}
-
-// Ptr returns a pointer to `p`.
-// Useful in flag declaration line.
-func (p SidecarUsagePolicy) Ptr() *SidecarUsagePolicy {
-	return &p
-}
-
-// Get implements flag.Get.
-func (p *SidecarUsagePolicy) Get() any {
-	return *p
-}
-
-// String implements flag.String.
-func (p SidecarUsagePolicy) String() string {
-	return string(p)
-}
-
-// AllowEmbeddedFallback returns whether embedded fallback binaries can be used
-// if the on-disk sidecar binaries are not found.
-func (p SidecarUsagePolicy) AllowEmbeddedFallback() bool {
-	switch p {
-	case SidecarUsageDefault, SidecarUsageStrict:
-		return false
-	case SidecarUsageLegacyEmbedded:
-		return true
-	default:
-		panic(fmt.Sprintf("invalid sidecar usage policy: %q", p))
-	}
 }
 
 // releaseVersionRE matches the version strings of production release builds:
@@ -1705,4 +1734,52 @@ func (xd *XDP) Set(input string) error {
 		return fmt.Errorf("invalid --xdp value: %q", input)
 	}
 	return nil
+}
+
+// AMDGPUProxyMode controls support for AMD GPUs.
+type AMDGPUProxyMode int
+
+// AMDGPUProxyMode values.
+const (
+	// AMDGPUProxyDisabled disables AMD GPU support.
+	AMDGPUProxyDisabled AMDGPUProxyMode = iota
+
+	// AMDGPUProxyCompute exposes /dev/kfd and the DRM render nodes granted
+	// by the OCI spec, for ROCm compute.
+	AMDGPUProxyCompute
+)
+
+// Set implements flag.Value.
+func (m *AMDGPUProxyMode) Set(v string) error {
+	switch v {
+	case "disabled":
+		*m = AMDGPUProxyDisabled
+	case "compute":
+		*m = AMDGPUProxyCompute
+	default:
+		return fmt.Errorf("invalid AMD GPU proxy mode %q; must be disabled or compute", v)
+	}
+	return nil
+}
+
+// Get implements flag.Get.
+func (m *AMDGPUProxyMode) Get() any {
+	return *m
+}
+
+// String implements flag.String.
+func (m AMDGPUProxyMode) String() string {
+	switch m {
+	case AMDGPUProxyDisabled:
+		return "disabled"
+	case AMDGPUProxyCompute:
+		return "compute"
+	default:
+		panic(fmt.Sprintf("Invalid AMD GPU proxy mode %d", m))
+	}
+}
+
+// Ptr returns a pointer to m.
+func (m AMDGPUProxyMode) Ptr() *AMDGPUProxyMode {
+	return &m
 }

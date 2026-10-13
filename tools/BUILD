@@ -22,6 +22,14 @@ config_setting(
     ],
 )
 
+config_setting(
+    name = "lockdep",
+    values = {"define": "lockdep=true"},
+    visibility = [
+        "//:sandbox",
+    ],
+)
+
 bzl_library(
     name = "arch_bzl",
     srcs = ["arch.bzl"],
@@ -41,6 +49,14 @@ bzl_library(
 bzl_library(
     name = "deps_bzl",
     srcs = ["deps.bzl"],
+    visibility = [
+        "//:sandbox",
+    ],
+)
+
+bzl_library(
+    name = "gazelle_bzl",
+    srcs = ["gazelle.bzl"],
     visibility = [
         "//:sandbox",
     ],

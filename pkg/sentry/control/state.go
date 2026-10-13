@@ -24,8 +24,8 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
+	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -109,10 +109,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
-	// SplitFSCheckpointPaths is the list of paths to include in the filesystem
-	// for split checkpoint. If non-empty, split filesystem checkpoint is enabled.
-	// For capturing all of tmpfs, the ResourceID Path should be "all-tmpfs".
-	SplitFSCheckpointPaths []checkpoint.ResourceID `json:"split_fs_checkpoint_paths"`
+	// SplitFSCheckpointPaths lists the filesystem checkpoint bundles to save in
+	// separate files. Filesystems not in any bundle are saved in the regular
+	// checkpoint files. Use the path "all-tmpfs" to include all tmpfs mounts.
+	SplitFSCheckpointPaths []fscheckpoint.Bundle `json:"split_fs_checkpoint_paths"`
 
 	// RunscVersion is the runsc binary version.
 	RunscVersion string `json:"runsc_version"`
@@ -206,7 +206,7 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 	if len(o.SplitFSCheckpointPaths) > 0 {
 		saveOpts.FSSaveOpts = &kernel.FSSaveOpts{
 			RunscVersion: o.RunscVersion,
-			Paths:        o.SplitFSCheckpointPaths,
+			Paths:        o.SplitFSCheckpointPaths[0].Paths,
 		}
 		manifestFile, err := o.ReleaseFD(fsFilesStart)
 		if err != nil {
@@ -499,7 +499,11 @@ func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, timeout time.Dura
 // the given containerID. If containerID is empty, the global init process is returned.
 func findContainerInitProcess(k *kernel.Kernel, containerID string) (*kernel.Task, error) {
 	if containerID == "" {
-		return k.GlobalInit().Leader(), nil
+		init := k.GlobalInit()
+		if init == nil {
+			return nil, fmt.Errorf("sandbox has no global init process")
+		}
+		return init.Leader(), nil
 	}
 	// To find the init process of a container, we look for the process with no
 	// parent (root of execution) that is not an exec process.

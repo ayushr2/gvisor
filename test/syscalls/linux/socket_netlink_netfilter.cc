@@ -1549,7 +1549,7 @@ TEST(NetlinkNetfilterTest, ErrNewBaseChainWithMalformedHookDataMissingHookNum) {
 TEST(NetlinkNetfilterTest, ErrNewBaseChainWithInvalidChainType) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCaps()));
   // TODO: b/421437663 - Fix this error test for native Linux.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
   std::string test_table_name = GetUniqueTestTableName();
   const char test_chain_name[] = "test_chain_bad_policy";
   const char test_chain_type_name[] = "test_chain_type_invalid";
@@ -4961,6 +4961,12 @@ std::vector<RuleWithExprTestParams> GetMetaRuleTestParams() {
           .expr_attrs = NlNestedAttr()
                             .U32Attr(NFTA_META_DREG, NFT_REG_1)
                             .U32Attr(NFTA_META_KEY, NFT_META_PKTTYPE)},
+      RuleWithExprTestParams{
+          .test_name = "GetMarkValid",
+          .expr_name = "meta",
+          .expr_attrs = NlNestedAttr()
+                            .U32Attr(NFTA_META_DREG, NFT_REG32_00)
+                            .U32Attr(NFTA_META_KEY, NFT_META_MARK)},
       RuleWithExprTestParams{
           .test_name = "SetValid",
           .expr_name = "meta",

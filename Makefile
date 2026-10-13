@@ -58,7 +58,7 @@ help: ## Shows all targets and help from the Makefile (this message).
 		}'
 
 build: ## Builds the given $(TARGETS) with the given $(OPTIONS). E.g. make build TARGETS=runsc
-	@$(call build,$(OPTIONS) -- $(TARGETS))
+	@$(call build,$(OPTIONS) -- $(TARGETS),$(OPTIONS) -- $(call target_query,$(TARGETS)))
 .PHONY: build
 
 test: ## Tests the given $(TARGETS) with the given $(OPTIONS). E.g. make test TARGETS=pkg/buffer:buffer_test
@@ -66,7 +66,7 @@ test: ## Tests the given $(TARGETS) with the given $(OPTIONS). E.g. make test TA
 .PHONY: test
 
 copy: ## Copies the given $(TARGETS), built with the given $(OPTIONS), to the given $(DESTINATION). E.g. make copy TARGETS=runsc DESTINATION=/tmp
-	@$(call copy,$(OPTIONS) -- $(TARGETS),$(DESTINATION))
+	@$(call copy,$(OPTIONS) -- $(TARGETS),$(DESTINATION),$(OPTIONS) -- $(call target_query,$(TARGETS)))
 .PHONY: copy
 
 run: ## Runs the given $(TARGETS), built with $(OPTIONS), using $(ARGS). E.g. make run TARGETS=runsc ARGS=-version
@@ -202,13 +202,11 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 .PHONY: dev
 
 governance-regen: ## Regenerates the files derived from governance/maintainers.yaml and governance/areas.yaml.
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format MAINTAINERS.md -output MAINTAINERS.md)
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format CODEOWNERS -output CODEOWNERS)
+	@$(call wrapper,$(BAZEL) run $(BASE_OPTIONS) $(BAZEL_OPTIONS) //:governance-regen)
 .PHONY: governance-regen
 
-governance-check: governance-regen ## Checks that the files derived from governance/*.yaml are in sync. Can't be a bazel test because it requires visibility across the whole codebase to check for subdirectories' existence.
-	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md || \
-		(echo "Generated governance files are out of sync. Please run \`make governance-regen\`." >&2; exit 1)
+governance-check: ## Checks that the files derived from governance data are in sync.
+	@$(call test,//:governance-check)
 .PHONY: governance-check
 
 license-check: ## Checks that tools/licensecheck/dependencies.yaml has an entry for every dependency.
@@ -259,12 +257,8 @@ nogo-tests:
 # pull in all directories in runsc except runsc/container.
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
-#
-# examples/sandboxexec/go:doc_processor_test embeds the doc_processor go_binary
-# via library=, which rules_go rejects (no GoInfo). Re-enable once the example
-# is split into a go_library.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//examples/sandboxexec/go:doc_processor_test -//test/trace:trace_test)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -279,7 +273,7 @@ tests: unit-tests nogo-tests container-tests syscall-tests
 integration-tests: ## Run all standard integration tests.
 integration-tests: docker-tests overlay-tests hostnet-tests swgso-tests
 integration-tests: do-tests kvm-tests containerd-tests-min
-integration-tests: sandbox-posture-tests
+integration-tests: root-tests sandbox-posture-tests
 .PHONY: integration-tests
 
 integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services load-ubi10-init $(if $(filter x86_64,$(ARCH)),load-arch-systemd)
@@ -289,16 +283,43 @@ network-tests: ## Run all networking integration tests.
 network-tests: iptables-tests packetdrill-tests packetimpact-tests
 .PHONY: network-tests
 
-# `make syscall-tests` runs all system call tests.
+HOST_KERNEL ?= $(shell uname -r)
+
+# To run all system call tests:
+#   make syscall-tests
 # To run a single syscall test:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared
 # To run a single syscall test without caching:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared OPTIONS=--nocache_test_results
 # To run multiple specific syscall tests:
 #   make syscall-tests TARGETS="//test/syscalls:signalfd_test_runsc_systrap_shared //test/syscalls:link_test_runsc_systrap_shared"
+# To run a single syscall test with the lockdep lock-order checker (use
+# BAZEL_OPTIONS, not OPTIONS, so the runtime under test is rebuilt):
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=lockdep OPTIONS=--nocache_test_results
+# To run a single syscall test with the Go race detector in runsc and the Sentry:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS=--nocache_test_results
+# To also stop the Sentry at the first race it finds:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS="--nocache_test_results --test_env=GORACE=halt_on_error=1"
+# To find the boot log of a run (e.g. to read a sentry panic). TEST= is a
+# substring of the test name, so a prefix like "signalfd" matches
+# signalfd_test_runsc_systrap_shared:
+#   make syscall-test-boot-log TEST=signalfd
+# To run a native (non-runsc) test's root cases as real root on the host
+# (sudo make syscall-tests strips privileges, so use the sudo rule; ARGS are
+# gtest flags):
+#   make sudo TARGETS=//test/syscalls/linux:chown_test ARGS='--gtest_filter=*Root*'
 syscall-tests: $(RUNTIME_BIN)
-	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
+	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --test_env=HOST_KERNEL=$(HOST_KERNEL) --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
 .PHONY: syscall-tests
+
+# `make syscall-test-boot-log` prints the newest runsc boot log written by a
+# syscall test, so you can inspect a sentry panic or crash. Optionally filter by
+# TEST=, a substring of the test name, e.g.
+# `make syscall-test-boot-log TEST=uidgid`.
+syscall-test-boot-log: ## Print the path to the newest runsc boot log. Usage: make syscall-test-boot-log [TEST=<name>].
+	@find $(HOME)/.cache/bazel/*/*/execroot/_main/bazel-out/*/testlogs/test/syscalls/*$(TEST)*/test.outputs \
+	  -name 'runsc.log.*.boot.txt' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+.PHONY: syscall-test-boot-log
 
 packetimpact-tests:
 	@$(call test,--jobs=HOST_CPUS*3 --local_test_jobs=HOST_CPUS*3 //test/packetimpact/tests:all_tests)
@@ -315,6 +336,15 @@ RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT ?= true
 	@$(call install_runtime,$(RUNTIME),--watchdog-action=panic --platform=systrap)
 	@IMAGE_TAG=$(call tag,runtimes_$*) && \
 	$(call test_runtime_cached,$(RUNTIME),--test_timeout=1800 --test_env=RUNTIME_TESTS_FILTER=$(RUNTIME_TESTS_FILTER) --test_env=RUNTIME_TESTS_PER_TEST_TIMEOUT=$(RUNTIME_TESTS_PER_TEST_TIMEOUT) --test_env=RUNTIME_TESTS_RUNS_PER_TEST=$(RUNTIME_TESTS_RUNS_PER_TEST) --test_env=RUNTIME_TESTS_FLAKY_IS_ERROR=$(RUNTIME_TESTS_FLAKY_IS_ERROR) --test_env=RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT=$(RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT) --test_env=IMAGE_TAG=$${IMAGE_TAG} //test/runtimes:$*)
+
+# Moby(dockerd) in gvisor/runc tests.
+moby-tests: load-moby $(if $(filter-out runc,$(RUNTIME)),$(RUNTIME_BIN))
+ifneq ($(RUNTIME),runc)
+	@$(call install_runtime,$(RUNTIME),--net-raw --allow-packet-socket-write --TESTONLY-nftables)
+endif
+	@IMAGE_TAG=$(call tag,moby) && \
+	$(call test_runtime_cached,$(RUNTIME),--test_timeout=360 --test_env=RUNTIME_TESTS_FILTER=$(RUNTIME_TESTS_FILTER) --test_env=IMAGE_TAG=$${IMAGE_TAG} -- //test/moby:moby)
+.PHONY: moby-tests
 
 do-tests: $(RUNTIME_BIN)
 	@$(RUNTIME_BIN) --rootless do true
@@ -434,8 +464,17 @@ sandbox-posture-tests: load-basic_alpine $(RUNTIME_BIN)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-kvm --platform=kvm $(POSTURE_TEST_ARGS) $(ARGS))
 .PHONY: sandbox-posture-tests
 
+root-tests: load-basic_alpine $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),) # Clear flags.
+	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v $(ARGS))
+.PHONY: root-tests
+
 # Standard integration targets.
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
+
+# Socket that the external network proxy in //test/e2e:uds_proxy_test listens
+# on. Must match externalUDSSocketPath in test/e2e/uds_proxy_test.go.
+NET_PROXY_SOCKET := /tmp/gvisor-net-uds/proxy.sock
 
 docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME),) # Clear flags.
@@ -444,8 +483,9 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100) # Used by TestDentryCacheLimit.
 	@$(call install_runtime_noreload,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
 	@$(call install_runtime_noreload,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
+	@$(call install_runtime_noreload,$(RUNTIME)-net-uds,--network-proxy-path=$(NET_PROXY_SOCKET)) # Used by TestExternalUDSProxy*.
 	@$(call install_runtime,$(RUNTIME)-cgroupv2,--in-sandbox-cgroup=v2) # Used by TestSystemd* and TestPIDFDSelftests.
-	@$(call test_runtime_cached,$(RUNTIME),$(INTEGRATION_TARGETS) --test_env=TEST_SAVE_RESTORE_NETSTACK=true //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test)
+	@$(call test_runtime_cached,$(RUNTIME),--test_env=TEST_SAVE_RESTORE_NETSTACK=true -- $(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test //test/e2e:uds_proxy_test)
 .PHONY: docker-tests
 
 plugin-network-tests: integration-test-images $(RUNTIME_BIN)
@@ -549,21 +589,14 @@ install_containerd = \
 	sudo -H "PATH=$$PATH" $$T/install_containerd.sh $(1); \
 	rm -rf $$T)
 
-# Specific containerd version tests.
-containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-basic_symlink-resolv load-basic_httpd load-basic_ubuntu $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME),) # Clear flags.
-	@$(call install_containerd,$*)
-ifeq (,$(STAGED_BINARIES))
-	@sudo cp -fa "$(RUNTIME_DIR)"/* "$$(dirname $$(which containerd))/"
-else
-	@gcloud storage cat "$(STAGED_BINARIES)" | \
-		sudo tar -C "$$(dirname $$(which containerd))" -zxvf -
-endif
-	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
+containerd-test-%: load-containerd_harness load-basic_alpine load-basic_python load-basic_busybox load-basic_symlink-resolv load-basic_httpd load-basic_ubuntu
+	@$(call test_runtime,$(RUNTIME),--test_output=streamed --test_arg=-test.v --test_arg=--containerd_version=$* $(ARGS) -- //test/root:crictl_test)
 containerd-tests-min: containerd-test-1.7.31
+containerd-tests: containerd-test-1.7.31 containerd-test-2.0.8 containerd-test-2.1.7 containerd-test-2.2.3
+.PHONY: containerd-test-% containerd-tests-min containerd-tests
 
 containerd-performance-test-%:
-	@export RUN_SHIM_GROUPING_PERFORMANCE_TEST=true; $(MAKE) containerd-test-$*
+	@$(call test_runtime,$(RUNTIME),--test_output=streamed --test_arg=-test.v --test_arg=--containerd_version=$* --test_env=RUN_SHIM_GROUPING_PERFORMANCE_TEST=true $(ARGS) -- //test/root:crictl_test)
 .PHONY: containerd-performance-test-%
 
 
@@ -617,9 +650,32 @@ run_benchmark = \
 	($(call header,BENCHMARK $(1)); \
 	set -euo pipefail; \
 	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
+	trap 'rm -rf "$$T"' EXIT; \
 	export UNSANDBOXED_RUNTIME; \
-	if test "$(1)" = "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS)) | tee $$T; fi; \
-	if test "$(1)" != "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T; fi; \
+	export RUNTIME="$(1)"; \
+	exit_code=0; \
+	if test "$(1)" = "runc"; then \
+	  $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS)) | tee $$T || exit_code=$$?; \
+	else \
+	  $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T || exit_code=$$?; \
+	fi; \
+	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
+	  upload_ret=0; \
+	  $(call run,tools/parsers:parser,parse --debug --file=$$T --runtime=$(1) --suite_name=$(BENCHMARKS_SUITE) --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)) || upload_ret=$$?; \
+	  if test "$$upload_ret" -ne 0 && test "$$exit_code" -eq 0; then \
+	    exit_code=$$upload_ret; \
+	  fi; \
+	fi; \
+	exit $$exit_code)
+
+# $(1) is the platform name.
+# TODO: b/567563387 - consider not using --runtime here to describe the platform
+# in the BigQuery parser for these non-docker tests.
+run_platform_benchmark = \
+	($(call header,BENCHMARK $(1)); \
+	set -euo pipefail; \
+	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
+	$(call sudo,$(BENCHMARKS_TARGETS),--test_platforms=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T; \
 	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
 	  $(call run,tools/parsers:parser,parse --debug --file=$$T --runtime=$(1) --suite_name=$(BENCHMARKS_SUITE) --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)); \
 	fi; \
@@ -650,6 +706,18 @@ benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc 
 	  $(call run_benchmark,runc); \
 	fi
 .PHONY: benchmark-platforms
+
+# TODO: b/529809802 - Enable benchmarks for slimvm.
+benchmark-platforms-nodocker: $(RUNTIME_BIN) ## Runs non-Docker benchmarks for all (selected) platforms.
+	@set -xe; \
+	for PLATFORM in $$(if test -z "$(BENCHMARKS_PLATFORMS)"; then $(RUNTIME_BIN) help platforms; else echo $(BENCHMARKS_PLATFORMS); fi); do \
+	  if test "$${PLATFORM}" = "slimvm"; then \
+	    continue; \
+	  fi; \
+	  export PLATFORM; \
+	  $(call run_platform_benchmark,$${PLATFORM}); \
+	done
+.PHONY: benchmark-platforms-nodocker
 
 run-benchmark: load-benchmarks ## Runs single benchmark and optionally sends data to BigQuery.
 	@$(call run_benchmark,$(RUNTIME))
@@ -819,7 +887,19 @@ webhook-update: test/kubernetes/gvisor-injection-admission-webhook.yaml.in
 SYZKALLER_IMAGE     ?= gcr.io/syzkaller/syzbot:latest
 SYZKALLER_CONTAINER ?= gvisor-syz-$(HASH)-$(ARCH)
 SYZKALLER_REPO_URL  ?= https://github.com/google/syzkaller
-syzkaller-smoke-test: $(RUNTIME_BIN)
+SYZKALLER_BRANCH    ?= master
+SYZKALLER_TARBALL   ?= $(RUNTIME_DIR)/$(if $(STAGED_BINARIES),$(notdir $(STAGED_BINARIES)),gvisor.tar.bz2)
+
+$(SYZKALLER_TARBALL):
+	@mkdir -p "$(dir $(SYZKALLER_TARBALL))"
+ifeq (,$(STAGED_BINARIES))
+	@$(call copy,//debian:gvisor-release-tar-bz2,$(SYZKALLER_TARBALL))
+else
+	@gcloud storage cp "$(STAGED_BINARIES)" "$(SYZKALLER_TARBALL)"
+endif
+.PHONY: $(SYZKALLER_TARBALL)
+
+syzkaller-smoke-test: $(SYZKALLER_TARBALL)
 	@docker rm -f $(SYZKALLER_CONTAINER) 2>/dev/null || true && \
 	docker run --rm \
 		--name="$(SYZKALLER_CONTAINER)" \
@@ -827,13 +907,13 @@ syzkaller-smoke-test: $(RUNTIME_BIN)
 		--hostname="$(SYZKALLER_CONTAINER)" \
 		$(DOCKER_PRIVILEGED) \
 		--pid=host \
-		-v "$(RUNTIME_DIR):$(RUNTIME_DIR):ro" \
+		-v "$(SYZKALLER_TARBALL):$(SYZKALLER_TARBALL):ro" \
 		-e "GOPATH=/__w/syzkaller/syzkaller/gopath" \
-		-e "GVISOR_VMLINUX_PATH=$(RUNTIME_BIN)" \
+		-e "GVISOR_TARBALL_PATH=$(SYZKALLER_TARBALL)" \
 		"$(SYZKALLER_IMAGE)" \
 		/bin/bash -xeuc ' \
 			mkdir -p "$$GOPATH/src/github.com/google" && \
-			git clone --depth=1 https://github.com/google/syzkaller "$$GOPATH/src/github.com/google/syzkaller" && \
+			git clone --depth=1 --branch "$(SYZKALLER_BRANCH)" "$(SYZKALLER_REPO_URL)" "$$GOPATH/src/github.com/google/syzkaller" && \
 			cd "$$GOPATH/src/github.com/google/syzkaller" && \
 			make && \
 			bash tools/gvisor-smoke-test.sh \

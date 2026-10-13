@@ -116,7 +116,7 @@ go_test(
         "utils_test.go",
         "xattr_test.go",
     ],
-    library = ":fuse",
+    embed = [":fuse"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",
@@ -128,6 +128,7 @@ go_test(
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
+        "//pkg/state",
         "//pkg/usermem",
         "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",

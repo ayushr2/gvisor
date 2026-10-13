@@ -17,12 +17,10 @@ go_test(
         # Needed to invalidate the bazel cache in case of any code changes.
         "//:release",
     ],
-    library = ":image",
-    tags = [
-        # Requires docker and runsc to be configured before the test runs.
-        "manual",
-        "local",
-    ],
+    embed = [":image"],
+    # Requires docker and runsc to be configured before the test runs.
+    local = True,
+    tags = ["manual"],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",

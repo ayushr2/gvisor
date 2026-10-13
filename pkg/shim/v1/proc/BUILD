@@ -19,6 +19,7 @@ go_library(
         "types.go",
         "utils.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/shim/v1/proc",
     visibility = [
         "//pkg/shim:__subpackages__",
         "//shim:__subpackages__",
@@ -47,11 +48,12 @@ go_test(
     name = "proc_test",
     size = "small",
     srcs = [
+        "init_kill_test.go",
         "init_state_test.go",
         "update_test.go",
         "utils_test.go",
     ],
-    library = ":proc",
+    embed = [":proc"],
     deps = [
         "//pkg/shim/v1/runsccmd",
         "@com_github_containerd_console//:go_default_library",
@@ -59,5 +61,6 @@ go_test(
         "@com_github_containerd_containerd_v2//pkg/stdio:go_default_library",
         "@com_github_containerd_errdefs//:go_default_library",
         "@com_github_containerd_go_runc//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

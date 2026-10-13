@@ -172,7 +172,7 @@ func (*KVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace() (platform.AddressSpace, error) {
+func (k *KVM) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
@@ -227,9 +227,11 @@ func (k *KVM) PreemptCPU(cpu int32) error {
 
 // NewContext returns an interruptible context.
 func (k *KVM) NewContext(pkgcontext.Context) platform.Context {
-	return &platformContext{
+	c := &platformContext{
 		machine: k.machine,
 	}
+	c.interrupt.Dst = c
+	return c
 }
 
 type constructor struct{}

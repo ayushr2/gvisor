@@ -140,6 +140,9 @@ const (
 
 	// Arbitrary Packet Type
 	arbitraryPktType = tcpip.PacketOutgoing
+
+	// Arbitrary Packet Mark
+	arbitraryMark = 0x2a
 )
 
 var (
@@ -1648,11 +1651,12 @@ func TestEvaluatePayloadLoad(t *testing.T) {
 // TODO(b/339691111): Add tests for VLAN, ARP, ICMP, ICMPv6, IGMP, UDP headers.
 func TestEvaluatePayloadSet(t *testing.T) {
 	for _, test := range []struct {
-		tname  string
-		pkt    *stack.PacketBuffer
-		outPkt *stack.PacketBuffer // nil if expecting a break during evaluation.
-		op1    operation           // Immediate operation to load source register.
-		op2    operation           // Payload Set operation to test.
+		tname            string
+		pkt              *stack.PacketBuffer
+		outPkt           *stack.PacketBuffer // nil if expecting a break during evaluation.
+		unchangedOnBreak bool
+		op1              operation // Immediate operation to load source register.
+		op2              operation // Payload Set operation to test.
 	}{
 		// Ethernet header statement commands.
 		{ // cmd: add rule ip tab ch ether saddr set 02:02:03:04:05:07
@@ -2091,6 +2095,22 @@ func TestEvaluatePayloadSet(t *testing.T) {
 			op1: mustCreateImmediate(t, linux.NFT_REG_3, arbitraryIPv6AddrB[:], Verdict{}),
 			op2: mustCreatePayloadSet(t, linux.NFT_PAYLOAD_NETWORK_HEADER, ipv6DstAddrOffset, ipv6DstAddrLen, linux.NFT_REG_3, linux.NFT_PAYLOAD_CSUM_NONE, 0, linux.NFT_PAYLOAD_L4CSUM_PSEUDOHDR),
 		},
+		{
+			tname:            "csumOffset equal to network header length triggers NFT_BREAK",
+			pkt:              makeIPv4Packet(header.IPv4MinimumSize, arbitraryIPv4Fields()),
+			outPkt:           nil,
+			unchangedOnBreak: true,
+			op1:              mustCreateImmediate(t, linux.NFT_REG_1, numToBE(0, ipv4LengthLen), Verdict{}),
+			op2:              mustCreatePayloadSet(t, linux.NFT_PAYLOAD_NETWORK_HEADER, ipv4LengthOffset, ipv4LengthLen, linux.NFT_REG_1, linux.NFT_PAYLOAD_CSUM_INET, header.IPv4MinimumSize, 0x0),
+		},
+		{
+			tname:            "csumOffset past network header length triggers NFT_BREAK",
+			pkt:              makeIPv4Packet(header.IPv4MinimumSize, arbitraryIPv4Fields()),
+			outPkt:           nil,
+			unchangedOnBreak: true,
+			op1:              mustCreateImmediate(t, linux.NFT_REG_1, numToBE(0, ipv4LengthLen), Verdict{}),
+			op2:              mustCreatePayloadSet(t, linux.NFT_PAYLOAD_NETWORK_HEADER, ipv4LengthOffset, ipv4LengthLen, linux.NFT_REG_1, linux.NFT_PAYLOAD_CSUM_INET, 250, 0x0),
+		},
 	} {
 		t.Run(test.tname, func(t *testing.T) {
 			// Sets up an NFTables object with a single table, chain, and rule.
@@ -2123,6 +2143,10 @@ func TestEvaluatePayloadSet(t *testing.T) {
 			}
 
 			// Runs evaluation.
+			var originalNetworkHeader []byte
+			if test.unchangedOnBreak {
+				originalNetworkHeader = slices.Clone(test.pkt.NetworkHeader().Slice())
+			}
 			v, err := nf.EvaluateHook(getAddrFamilyOrDefault(test.pkt, arbitraryFamily), arbitraryHook, test.pkt, nil /* route */)
 			if err != nil {
 				t.Fatalf("unexpected error for EvaluateHook: %v", err)
@@ -2134,6 +2158,9 @@ func TestEvaluatePayloadSet(t *testing.T) {
 				// resulting in Accept as the default policy verdict.
 				if v.Code != VC(linux.NF_ACCEPT) {
 					t.Fatalf("expected verdict Accept for break during evaluation, got %v", v)
+				}
+				if test.unchangedOnBreak && !slices.Equal(originalNetworkHeader, test.pkt.NetworkHeader().Slice()) {
+					t.Fatalf("network header changed despite payload set breaking")
 				}
 				return
 			} else {
@@ -2852,6 +2879,7 @@ func TestEvaluateMetaLoad(t *testing.T) {
 	tcpFields := arbitraryTCPFields()
 	pkt := makeIPv6TCPPacket(pktSize, ipv6Fields, tcpFields)
 	pkt.Owner = &mockPacketOwner{arbitrarySKUID, arbitrarySKGID}
+	pkt.Mark = arbitraryMark
 
 	// Sets up a fake clock (now = UnixEpoch) and dependent time/random fields.
 	fakeClock := faketime.NewManualClock()
@@ -2925,6 +2953,13 @@ func TestEvaluateMetaLoad(t *testing.T) {
 			op1:   mustCreateMetaLoad(t, linux.NFT_META_PKTTYPE, linux.NFT_REG32_05),
 			op2: mustCreateComparison(t, linux.NFT_REG32_05, linux.NFT_CMP_EQ,
 				[]byte{uint8(arbitraryPktType), 0, 0, 0}),
+		},
+		{ // cmd: add rule ip6 tab ch meta mark 0x0000002a
+			tname: "meta load mark test",
+			pkt:   pkt,
+			op1:   mustCreateMetaLoad(t, linux.NFT_META_MARK, linux.NFT_REG32_01),
+			op2: mustCreateComparison(t, linux.NFT_REG32_01, linux.NFT_CMP_EQ,
+				binary.NativeEndian.AppendUint32(nil, arbitraryMark)),
 		},
 		{ // cmd: add rule ip6 tab ch meta random 4059586549
 			tname: "meta load prandom test",

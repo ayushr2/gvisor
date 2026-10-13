@@ -26,26 +26,37 @@ _templates:
   docker: &docker
     env:
       BUILDKITE_PIPELINE_INSTALL_RUNTIME: true
-  benchmarks: &benchmarks
+  benchmarks_env: &benchmarks_env
+    # BENCHMARKS_OFFICIAL is set from hooks/pre-command, based
+    # on whether this is executing on the master branch.
+    BENCHMARKS_DATASET: buildkite
+    BENCHMARKS_PROJECT: gvisor-benchmarks
+    BENCHMARKS_TABLE: benchmarks
+    BENCHMARKS_UPLOAD: true
+    BENCHMARKS_PLATFORMS: "kvm systrap"
+  benchmarks_base: &benchmarks_base
     timeout_in_minutes: 120
     retry:
-      automatic: false
+      automatic:
+        - exit_status: -1
+          limit: 2
     soft_fail: true
     if: build.branch == "master"
-    env:
-      # BENCHMARKS_OFFICIAL is set from hooks/pre-command, based
-      # on whether this is executing on the master branch.
-      BENCHMARKS_DATASET: buildkite
-      BENCHMARKS_PROJECT: gvisor-benchmarks
-      BENCHMARKS_TABLE: benchmarks
-      BENCHMARKS_UPLOAD: true
-      BENCHMARKS_PLATFORMS: "kvm systrap"
-      BUILDKITE_PIPELINE_INSTALL_RUNTIME: true
     agents:
       <<: *kvm_agents
       <<: *platform_specific_agents
       arch: "amd64"
       queue: "default"
+  benchmarks: &benchmarks
+    <<: *benchmarks_base
+    env:
+      <<: *benchmarks_env
+      BUILDKITE_PIPELINE_INSTALL_RUNTIME: true
+  benchmarks_nodocker: &benchmarks_nodocker
+    <<: *benchmarks_base
+    env:
+      <<: *benchmarks_env
+      BUILDKITE_PIPELINE_INSTALL_RUNTIME: false
   netstack_test: &netstack_test
     env:
       PACKAGES: >
@@ -68,6 +79,7 @@ env:
   # Optional filter for syscall tests.
   SYSCALL_TEST_FILTERS: ''
 
+priority: ${PRIORITY:-0}
 steps:
   # Run basic smoke tests before preceding to other tests.
   - <<: *common
@@ -397,7 +409,7 @@ steps:
   # All system call tests.
   - <<: *common
     label: ":toolbox: System call tests (AMD64)"
-    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave,-runsc_slimvm syscall-tests
+    command: make OPTIONS=--config=syscalls-amd64 syscall-tests
     parallelism: 20
     agents:
       <<: *platform_specific_agents
@@ -407,11 +419,38 @@ steps:
   - <<: *common
     <<: *source_test
     label: ":muscle: System call tests (ARM64)"
-    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave,runsc_ptrace,runsc_systrap syscall-tests
+    command: make OPTIONS=--config=syscalls-arm64 syscall-tests
     parallelism: 10
     agents:
       arch: "arm64"
       queue: "arm64"
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":muscle: System call tests (ARM64 64K)"
+    command: make BAZEL_OPTIONS=--config=syscalls-arm64-64k syscall-tests
+    parallelism: 10
+    agents:
+      arch: "arm64"
+      queue: "arm64-64k"
+  # Against Linux release candidates on AMD64.
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":linux: System call tests on release-candidate Linux (AMD64)"
+    command: make OPTIONS=--config=syscalls-amd64 syscall-tests
+    parallelism: 20
+    agents:
+      arch: "amd64"
+      queue: "rckernel"
+  # Against Linux release candidates on ARM64.
+  # TODO(b/546611123): Test kvm platform on arm64 against rc kernels.
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":linux: System call tests on release-candidate Linux (ARM64)"
+    command: make OPTIONS=--config=syscalls-arm64 syscall-tests
+    parallelism: 10
+    agents:
+      arch: "arm64"
+      queue: "rckernel-arm64"
   # With Save Restore on AMD64.
   - <<: *common
     <<: *source_test_continuous
@@ -559,6 +598,15 @@ steps:
   - <<: *common
     <<: *docker
     <<: *source_test
+    label: ":lock: Root tests"
+    command: make root-tests
+    agents:
+      arch: "amd64"
+      kernel: "modern"
+      queue: "default"
+  - <<: *common
+    <<: *docker
+    <<: *source_test
     label: ":rocket: Systrap tests"
     parallelism: 8
     command: make systrap-tests
@@ -621,6 +669,17 @@ steps:
       - sudo RUNTIME_ARGS=--directfs=true ./test/podman/run.sh
     agents:
       <<: *ubuntu_agents
+      cgroup: "v2"
+      queue: "default"
+  # TODO: b/568426030 - Enable Moby tests on ARM64.
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":docker: Moby tests"
+    command: make moby-tests
+    agents:
+      <<: *ubuntu_agents
+      arch: "amd64"
       cgroup: "v2"
       queue: "default"
 
@@ -847,7 +906,7 @@ steps:
     command: make -i benchmark-platforms BENCHMARKS_SUITE=fio BENCHMARKS_TARGETS=test/benchmarks/fs:fio_test BENCHMARKS_FILTER='BenchmarkFioRandRead' BENCHMARKS_OPTIONS=--test.benchtime=1000x
   - <<: *benchmarks
     label: ":cd: Ruby CI/CD benchmarks"
-    command: make -i benchmark-platforms BENCHMARKS_SUITE=fio BENCHMARKS_TARGETS=test/benchmarks/fs:rubydev_test BENCHMARKS_OPTIONS=-test.benchtime=1ns
+    command: make -i benchmark-platforms BENCHMARKS_SUITE=rubydev BENCHMARKS_TARGETS=test/benchmarks/fs:rubydev_test BENCHMARKS_OPTIONS=-test.benchtime=1ns
   - <<: *benchmarks
     label: ":globe_with_meridians: HTTPD benchmarks"
     command: make -i benchmark-platforms BENCHMARKS_FILTER="Continuous" BENCHMARKS_SUITE=httpd BENCHMARKS_TARGETS=test/benchmarks/network:httpd_test
@@ -872,9 +931,12 @@ steps:
   - <<: *benchmarks
     label: ":speedboat: Startup benchmarks"
     command: make -i benchmark-platforms BENCHMARKS_SUITE=startup BENCHMARKS_TARGETS=test/benchmarks/base:startup_test
-  - <<: *benchmarks
+  - <<: *benchmarks_nodocker
     label: ":stopwatch: OCI Lifecycle benchmarks"
-    command: make -i benchmark-platforms SKIP_IMAGE_LOAD=true BENCHMARKS_RUNC=false BENCHMARKS_OPTIONS=-test.benchtime=30x BENCHMARKS_SUITE=lifecycle BENCHMARKS_TARGETS=runsc/container:lifecycle_benchmark_test
+    command: make -i benchmark-platforms-nodocker BENCHMARKS_OPTIONS=-test.benchtime=30x BENCHMARKS_SUITE=oci_lifecycle BENCHMARKS_TARGETS=runsc/container:lifecycle_benchmark_test
+  - <<: *benchmarks_nodocker
+    label: ":stopwatch: Shim Lifecycle benchmarks"
+    command: make -i benchmark-platforms-nodocker BENCHMARKS_OPTIONS=-test.benchtime=30x BENCHMARKS_SUITE=shim_lifecycle BENCHMARKS_TARGETS=shim/tests:lifecycle_benchmark_test
   - <<: *benchmarks
     label: ":computer: sysbench benchmarks"
     command: make -i benchmark-platforms BENCHMARKS_SUITE=sysbench BENCHMARKS_TARGETS=test/benchmarks/base:sysbench_test

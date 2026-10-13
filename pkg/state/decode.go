@@ -405,10 +405,11 @@ func (ds *decodeState) decodeStruct(ods *objectDecodeState, obj reflect.Value, e
 	}
 	ds.stats.start(ods.typ)
 	defer ds.stats.done()
-	if sl, ok := obj.Addr().Interface().(SaverLoader); ok {
-		// Note: may be a registered empty struct which does not
-		// implement the saver/loader interfaces.
-		sl.StateLoad(ds.ctx, Source{internal: od})
+	switch value := obj.Addr().Interface().(type) {
+	case SaverLoader:
+		value.StateLoad(ds.ctx, Source{internal: od})
+	case binaryObject:
+		loadBinary(value, rte.Name, Source{internal: od})
 	}
 }
 
@@ -452,7 +453,7 @@ func (ds *decodeState) findType(t wire.TypeSpec) reflect.Type {
 		rte := ds.types.Lookup(typeID(x), typ)
 		return rte.LocalType
 	case *wire.TypeSpecPointer:
-		return reflect.PtrTo(ds.findType(x.Type))
+		return reflect.PointerTo(ds.findType(x.Type))
 	case *wire.TypeSpecArray:
 		return reflect.ArrayOf(int(x.Count), ds.findType(x.Type))
 	case *wire.TypeSpecSlice:

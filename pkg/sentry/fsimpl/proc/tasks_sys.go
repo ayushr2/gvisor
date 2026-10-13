@@ -34,7 +34,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -79,6 +81,8 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"version":   fs.newInode(ctx, root, 0444, newStaticFile(version.LinuxVersion)),
 		}),
 		"fs": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+			"file-max":      fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", int64(math.MaxInt64)))),
+			"file-nr":       fs.newInode(ctx, root, 0444, &fileNrData{vfs: k.VFS()}),
 			"mount-max":     fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.VFS().MountMax, min: 1, max: math.MaxInt32}),
 			"nr_open":       fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.MaxFDLimit, min: 8, max: kernel.MaxFdLimit}),
 			"pipe-max-size": fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", pipe.MaximumPipeSize))),
@@ -89,6 +93,9 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"overcommit_memory": fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
 		}),
 		"net": fs.newSysNetDir(ctx, root, k),
+		"user": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+			"max_user_namespaces": fs.newInode(ctx, root, 0644, &maxUserNamespacesData{}),
+		}),
 	})
 }
 
@@ -101,7 +108,7 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 	if stack := k.RootNetworkNamespace().Stack(); stack != nil {
 		contents = map[string]kernfs.Inode{
 			"ipv4": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"ip_forward":          fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack}),
+				"ip_forward":          fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv4.ProtocolNumber}),
 				"ip_local_port_range": fs.newInode(ctx, root, 0644, &portRange{stack: stack}),
 				"tcp_recovery":        fs.newInode(ctx, root, 0644, &tcpRecoveryData{stack: stack}),
 				"tcp_rmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpRMem}),
@@ -176,6 +183,15 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 				"ip6frag_time":     fs.newInode(ctx, root, 0444, newStaticFile("60")),
 				"ip_nonlocal_bind": fs.newInode(ctx, root, 0444, newStaticFile("0")),
 				"auto_flowlabels":  fs.newInode(ctx, root, 0444, newStaticFile("1")),
+				"conf": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+					"all": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+						"forwarding": fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
+					}),
+					// Stub for conf/default/forwarding; doesn't affect behavior.
+					"default": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+						"forwarding": fs.newInode(ctx, root, 0644, &atomicInt32File{val: new(atomicbitops.Int32), min: 0, max: 1}),
+					}),
+				}),
 			}),
 		}
 	}
@@ -260,6 +276,53 @@ func (*uuidData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 // GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
 func (*domainnameData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
 	return &kernel.KernelFromContext(ctx).DomainNamePoller
+}
+
+// maxUserNamespacesData implements vfs.WritableDynamicBytesSource for
+// /proc/sys/user/max_user_namespaces.
+//
+// +stateify savable
+type maxUserNamespacesData struct {
+	kernfs.DynamicBytesFile
+}
+
+var _ vfs.WritableDynamicBytesSource = (*maxUserNamespacesData)(nil)
+
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// In Linux, this file's access can be granted via CAP_SYS_RESOURCE
+// in the caller's user namespace, and read-only access otherwise.
+func (*maxUserNamespacesData) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if (ats.MayWrite() && !creds.HasSelfCapability(linux.CAP_SYS_RESOURCE)) || ats.MayExec() {
+		return linuxerr.EACCES
+	}
+	return nil
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*maxUserNamespacesData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	userns := auth.CredentialsFromContext(ctx).UserNamespace
+	_, err := fmt.Fprintf(buf, "%d\n", userns.MaxUserNamespaces())
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (*maxUserNamespacesData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		// Ignore partial writes.
+		return 0, linuxerr.EINVAL
+	}
+	var buf [1]int32
+	n, err := ParseInt32Vec(ctx, src, buf[:])
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	// The limit is a non-negative count.
+	if buf[0] < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	auth.CredentialsFromContext(ctx).UserNamespace.SetMaxUserNamespaces(buf[0])
+	return n, nil
 }
 
 // tcpSackData implements vfs.WritableDynamicBytesSource for
@@ -436,14 +499,15 @@ func (d *tcpMemData) writeSizeLocked(size inet.TCPBufferSize) error {
 }
 
 // ipForwarding implements vfs.WritableDynamicBytesSource for
-// /proc/sys/net/ipv4/ip_forward.
+// /proc/sys/net/ipv4/ip_forward and /proc/sys/net/ipv6/conf/all/forwarding.
 //
 // +stateify savable
 type ipForwarding struct {
 	kernfs.DynamicBytesFile
 
-	stack inet.Stack `state:"wait"`
-	mu    sync.Mutex `state:"nosave"`
+	stack    inet.Stack `state:"wait"`
+	mu       sync.Mutex `state:"nosave"`
+	protocol tcpip.NetworkProtocolNumber
 
 	// enabled is the last value successfully written here, which may differ
 	// from the forwarding state of individual interfaces.
@@ -488,7 +552,7 @@ func (ipf *ipForwarding) Write(ctx context.Context, _ *vfs.FileDescription, src 
 	enabled := buf[0] != 0
 	ipf.mu.Lock()
 	defer ipf.mu.Unlock()
-	if err := ipf.stack.SetForwarding(ipv4.ProtocolNumber, enabled); err != nil {
+	if err := ipf.stack.SetForwarding(ipf.protocol, enabled); err != nil {
 		return 0, err
 	}
 	ipf.enabled = enabled
@@ -620,6 +684,25 @@ func (f *atomicInt32File) Write(ctx context.Context, _ *vfs.FileDescription, src
 
 	f.val.Store(buf[0])
 	return n, nil
+}
+
+// fileNrData implements /proc/sys/fs/file-nr.
+//
+// +stateify savable
+type fileNrData struct {
+	kernfs.DynamicBytesFile
+
+	vfs *vfs.VirtualFilesystem
+}
+
+var _ dynamicInode = (*fileNrData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate. Like Linux's
+// proc_nr_files, the fields are the allocated file count, the unused file
+// count (always 0), and the maximum number of files.
+func (f *fileNrData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	_, err := fmt.Fprintf(buf, "%d\t0\t%d\n", f.vfs.NumFiles(), int64(math.MaxInt64))
+	return err
 }
 
 // randUUID returns a string containing a randomly-generated UUID followed by a
