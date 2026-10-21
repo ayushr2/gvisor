@@ -53,7 +53,6 @@
 #include <ostream>
 #include <regex>  // NOLINT
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,7 +76,6 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/epoll_util.h"
 #include "test/util/eventfd_util.h"
@@ -102,7 +100,6 @@
 // way to get it tested on both gVisor, PTrace and Linux.
 
 using ::testing::AllOf;
-using ::testing::AnyOf;
 using ::testing::ContainerEq;
 using ::testing::Contains;
 using ::testing::ContainsRegex;
@@ -1032,7 +1029,7 @@ TEST(ProcSelfMaps, Basic) {
   std::vector<std::string> stacks;
   // Make sure there's a stack in there.
   for (const auto& str : strings) {
-    if (str.find("[stack]") != std::string::npos) {
+    if (absl::StrContains(str, "[stack]")) {
       stacks.push_back(str);
     }
   }
@@ -1756,6 +1753,45 @@ TEST_P(ProcPidStatTest, HasBasicFields) {
 INSTANTIATE_TEST_SUITE_P(SelfAndNumericPid, ProcPidStatTest,
                          ::testing::Values("self", absl::StrCat(getpid())));
 
+// PF_EXITING from include/linux/sched.h.
+constexpr uint64_t kPFExiting = 0x4;
+
+TEST(ProcPidStatTest, SelfIsNotExiting) {
+  std::string proc_pid_stat =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/stat"));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_EQ(flags & kPFExiting, 0);
+}
+
+TEST(ProcPidStatTest, ZombieIsExiting) {
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto reap = Cleanup([child] {
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+  siginfo_t info = {};
+  ASSERT_THAT(RetryEINTR(waitid)(P_PID, child, &info, WEXITED | WNOWAIT),
+              SyscallSucceeds());
+
+  std::string proc_pid_stat = ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/", child, "/stat")));
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+  ASSERT_GE(fields.size(), 9);
+  EXPECT_EQ("Z", fields[2]);
+  uint64_t flags;
+  ASSERT_TRUE(absl::SimpleAtoi(fields[8], &flags));
+  EXPECT_NE(flags & kPFExiting, 0);
+}
+
 using ProcPidStatmTest = ::testing::TestWithParam<std::string>;
 
 TEST_P(ProcPidStatmTest, HasBasicFields) {
@@ -1984,6 +2020,24 @@ TEST(ProcPidStatusTest, HasBasicFields) {
             Pair("Groups", StartsWith(absl::StrJoin(supplementary_gids, " "))),
         }));
   });
+}
+
+TEST(ProcPidStatusTest, InvalidCloseDoesNotGrowFDTable) {
+  // Restoring a checkpoint may change the FD table's capacity.
+  const DisableSave disable_save;
+  const std::string before_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  const auto before = ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatus(before_str));
+  const auto fd_size = before.find("FDSize");
+  ASSERT_NE(fd_size, before.end());
+
+  EXPECT_THAT(close(INT_MAX), SyscallFailsWithErrno(EBADF));
+
+  const std::string after_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  EXPECT_THAT(
+      ParseProcStatus(after_str),
+      IsPosixErrorOkAndHolds(Contains(Pair("FDSize", fd_size->second))));
 }
 
 TEST(ProcPidStatusTest, NoNewPrivs) {
@@ -3750,47 +3804,102 @@ TEST(Proc, NoDuplicates) { CheckDuplicatesRecursively("/proc"); }
 
 // Most /proc/PID files are owned by the task user with SUID_DUMP_USER.
 TEST(ProcPid, UserDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
-  });
+  // A child leaves the parent's dumpability intact even when it is
+  // SUID_DUMP_ROOT, which PR_SET_DUMPABLE cannot restore.
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER), SyscallSucceeds());
+                // This applies to the task directory itself and files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
 
-  // This applies to the task directory itself and files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
-
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 // /proc/PID files are owned by root with SUID_DUMP_DISABLE.
 TEST(ProcPid, RootDumpableOwner) {
-  int before;
-  ASSERT_THAT(before = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
-  auto cleanup = Cleanup([before] {
-    ASSERT_THAT(prctl(PR_SET_DUMPABLE, before), SyscallSucceeds());
+  EXPECT_THAT(InForkedProcess([] {
+                TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE) == 0);
+
+                // This does not apply to the task directory itself (or other
+                // 0555 directories), but does to files inside.
+                struct stat st;
+                TEST_PCHECK(stat("/proc/self/", &st) == 0);
+                TEST_CHECK(st.st_uid == geteuid());
+                TEST_CHECK(st.st_gid == getegid());
+
+                // Also allow nobody in a userns without root mapped.
+                TEST_PCHECK(stat("/proc/self/stat", &st) == 0);
+                TEST_CHECK(st.st_uid == 0 || st.st_uid == 65534);
+                TEST_CHECK(st.st_gid == 0 || st.st_gid == 65534);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Regression test for gvisor.dev/issues/15504.
+TEST(Proc, GetdentsPartialBufferSparsePids) {
+  const DisableSave ds;  // Keep the process IDs stable throughout the scan.
+  std::map<pid_t, int> children;
+  auto cleanup = Cleanup([&] {
+    for (const auto& child : children) {
+      EXPECT_THAT(RetryEINTR(waitpid)(child.first, nullptr, 0),
+                  SyscallSucceedsWithValue(child.first));
+    }
   });
 
-  EXPECT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_DISABLE), SyscallSucceeds());
+  for (int i = 0; i < 8; ++i) {
+    // Leave a gap before each child that remains visible in /proc.
+    pid_t gap = fork();
+    if (gap == 0) {
+      _exit(0);
+    }
+    ASSERT_THAT(gap, SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(gap, nullptr, 0),
+                SyscallSucceedsWithValue(gap));
 
-  // This *does not* applies to the task directory itself (or other 0555
-  // directories), but does to files inside.
-  struct stat st;
-  ASSERT_THAT(stat("/proc/self/", &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_uid, geteuid());
-  EXPECT_EQ(st.st_gid, getegid());
+    pid_t child = fork();
+    if (child == 0) {
+      _exit(0);
+    }
+    ASSERT_THAT(child, SyscallSucceeds());
+    // Retain the child, including after it becomes a zombie, until the scan
+    // finishes. Only check these PIDs, since unrelated processes may churn.
+    children.emplace(child, 0);
+  }
 
-  // This file is owned by root. Also allow nobody in case this test is running
-  // in a userns without root mapped.
-  ASSERT_THAT(stat("/proc/self/stat", &st), SyscallSucceeds());
-  EXPECT_THAT(st.st_uid, AnyOf(Eq(0), Eq(65534)));
-  EXPECT_THAT(st.st_gid, AnyOf(Eq(0), Eq(65534)));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc", O_RDONLY | O_DIRECTORY));
+  // Force continuation across calls even with a small number of processes.
+  alignas(struct dirent) char buf[64];
+  while (true) {
+    int n;
+    ASSERT_THAT(
+        n = RetryEINTR(syscall)(SYS_getdents64, fd.get(), buf, sizeof(buf)),
+        SyscallSucceeds());
+    if (n == 0) {
+      break;
+    }
+    for (int pos = 0; pos < n;) {
+      const auto* d = reinterpret_cast<const struct dirent*>(buf + pos);
+      pid_t pid;
+      if (absl::SimpleAtoi(d->d_name, &pid)) {
+        auto child = children.find(pid);
+        if (child != children.end()) {
+          ASSERT_EQ(++child->second, 1) << "Repeated PID " << pid;
+        }
+      }
+      pos += d->d_reclen;
+    }
+  }
+  for (const auto& child : children) {
+    EXPECT_EQ(child.second, 1) << "Missing PID " << child.first;
+  }
 }
 
 TEST(Proc, GetdentsEnoent) {
@@ -3995,35 +4104,6 @@ TEST(ProcFilesystems, OverflowID) {
   EXPECT_EQ(overflowUid, defaultOverflowID);
 }
 
-TEST(ProcSysKernelKeysMax, Exists) {
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 200);
-}
-
-TEST(ProcSysKernelKeysMax, InvalidMaxKeysValue) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  ASSERT_THAT(SetContents("/proc/sys/kernel/keys/maxkeys", "-1"),
-              PosixErrorIs(EINVAL));
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 200);
-}
-
-TEST(ProcSysKernelKeysMax, SetMaxKeys) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  ASSERT_NO_ERRNO(SetContents("/proc/sys/kernel/keys/maxkeys", "100"));
-  auto maxkeys =
-      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/keys/maxkeys"));
-  int32_t mk;
-  ASSERT_TRUE(absl::SimpleAtoi(maxkeys, &mk));
-  EXPECT_EQ(mk, 100);
-}
-
 TEST(ProcSysKernel, RandomizeVaSpace) {
   std::string val = ASSERT_NO_ERRNO_AND_VALUE(
       GetContents("/proc/sys/kernel/randomize_va_space"));
@@ -4036,6 +4116,60 @@ TEST(ProcSysKernel, RandomizeVaSpace) {
     // gVisor always uses full ASLR, so expect 2.
     EXPECT_EQ(randomize_va, 2);
   }
+}
+
+// Parses /proc/sys/fs/file-nr into its three fields.
+PosixErrorOr<std::vector<int64_t>> ReadFileNr() {
+  ASSIGN_OR_RETURN_ERRNO(std::string contents,
+                         GetContents("/proc/sys/fs/file-nr"));
+  std::vector<int64_t> fields;
+  for (absl::string_view f :
+       absl::StrSplit(absl::StripAsciiWhitespace(contents),
+                      absl::ByAnyChar(" \t"), absl::SkipEmpty())) {
+    int64_t v;
+    if (!absl::SimpleAtoi(f, &v)) {
+      return PosixError(EINVAL, absl::StrCat("bad file-nr field: ", f));
+    }
+    fields.push_back(v);
+  }
+  return fields;
+}
+
+TEST(ProcSysFsFileNr, TracksOpenFiles) {
+  constexpr int kNumFiles = 200;
+
+  std::vector<int64_t> before = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(before.size(), 3);
+  EXPECT_GT(before[0], 0);
+  EXPECT_EQ(before[1], 0);
+
+  std::vector<FileDescriptor> fds;
+  fds.reserve(kNumFiles);
+  for (int i = 0; i < kNumFiles; i++) {
+    fds.push_back(ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY)));
+  }
+  std::vector<int64_t> during = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(during.size(), 3);
+  // Other processes on a shared host may open and close files concurrently,
+  // so only require that most of the new files are visible.
+  EXPECT_GE(during[0], before[0] + kNumFiles / 2);
+  EXPECT_EQ(during[1], 0);
+
+  fds.clear();
+  std::vector<int64_t> after = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(after.size(), 3);
+  EXPECT_LE(after[0], during[0] - kNumFiles / 2);
+  EXPECT_EQ(after[1], 0);
+}
+
+TEST(ProcSysFsFileNr, MaxMatchesFileMax) {
+  std::vector<int64_t> fields = ASSERT_NO_ERRNO_AND_VALUE(ReadFileNr());
+  ASSERT_EQ(fields.size(), 3);
+  std::string file_max =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/fs/file-max"));
+  int64_t max;
+  ASSERT_TRUE(absl::SimpleAtoi(absl::StripAsciiWhitespace(file_max), &max));
+  EXPECT_EQ(fields[2], max);
 }
 
 }  // namespace

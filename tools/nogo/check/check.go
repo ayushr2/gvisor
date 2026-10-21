@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -532,6 +533,20 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 	// If packages are available locally, we can refer to those directly.
 	astFacts := facts.NewPackage()
 
+	// Analysis can refer to a package through a field or method selection on
+	// an imported type without importing that package directly.
+	packageFacts := map[*types.Package]*facts.Package{astPackage: astFacts}
+	for _, pkg := range astPackage.Imports() {
+		packageFacts[pkg] = i.fastFacts(pkg)
+	}
+	for _, obj := range typesInfo.Uses {
+		if pkg := obj.Pkg(); pkg != nil {
+			if _, ok := packageFacts[pkg]; !ok {
+				packageFacts[pkg] = i.fastFacts(pkg)
+			}
+		}
+	}
+
 	// Recursively visit all analyzers.
 	var (
 		resultsMu sync.RWMutex // protects results & errs, findings.
@@ -541,13 +556,21 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 		errs      = make(map[*analysis.Analyzer]error)
 		findings  = make(FindingSet, 0)
 	)
+	sortedAnalyzers := make([]*analysis.Analyzer, 0, len(i.analyzers))
 	for a := range i.analyzers {
+		sortedAnalyzers = append(sortedAnalyzers, a)
+	}
+	sort.Slice(sortedAnalyzers, func(i, j int) bool {
+		return sortedAnalyzers[i].Name < sortedAnalyzers[j].Name
+	})
+	for _, a := range sortedAnalyzers {
 		wg := new(sync.WaitGroup)
 		wg.Add(1) // For analysis.
 		ready[a] = wg
 	}
 	limit := make(chan struct{}, 1)
-	for a, wg := range ready {
+	for _, a := range sortedAnalyzers {
+		wg := ready[a]
 		go func(a *analysis.Analyzer, wg *sync.WaitGroup) {
 			defer wg.Done()
 
@@ -640,30 +663,12 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 				AllPackageFacts: func() (rv []analysis.PackageFact) {
 					factsMu.RLock()
 					defer factsMu.RUnlock()
-					// Pull all dependencies.
-					for _, importedPkg := range astPackage.Imports() {
-						otherFacts := i.fastFacts(importedPkg)
-						if otherFacts == nil {
-							continue
-						}
+					for pkg, fs := range packageFacts {
 						for typ := range localFactTypes {
-							v := reflect.New(typ.Elem())
-							if otherFacts.ImportFact(nil, v.Interface().(analysis.Fact)) {
-								rv = append(rv, analysis.PackageFact{
-									Package: importedPkg,
-									Fact:    v.Interface().(analysis.Fact),
-								})
+							fact := reflect.New(typ.Elem()).Interface().(analysis.Fact)
+							if fs.ImportFact(nil, fact) {
+								rv = append(rv, analysis.PackageFact{Package: pkg, Fact: fact})
 							}
-						}
-					}
-					// Pull all local facts.
-					for typ := range localFactTypes {
-						v := reflect.New(typ.Elem())
-						if astFacts.ImportFact(nil, v.Interface().(analysis.Fact)) {
-							rv = append(rv, analysis.PackageFact{
-								Package: astPackage,
-								Fact:    v.Interface().(analysis.Fact),
-							})
 						}
 					}
 					return
@@ -671,15 +676,19 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 				AllObjectFacts: func() (rv []analysis.ObjectFact) {
 					factsMu.RLock()
 					defer factsMu.RUnlock()
-					// Pull all local facts.
-					for obj := range astFacts.Objects {
-						for typ := range localFactTypes {
-							v := reflect.New(typ.Elem())
-							if astFacts.ImportFact(obj, v.Interface().(analysis.Fact)) {
-								rv = append(rv, analysis.ObjectFact{
-									Object: obj,
-									Fact:   v.Interface().(analysis.Fact),
-								})
+					for _, fs := range packageFacts {
+						if fs == nil {
+							continue
+						}
+						for obj := range fs.Objects {
+							if obj == nil {
+								continue // Package facts are not object facts.
+							}
+							for typ := range localFactTypes {
+								fact := reflect.New(typ.Elem()).Interface().(analysis.Fact)
+								if fs.ImportFact(obj, fact) {
+									rv = append(rv, analysis.ObjectFact{Object: obj, Fact: fact})
+								}
 							}
 						}
 					}
@@ -810,7 +819,13 @@ func (i *importer) allFactsAndFindings() (FindingSet, *facts.Bundle) {
 		findings = make(FindingSet, 0)
 		allFacts = facts.NewBundle()
 	)
-	for path, entry := range i.cache {
+	paths := make([]string, 0, len(i.cache))
+	for path := range i.cache {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		entry := i.cache[path]
 		findings = append(findings, entry.findings...)
 		if entry.facts != nil {
 			allFacts.Add(path, entry.facts)
@@ -946,7 +961,12 @@ func Bundle(sources map[string][]string, roots []string) (FindingSet, facts.Seri
 		imports:   make(map[string]*types.Package),
 		analyzers: allAnalyzers,
 	}
+	pkgs := make([]string, 0, len(sources))
 	for pkg := range sources {
+		pkgs = append(pkgs, pkg)
+	}
+	sort.Strings(pkgs)
+	for _, pkg := range pkgs {
 		// Was there an error processing this package?
 		if _, err := i.importPackage(pkg, ""); err != nil {
 			return nil, nil, err

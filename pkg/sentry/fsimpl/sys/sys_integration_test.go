@@ -230,7 +230,7 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	if err := os.MkdirAll(pciPath0, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
-	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0000:10")
+	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0007:10")
 	if err := os.MkdirAll(pciPath1, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
@@ -261,14 +261,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		{
 			group:             "2",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0",
+			pciAddress:        "0007:10:05.0",
 			name:              "vfio2",
 			nestedDeviceIndex: 3,
 		},
 		{
 			group:             "3",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0/0000:03:00.1",
+			pciAddress:        "0007:10:05.0/0007:03:00.1",
 			name:              "vfio3",
 			nestedDeviceIndex: -1,
 		},
@@ -298,6 +298,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 			t.Fatalf("Failed to symlink iommu_groups directory: %v", err)
 		}
 	}
+	// Non-PCI platform devices in IOMMU groups (e.g. on ARM64 hosts) must be ignored.
+	nonPCIIOMMUPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", "4", "devices")
+	if err := os.MkdirAll(nonPCIIOMMUPath, 0755); err != nil {
+		t.Fatalf("Failed to create non-PCI iommu_groups directory: %v", err)
+	}
+	if err := os.Symlink("../../../../devices/platform/arm-smmu-v3.0.auto", path.Join(nonPCIIOMMUPath, "arm-smmu-v3.0.auto")); err != nil {
+		t.Fatalf("Failed to symlink non-PCI iommu_group device: %v", err)
+	}
 	s := newTestSystem(t, sysfsTestDir)
 	defer s.Destroy()
 
@@ -322,6 +330,85 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		pop = s.PathOpAtRoot(path.Join("kernel", "iommu_groups", string(device.group), "devices"))
 		s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
 			path.Base(device.pciAddress): linux.DT_LNK,
+		})
+	}
+
+	// Read iommu_group symlinks via /bus/pci/devices to populate cached dentries.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/0"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/1"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Fatalf("ReadlinkAt(%q) = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+	}
+
+	// Swap IOMMU groups 0 and 1 on the host and run CompleteRestore.
+	for _, swap := range []struct {
+		pciAddr  string
+		oldGroup string
+		newGroup string
+	}{
+		{"0000:00:04.0", "0", "1"},
+		{"0000:00:05.0", "1", "0"},
+	} {
+		iommuLink := path.Join(pciPath0, swap.pciAddr, "iommu_group")
+		if err := os.Remove(iommuLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_group symlink: %v", err)
+		}
+		if err := os.Symlink(path.Join("..", "..", "..", "kernel", "iommu_groups", swap.newGroup), iommuLink); err != nil {
+			t.Fatalf("Failed to create new iommu_group symlink: %v", err)
+		}
+		oldDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.oldGroup, "devices", swap.pciAddr)
+		if err := os.Remove(oldDevLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_groups device symlink: %v", err)
+		}
+	}
+	for _, swap := range []struct {
+		pciAddr  string
+		newGroup string
+	}{
+		{"0000:00:04.0", "1"},
+		{"0000:00:05.0", "0"},
+	} {
+		newDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.newGroup, "devices", swap.pciAddr)
+		if err := os.Symlink(path.Join("..", "..", "..", "..", "devices", "pci0000:00", swap.pciAddr), newDevLink); err != nil {
+			t.Fatalf("Failed to create new iommu_groups device symlink: %v", err)
+		}
+	}
+
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+
+	// Verify that cached dentries were invalidated and the new IOMMU groups are visible.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+		groupNum  string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/1", "1"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/0", "0"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) after CompleteRestore failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Errorf("ReadlinkAt(%q) after CompleteRestore = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+		pop = s.PathOpAtRoot(path.Join("kernel", "iommu_groups", tc.groupNum, "devices"))
+		s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+			tc.pciAddr: linux.DT_LNK,
 		})
 	}
 }

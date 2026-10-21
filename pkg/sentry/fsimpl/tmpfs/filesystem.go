@@ -414,6 +414,11 @@ afterTrailingSymlink:
 		goto afterTrailingSymlink
 	}
 	if linuxerr.Equals(linuxerr.ENOENT, err) {
+		// tmpfs never calls VFS.InvalidateDentry(), so parentDir.dentry can
+		// only be dead if it was deleted.
+		if parentDir.dentry.vfsd.IsDead() {
+			return nil, linuxerr.ENOENT
+		}
 		// Already checked for searchability above; now check for writability.
 		if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 			return nil, err
@@ -461,6 +466,17 @@ afterTrailingSymlink:
 // indefinitely).
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, afterCreate bool) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
+	if opts.FileExec {
+		_, isRegular := d.inode.impl.(*regularFile)
+		_, isSymlink := d.inode.impl.(*symlink)
+		// Only regular files may be executed; reject before the open can
+		// block (e.g. on a FIFO with no writer), as in Linux's
+		// fs/namei.c:may_open(). Symlinks are exempt so that they produce
+		// ELOOP below, also per may_open().
+		if !isRegular && !isSymlink {
+			return nil, linuxerr.EACCES
+		}
+	}
 	if !afterCreate {
 		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
 			return nil, err

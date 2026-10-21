@@ -22,10 +22,9 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
-	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -44,7 +43,7 @@ type Checkpoint struct {
 	cudaCheckpointSequential  bool
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
-	splitFSCheckpointPaths    string
+	splitFSCheckpointPaths    pathVar
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -79,8 +78,10 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
-	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
-	f.StringVar(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", "", "comma-separated list of container:path targets to include in the filesystem checkpoint. For capturing all of tmpfs, the value should be \"all-tmpfs\".")
+	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", controlapi.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
+	// Must match the default prefix applied by sandbox.Sandbox.Checkpoint.
+	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
+	f.Var(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", `[<prefix>=][<container>:]<path> target to include in the filesystem checkpoint (can be repeated). <prefix> defaults to "fs". The files are written to --image-path as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. For capturing all of tmpfs, the path should be "all-tmpfs".`)
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
@@ -118,18 +119,6 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		util.Fatalf("making directories at path provided: %v", err)
 	}
 
-	var paths []checkpoint.ResourceID
-	if c.splitFSCheckpointPaths != "" {
-		var err error
-		paths, err = boot.ParseFSCheckpointPaths(c.splitFSCheckpointPaths)
-		if err != nil {
-			util.Fatalf("parsing fs-checkpoint-paths: %v", err)
-		}
-		if len(paths) == 0 {
-			util.Fatalf("empty fs-checkpoint-paths: %q", c.splitFSCheckpointPaths)
-		}
-	}
-
 	opts := sandbox.CheckpointOpts{
 		Compression:                c.compression.Level(),
 		Resume:                     c.leaveRunning,
@@ -140,7 +129,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
-		SplitFSCheckpointPaths:     paths,
+		SplitFSCheckpointPaths:     c.splitFSCheckpointPaths.targets,
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {

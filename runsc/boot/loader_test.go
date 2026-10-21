@@ -40,11 +40,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+// procSelfFD is passed as Args.ProcSelfFD to every loader created by tests.
+var procSelfFD int
 
 func init() {
 	// Reserve the initial thread for main so capability tests use threads that
@@ -56,6 +60,11 @@ func init() {
 	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
 	}
+	fd, err := unix.Open("/proc/self/fd", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		panic(err)
+	}
+	procSelfFD = fd
 }
 
 func testConfig() *config.Config {
@@ -157,6 +166,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		GoferMountConfs:  []specutils.GoferMountConf{{Lower: specutils.Lisafs, Upper: specutils.NoOverlay}},
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
+		ProcSelfFD:       procSelfFD,
 		RootfsUpperTarFD: -1,
 		CPUDMALatencyFD:  -1,
 	}
@@ -664,14 +674,14 @@ func TestNetworkConfig(t *testing.T) {
 		l.ctrl.manager.startResultChan <- nil
 	}()
 
-	args := &CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{
 			{
 				Name: "lo",
-				Addresses: []IPWithPrefix{
+				Addresses: []sentryapi.IPWithPrefix{
 					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
 				},
-				Routes: []Route{
+				Routes: []sentryapi.Route{
 					{
 						Destination: net.IPNet{
 							IP:   net.IP{127, 0, 0, 0},
@@ -685,7 +695,7 @@ func TestNetworkConfig(t *testing.T) {
 	if err := l.ctrl.manager.SetNetworkArgs(args, nil); err != nil {
 		t.Errorf("error calling SetNetworkConfig: %v", err)
 	}
-	var networkArgs CreateLinksAndRoutesArgs
+	var networkArgs sentryapi.CreateLinksAndRoutesArgs
 	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
 		t.Errorf("error calling NetworkConfig: %v", err)
 	}

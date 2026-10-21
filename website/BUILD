@@ -149,6 +149,7 @@ docs(
         "//:security",
         "//g3doc:community",
         "//g3doc:index",
+        "//g3doc:release",
         "//g3doc:roadmap",
         "//g3doc:style",
         "//g3doc/architecture_guide:intro_to_gvisor",
@@ -204,8 +205,8 @@ docs(
 genrule(
     name = "syscalljson",
     outs = ["syscalls.json"],
-    cmd = "$(location //runsc) -- help syscalls -format json -filename $@",
-    tools = ["//runsc"],
+    cmd = "$(location //runsc/cmd/sentry:gvisor_sentry) -- help syscalls -format json -filename $@",
+    tools = ["//runsc/cmd/sentry:gvisor_sentry"],
 )
 
 # Generate markdown from the json dump.

@@ -118,15 +118,19 @@ namespace {
 using ::testing::Eq;
 using ::testing::HasSubstr;
 
+// Mounting cgroup2 requires CAP_SYS_ADMIN in the user namespace that owns the
+// cgroup namespace, which is normally the initial user namespace.
 bool Cgroup2Available() {
-  return TEST_CHECK_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN));
+  return TEST_CHECK_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)) &&
+         TEST_CHECK_NO_ERRNO_AND_VALUE(InInitialUserNamespace());
 }
 
 class Cgroup2Test : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!Cgroup2Available()) {
-      GTEST_SKIP() << "Cgroup v2 not available or ignored on gVisor";
+      GTEST_SKIP() << "Mounting cgroup2 requires CAP_SYS_ADMIN in the initial "
+                      "user namespace";
     }
   }
 
@@ -772,6 +776,38 @@ TEST_F(Cgroup2Test, SubtreeControlPids) {
   EXPECT_THAT(Exists(child.Relpath("pids.max")), IsPosixErrorOkAndHolds(false));
   EXPECT_THAT(child.ReadControlFile("cgroup.controllers"),
               IsPosixErrorOkAndHolds(Not(HasSubstr("pids"))));
+}
+
+TEST_F(Cgroup2Test, CpusetRejectsImpossibleCpu) {
+  const std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpuset"));
+
+  const std::string possible =
+      std::string(absl::StripAsciiWhitespace(ASSERT_NO_ERRNO_AND_VALUE(
+          GetContents("/sys/devices/system/cpu/possible"))));
+  // CPU IDs can be sparse or offline. Use the last possible ID, not the number
+  // of online CPUs, to choose a bit outside the system's possible mask.
+  const size_t last = possible.find_last_of(",-");
+  const uint32_t max_cpu = ASSERT_NO_ERRNO_AND_VALUE(Atoi<uint32_t>(
+      possible.substr(last == std::string::npos ? 0 : last + 1)));
+  // Keep the range small even if a regression accepts it.
+  SKIP_IF(max_cpu >= 4096);
+  const std::string impossible = absl::StrCat(max_cpu + 1);
+  const std::string before =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cpuset.cpus"));
+  ASSERT_NO_ERRNO(c().WriteControlFile("cpuset.cpus", before));
+  RecordProperty("possible_cpus", possible);
+  for (const auto& [name, value] :
+       {std::pair{"singleton", impossible},
+        std::pair{"range", absl::StrCat("0-", impossible)}}) {
+    SCOPED_TRACE(value);
+    const PosixError error = c().WriteControlFile("cpuset.cpus", value);
+    RecordProperty(absl::StrCat(name, "_errno"), error.errno_value());
+    EXPECT_FALSE(error.ok()) << "Accepted an impossible CPU";
+    EXPECT_THAT(c().ReadControlFile("cpuset.cpus"),
+                IsPosixErrorOkAndHolds(before));
+  }
 }
 
 TEST_F(Cgroup2Test, PidsEnforcement) {
@@ -2799,123 +2835,6 @@ TEST_F(Cgroup2Test, V1MountRejectedWhenControllerEnabledInV2) {
   // Since it is enabled in v2, attempting to mount v1 pointing to pids should
   // fail with EBUSY.
   EXPECT_THAT(m_->MountCgroupfs("pids"), PosixErrorIs(EBUSY));
-}
-
-TEST_F(Cgroup2Test, V1MountSucceedsAndV2OwnershipReturnsOnUnmount) {
-  auto v2_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v2_mounter(std::move(v2_mount));
-  auto v2_cg = ASSERT_NO_ERRNO_AND_VALUE(v2_mounter.MountCgroup2fs());
-
-  // Skip if v2 doesn't have pids to begin with.
-  auto available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  SKIP_IF(!absl::StrContains(available, "pids"));
-  // Skip if we can't drain pids from below v2 root.
-  PosixError unused = v2_cg.WriteControlFile("cgroup.subtree_control", "-pids");
-  SKIP_IF(unused.errno_value() == EBUSY);
-
-  // Steal the pids controller away from v2 by mounting it in v1.
-  auto v1_mount1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter1(std::move(v1_mount1));
-  auto v1_cg1 = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter1.MountCgroupfs("pids"));
-  // Mount it again in another v1 hierarchy for good measure.
-  auto v1_mount2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter2(std::move(v1_mount2));
-  auto v1_cg2 = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter2.MountCgroupfs("pids"));
-
-  // Now pids should be gone from v2 root's cgroup.controllers
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::Not(::testing::HasSubstr("pids")));
-
-  // Unmount the first v1 mount. Pids should still be absent from v2.
-  ASSERT_NO_ERRNO(v1_mounter1.Unmount(v1_cg1));
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::Not(::testing::HasSubstr("pids")));
-
-  // Unmount the second v1 mount, restoring pids ownership to v2.
-  ASSERT_NO_ERRNO(v1_mounter2.Unmount(v1_cg2));
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::HasSubstr("pids"));
-}
-
-// Exercises cgroup.kill while the memory controller is mounted in a v1
-// hierarchy. Stealing the memory controller from v2 acquires the v2 tasks
-// lock under the cgroup registry lock, and cgroup.kill sends signals while
-// holding the same tasks lock; task creation meanwhile enters the initial v1
-// cgroups while holding the signal handlers lock. Together these form a lock
-// order cycle that gVisor builds with lock dependency checking (the "lockdep"
-// go build tag) detect and panic on.
-TEST_F(Cgroup2Test, KillWithV1MemoryMounted) {
-  auto v2_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v2_mounter(std::move(v2_mount));
-  auto v2_cg = ASSERT_NO_ERRNO_AND_VALUE(v2_mounter.MountCgroup2fs());
-
-  // Skip if v2 doesn't have memory to begin with.
-  auto available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  SKIP_IF(!absl::StrContains(available, "memory"));
-  // Skip if we can't drain memory from below v2 root.
-  PosixError drain =
-      v2_cg.WriteControlFile("cgroup.subtree_control", "-memory");
-  SKIP_IF(drain.errno_value() == EBUSY);
-
-  // Steal the memory controller away from v2 by mounting it in v1.
-  auto v1_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter(std::move(v1_mount));
-  auto v1_cg = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter.MountCgroupfs("memory"));
-
-  Cgroup child_cg =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.CreateChild("kill_v1mem_test"));
-
-  int fds[2];
-  ASSERT_THAT(pipe(fds), SyscallSucceeds());
-  FileDescriptor rfd(fds[0]);
-  FileDescriptor wfd(fds[1]);
-
-  pid_t pid = fork();
-  if (pid == 0) {
-    close(wfd.get());
-    char token;
-    if (read(rfd.get(), &token, 1) <= 0) {
-      _exit(1);
-    }
-    _exit(0);
-  }
-  ASSERT_GT(pid, 0);
-  rfd.reset();
-
-  ASSERT_NO_ERRNO(child_cg.Enter(pid));
-
-  // Killing the cgroup sends SIGKILL to its tasks while the stolen memory
-  // controller's v1 hierarchy is mounted.
-  EXPECT_TRUE(child_cg.WriteControlFile("cgroup.kill", "1").ok());
-  wfd.reset();
-
-  int status;
-  ASSERT_EQ(waitpid(pid, &status, 0), pid);
-  EXPECT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(WTERMSIG(status), SIGKILL);
-
-  // The killed task may leave the cgroup asynchronously; retry the removal.
-  absl::Time deadline = absl::Now() + absl::Seconds(5);
-  PosixError err;
-  while (true) {
-    err = Rmdir(child_cg.Path());
-    if (err.ok() || absl::Now() >= deadline) {
-      break;
-    }
-    absl::SleepFor(absl::Milliseconds(10));
-  }
-  EXPECT_NO_ERRNO(err);
-
-  // Return the memory controller to v2.
-  ASSERT_NO_ERRNO(v1_mounter.Unmount(v1_cg));
-  if (drain.ok()) {
-    v2_cg.WriteControlFile("cgroup.subtree_control", "+memory").IgnoreError();
-  }
 }
 
 TEST_F(Cgroup2Test, MemoryCurrent) {

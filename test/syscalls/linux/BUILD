@@ -472,6 +472,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:logging",
         "//test/util:posix_error",
@@ -479,6 +480,7 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
     ],
 )
@@ -676,8 +678,11 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "//test/util:logging",
+        "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:socket_util",
         "//test/util:test_main",
@@ -892,9 +897,11 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:capability_util",
         "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "//test/util:logging",
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:proc_util",
@@ -902,6 +909,7 @@ cc_binary(
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
+        "//test/util:thread_util",
         "@com_google_absl//absl/strings",
     ],
 )
@@ -1394,6 +1402,7 @@ cc_binary(
         "//test/util:capability_util",
         "//test/util:cleanup",
         "//test/util:file_descriptor",
+        "//test/util:memory_util",
         "//test/util:posix_error",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -1913,12 +1922,14 @@ cc_binary(
         "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "//test/util:mount_util",
         "//test/util:posix_error",
         "//test/util:save_util",
         "//test/util:temp_path",
         "//test/util:temp_umask",
         "//test/util:test_main",
         "//test/util:test_util",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -2243,11 +2254,13 @@ cc_binary(
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
+        "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:logging",
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
+        "//test/util:signal_util",
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
@@ -2424,6 +2437,23 @@ cc_binary(
 )
 
 cc_binary(
+    name = "proc_keys_test",
+    testonly = 1,
+    srcs = ["proc_keys.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:capability_util",
+        "//test/util:cleanup",
+        "//test/util:fs_util",
+        "//test/util:posix_error",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_binary(
     name = "proc_net_test",
     testonly = 1,
     srcs = ["proc_net.cc"],
@@ -2546,6 +2576,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:logging",
@@ -2559,6 +2590,7 @@ cc_binary(
         "//test/util:test_util",
         "//test/util:thread_util",
         "//test/util:time_util",
+        "//test/util:timer_util",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
@@ -2843,6 +2875,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:file_descriptor",
         "//test/util:logging",
         "//test/util:memory_util",
         "//test/util:multiprocess_util",
@@ -2853,6 +2886,7 @@ cc_binary(
         "//test/util:test_util",
         "//test/util:thread_util",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -3136,6 +3170,7 @@ cc_library(
     alwayslink = 1,
 )
 
+# Internal socket-option tests depend on this target despite its empty source.
 cc_binary(
     name = "socketopt_test",
     testonly = 1,
@@ -4245,6 +4280,7 @@ cc_library(
         ":unix_domain_socket_test_util",
         "//test/util:capability_util",
         "//test/util:cleanup",
+        "//test/util:memory_util",
         "//test/util:posix_error",
         "//test/util:socket_util",
         "//test/util:test_util",
@@ -4764,6 +4800,7 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "//test/util:timer_util",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -5506,6 +5543,30 @@ cc_binary(
 )
 
 cc_binary(
+    name = "cgroup2_transfer_test",
+    testonly = 1,
+    srcs = ["cgroup2_transfer.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:capability_util",
+        "//test/util:cgroup_util",
+        "//test/util:cleanup",
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "//test/util:logging",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:time_util",
+        "//test/util:timer_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_binary(
     name = "deleted_test",
     testonly = 1,
     srcs = ["deleted.cc"],
@@ -5553,9 +5614,11 @@ cc_binary(
         "//test/util:eventfd_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "//test/util:logging",
         "//test/util:mount_util",
         "//test/util:posix_error",
         "//test/util:save_util",
+        "//test/util:signal_util",
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -5564,6 +5627,7 @@ cc_binary(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
     ],
 )
 

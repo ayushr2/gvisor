@@ -108,16 +108,17 @@ TEST(IPTablesBasic, GetEntriesShortBuffer) {
 }
 
 TEST(IPTablesBasic, OriginalDstErrors) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  const FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_STREAM, 0));
 
-  int sock;
-  ASSERT_THAT(sock = socket(AF_INET, SOCK_STREAM, 0), SyscallSucceeds());
-
-  // Sockets not affected by NAT should fail to find an original destination.
+  // An unconnected socket has no tracked connection to look up.
   struct sockaddr_in addr = {};
   socklen_t addr_len = sizeof(addr);
-  EXPECT_THAT(getsockopt(sock, SOL_IP, SO_ORIGINAL_DST, &addr, &addr_len),
-              SyscallFailsWithErrno(ENOTCONN));
+  int ret = getsockopt(sock.get(), SOL_IP, SO_ORIGINAL_DST, &addr, &addr_len);
+  // Linux fails with ENOPROTOOPT if nf_conntrack is not loaded.
+  SKIP_IF(ret == -1 && errno == ENOPROTOOPT &&
+          GvisorPlatform() == Platform::kNative);
+  EXPECT_THAT(ret, SyscallFailsWithErrno(ENOENT));
 }
 
 TEST(IPTablesBasic, GetRevision) {
@@ -516,8 +517,12 @@ TEST_P(GetSockOptRequiresCapNetAdminTest, Validate) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
   FileDescriptor sock =
       ASSERT_NO_ERRNO_AND_VALUE(Socket(kind.domain, kind.type, kind.protocol));
+  // Linux fails with ENOENT if the kernel lacks the queried table or target
+  // so skip natively in that case.
   absl::StatusOr<SockOptArgs> args_or_status =
       params.generate_sockopt_args(sock.get());
+  SKIP_IF(absl::IsNotFound(args_or_status.status()) &&
+          GvisorPlatform() == Platform::kNative);
   ASSERT_EQ(args_or_status.status(), absl::OkStatus());
   SockOptArgs& getsockopt_args = *args_or_status;
 
@@ -529,9 +534,11 @@ TEST_P(GetSockOptRequiresCapNetAdminTest, Validate) {
               getsockopt_args.optlen);
 
   // Validate that the socket creator can successfully getsockopt.
-  ASSERT_THAT(getsockopt(getsockopt_args.sock, SOL_IP, getsockopt_args.optname,
-                         getsockopt_args.optval.get(), &getsockopt_args.optlen),
-              SyscallSucceeds());
+  int ret = getsockopt(getsockopt_args.sock, SOL_IP, getsockopt_args.optname,
+                       getsockopt_args.optval.get(), &getsockopt_args.optlen);
+  SKIP_IF(ret == -1 && errno == ENOENT &&
+          GvisorPlatform() == Platform::kNative);
+  ASSERT_THAT(ret, SyscallSucceeds());
 
   // Validate that another process from a different user namespace cannot
   // getsockopt and fails with EPERM.
@@ -579,7 +586,7 @@ INSTANTIATE_TEST_SUITE_P(
                          kNatTablename);
                 if (getsockopt(sock, SOL_IP, IPT_SO_GET_INFO, &get_info,
                                &get_info_optlen) != 0) {
-                  return absl::InternalError(strerror(errno));
+                  return absl::ErrnoToStatus(errno, "IPT_SO_GET_INFO");
                 }
                 socklen_t get_entries_optlen =
                     sizeof(ipt_get_entries) + get_info.size;

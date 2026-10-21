@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -72,9 +72,32 @@ go_library(
         "//pkg/sentry/hostfd",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/socket/unix/transport",
+        "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "erofs_test",
+    size = "small",
+    srcs = ["regular_file_test.go"],
+    embed = [":erofs"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/erofs",
+        "//pkg/fspath",
+        "//pkg/hostarch",
+        "//pkg/safemem",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/vfs",
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
     ],

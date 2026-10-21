@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/runsc/autoplatform"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -178,6 +179,12 @@ func Run(sidecar *gvisorbinaries.Binary, commands map[util.SubCommand]string, he
 		}
 	}
 
+	// Replace --platform=auto with a concrete platform. Child processes
+	// receive the concrete platform through their flags.
+	if err := autoplatform.Resolve(conf, spec); err != nil {
+		util.Fatalf("%v", err)
+	}
+
 	// Construct LogFileOpts for the subcommand.
 	lfOpts := &specutils.LogFileOpts{
 		SandboxID: "<unknown>",
@@ -286,7 +293,6 @@ func Run(sidecar *gvisorbinaries.Binary, commands map[util.SubCommand]string, he
 	}
 	log.Infof(delimString)
 	gvisorbinaries.ReleaseEnforcementPolicy = conf.SidecarReleaseEnforcementPolicy
-	gvisorbinaries.UsagePolicy = conf.SidecarUsagePolicy
 	gvisorbinaries.VerifyMatchingRelease(sidecar)
 
 	if *coverageFD >= 0 {
@@ -347,7 +353,7 @@ func userLogEmitter(conf *config.Config, subcommand string) (log.Emitter, bool) 
 	}
 	// We need to manually scan for `--user-log-fd` since it is a flag of the
 	// `boot` subcommand. We know it is in `--user-log-fd=FD` format because
-	// we control how arguments to `runsc boot` are formatted.
+	// we control how arguments to the `boot` subcommand are formatted.
 	const userLogFDFlagPrefix = "--user-log-fd="
 	var userLog *os.File
 	for _, arg := range os.Args[1:] {

@@ -415,6 +415,7 @@ disabled_plugins = ["io.containerd.internal.v1.restart"]
   runtime_type = "io.containerd.runc.v2"
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.` + containerdRuntime + `]
   runtime_type = "io.containerd.` + containerdRuntime + `.v1"
+  pod_annotations = ["dev.gvisor.*"]
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.` + containerdRuntime + `.options]
   TypeUrl = "io.containerd.` + containerdRuntime + `.v1.options"
 `
@@ -1139,7 +1140,7 @@ func TestCrictlSandboxPosture(t *testing.T) {
 		NetworkMode:          "sandbox",
 		EnableRaw:            conf.EnableRaw,
 		RequiresCapSysPtrace: sandboxposture.PlatformCapSysPtrace[conf.Platform],
-		GoDebug:              sandboxposture.PlatformGoDebug[conf.Platform],
+		GoDebug:              sandboxposture.GoDebug(conf.Platform),
 		ExtraFDClasses:       extraFDs,
 		CgoEnabled:           config.CgoEnabled,
 		ChildOfRef:           true,

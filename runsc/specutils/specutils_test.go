@@ -147,6 +147,70 @@ func TestSpecInvalid(t *testing.T) {
 			error: "",
 		},
 		{
+			name: "valid with no uts namespace",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Linux: &specs.Linux{
+					Namespaces: []specs.LinuxNamespace{
+						{Type: specs.PIDNamespace},
+					},
+				},
+			},
+			error: "",
+		},
+		{
+			name: "valid with new uts namespace",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Linux: &specs.Linux{
+					Namespaces: []specs.LinuxNamespace{
+						{Type: specs.UTSNamespace},
+					},
+				},
+			},
+			error: "",
+		},
+		{
+			name: "host uts namespace",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Linux: &specs.Linux{
+					Namespaces: []specs.LinuxNamespace{
+						{Type: specs.UTSNamespace, Path: "/proc/1/ns/uts"},
+					},
+				},
+			},
+			error: "joining UTS namespace",
+		},
+		{
+			name: "subcontainer with sandbox uts namespace",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Annotations: map[string]string{
+					ContainerdContainerTypeAnnotation: ContainerdContainerTypeContainer,
+					ContainerdSandboxIDAnnotation:     "sandbox-123",
+				},
+				Linux: &specs.Linux{
+					Namespaces: []specs.LinuxNamespace{
+						{Type: specs.UTSNamespace, Path: "/proc/1234/ns/uts"},
+					},
+				},
+			},
+			error: "",
+		},
+		{
 			name: "no root",
 			spec: specs.Spec{
 				Process: &specs.Process{
@@ -725,6 +789,30 @@ func TestRootfsUpperTarPath(t *testing.T) {
 			got := RootfsTarUpperPath(&tc.spec)
 			if got != tc.want {
 				t.Errorf("RootfsUpperTarFD() got: %v, want: %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsProcFDPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "proc-self-fd", path: "/proc/self/fd/3", want: true},
+		{name: "proc-thread-self-fd", path: "/proc/thread-self/fd/4", want: true},
+		{name: "dev-fd", path: "/dev/fd/5", want: true},
+		{name: "empty-fd", path: "/proc/self/fd/", want: false},
+		{name: "non-numeric", path: "/proc/self/fd/abc", want: false},
+		{name: "path-traversal", path: "/proc/self/fd/../etc/passwd", want: false},
+		{name: "overflow", path: "/proc/self/fd/2147483648", want: false},
+		{name: "negative", path: "/proc/self/fd/-1", want: false},
+		{name: "regular-tar", path: "/tmp/upper.tar", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsProcFDPath(tc.path); got != tc.want {
+				t.Errorf("IsProcFDPath(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
 	}

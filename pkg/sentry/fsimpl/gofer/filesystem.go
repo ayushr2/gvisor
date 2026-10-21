@@ -610,6 +610,19 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	}
 	parent.childrenMu.Unlock()
 
+	if !dir && rp.MustBeDir() {
+		// The trailing slash makes this fail regardless, but the error depends
+		// on whether the child exists and is a directory.
+		child, err := fs.getChildLocked(ctx, parent, name, &ds)
+		if err != nil {
+			return err
+		}
+		if child.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
+
 	// Load child if sticky bit is set because we need to determine whether
 	// deletion is allowed.
 	var child *dentry
@@ -687,12 +700,6 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		if child != nil && child.isDir() {
 			vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
 			return linuxerr.EISDIR
-		}
-		if rp.MustBeDir() {
-			if child != nil {
-				vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
-			}
-			return linuxerr.ENOTDIR
 		}
 	}
 	if parent.inode.isSynthetic() {
@@ -1090,6 +1097,13 @@ var logUnimplementedBlockDevOpenOnce sync.Once
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 
+	if ft := d.inode.fileType(); opts.FileExec && ft != linux.S_IFREG && ft != linux.S_IFLNK {
+		// Only regular files may be executed; reject before the open can
+		// block (e.g. on a FIFO with no writer), as in Linux's
+		// fs/namei.c:may_open(). Symlinks are exempt so that they produce
+		// ELOOP below, also per may_open().
+		return nil, linuxerr.EACCES
+	}
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
@@ -1102,11 +1116,10 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 	}
 	if !d.inode.isSynthetic() {
-		// renameMu is locked here because it is required by d.openHandle(), which
-		// is called by d.ensureSharedHandle() and d.openSpecialFile() below. It is
-		// also required by d.connect() which is called by
-		// d.openSocketByConnecting(). Note that opening non-synthetic pipes may
-		// block, renameMu is unlocked separately in d.openSpecialFile() for pipes.
+		// renameMu is locked here because it is required by d.connect() which is
+		// called by d.openSocketByConnecting(). Note that opening non-synthetic
+		// pipes may block, renameMu is unlocked separately in d.openSpecialFile()
+		// for pipes.
 		d.inode.fs.renameMu.RLock()
 		defer d.inode.fs.renameMu.RUnlock()
 	}
@@ -1129,7 +1142,10 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	switch d.inode.fileType() {
 	case linux.S_IFREG:
 		if !d.inode.fs.opts.regularFilesUseSpecialFileFD {
-			if err := d.ensureSharedHandle(ctx, ats.MayRead(), ats.MayWrite(), trunc); err != nil {
+			// Exec opens need a readable handle even without read permission;
+			// the sentry must read the executable to load it.
+			needReadHandle := ats.MayRead() || opts.FileExec
+			if err := d.ensureSharedHandle(ctx, needReadHandle, ats.MayWrite(), trunc); err != nil {
 				return nil, err
 			}
 			fd, err := newRegularFileFD(mnt, d, opts.Flags, rp.Credentials())
@@ -1292,8 +1308,11 @@ func (d *dentry) openSpecialFile(ctx context.Context, mnt *vfs.Mount, opts *vfs.
 	// open, not whether the pipe was *previously* opened by a peer that has
 	// since closed its end.
 	isBlockingOpenOfNamedPipe := d.inode.fileType() == linux.S_IFIFO && opts.Flags&linux.O_NONBLOCK == 0
+	// Exec opens need a readable handle even without read permission; the
+	// sentry must read the executable to load it.
+	needReadHandle := ats.MayRead() || opts.FileExec
 retry:
-	h, err := d.openHandle(ctx, ats.MayRead(), ats.MayWrite(), opts.Flags&linux.O_TRUNC != 0)
+	h, err := d.openHandle(ctx, needReadHandle, ats.MayWrite(), opts.Flags&linux.O_TRUNC != 0)
 	if err != nil {
 		if isBlockingOpenOfNamedPipe && ats == vfs.MayWrite && linuxerr.Equals(linuxerr.ENXIO, err) {
 			// An attempt to open a named pipe with O_WRONLY|O_NONBLOCK fails

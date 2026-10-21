@@ -186,6 +186,11 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 			return err
 		}
 	}
+	if IsRootContainer(spec) {
+		if utsns, ok := GetNS(specs.UTSNamespace, spec); ok && utsns.Path != "" {
+			return fmt.Errorf("joining UTS namespace %q is not supported", utsns.Path)
+		}
+	}
 	for _, m := range spec.Mounts {
 		if err := validateMount(&m); err != nil {
 			return err
@@ -975,6 +980,18 @@ func RootfsTarUpperPath(spec *specs.Spec) string {
 		return ""
 	}
 	return spec.Annotations[AnnotationRootfsUpperTar]
+}
+
+// IsProcFDPath returns true if the path is a numeric procfs/devfd magic link
+// (e.g. /proc/self/fd/3, /proc/thread-self/fd/4, /dev/fd/5).
+func IsProcFDPath(path string) bool {
+	for _, prefix := range []string{"/proc/self/fd/", "/proc/thread-self/fd/", "/dev/fd/"} {
+		if suffix, ok := strings.CutPrefix(path, prefix); ok {
+			_, err := strconv.ParseUint(suffix, 10, 31)
+			return err == nil
+		}
+	}
+	return false
 }
 
 // AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and

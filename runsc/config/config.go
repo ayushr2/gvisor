@@ -183,9 +183,11 @@ type Config struct {
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
-	// PlatformDevicePath is the path to the device file used by the platform.
-	// e.g. "/dev/kvm" for the KVM platform.
-	// If unset, a sane platform-specific default will be used.
+	// PlatformDevicePath is the raw value of --platform_device_path: either a
+	// single device file path, which applies to any platform, or
+	// comma-separated platform=path pairs, which apply only to the named
+	// platforms. Use PlatformDeviceFor to read it. If unset, a sane
+	// platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
 
 	// MetricServer, if set, indicates that metrics should be exported on this address.
@@ -202,10 +204,6 @@ type Config struct {
 	// SidecarReleaseEnforcementPolicy controls when spawned sidecar binaries
 	// must match `runsc`'s build label.
 	SidecarReleaseEnforcementPolicy SidecarReleasePolicy `flag:"sidecar-release-enforcement-policy"`
-
-	// SidecarUsagePolicy controls when to use sidecar binaries vs embedded
-	// fallbacks.
-	SidecarUsagePolicy SidecarUsagePolicy `flag:"sidecar-usage-policy"`
 
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
@@ -507,11 +505,65 @@ func (c *Config) UseNetworkProxy() bool {
 	return c.NetworkProxyPath != ""
 }
 
+// platformDevicePaths is the parsed value of --platform_device_path.
+type platformDevicePaths struct {
+	// any is the device file path for every platform. The single-path form
+	// sets it.
+	any string
+	// byPlatform maps a platform name to its device file path. The
+	// platform=path form sets it.
+	byPlatform map[string]string
+}
+
+// parsePlatformDevicePaths parses v, a --platform_device_path value. A value
+// without "=" is a single path. Otherwise it is comma-separated platform=path
+// pairs.
+func parsePlatformDevicePaths(v string) (platformDevicePaths, error) {
+	if !strings.Contains(v, "=") {
+		return platformDevicePaths{any: v}, nil
+	}
+	paths := platformDevicePaths{byPlatform: make(map[string]string)}
+	for _, pair := range strings.Split(v, ",") {
+		name, path, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || path == "" {
+			return platformDevicePaths{}, fmt.Errorf("expected format is --platform_device_path={path} or --platform_device_path={platform}={path}[,{platform}={path}...], got %q", v)
+		}
+		if _, dup := paths.byPlatform[name]; dup {
+			return platformDevicePaths{}, fmt.Errorf("--platform_device_path=%q names platform %q more than once", v, name)
+		}
+		paths.byPlatform[name] = path
+	}
+	return paths, nil
+}
+
+// PlatformDeviceFor returns the device file path that --platform_device_path
+// assigns to platform, or "" if it assigns none, in which case the platform
+// uses its default. Validate rejects malformed values, which this treats as
+// unset.
+func (c *Config) PlatformDeviceFor(platform string) string {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return ""
+	}
+	if path, ok := paths.byPlatform[platform]; ok {
+		return path
+	}
+	return paths.any
+}
+
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return err
+	}
+	if c.Platform == PlatformAuto && paths.any != "" {
+		// A single path cannot apply to every platform that auto may choose.
+		return fmt.Errorf("--platform=%s accepts only --platform_device_path={platform}={path}[,{platform}={path}...], got %q", PlatformAuto, c.PlatformDevicePath)
+	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
@@ -1241,12 +1293,10 @@ func setOverlay2Err(v string) error {
 const overlay2SizeEq = "size="
 
 // Set implements flag.Value. Set(String()) should be idempotent.
+// On error, the receiver is unchanged.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
-		o.rootMount = false
-		o.subMounts = false
-		o.medium = NoOverlay
-		o.size = ""
+		*o = Overlay2{}
 		return nil
 	}
 	parts := strings.Split(v, ",")
@@ -1259,34 +1309,34 @@ func (o *Overlay2) Set(v string) error {
 		return setOverlay2Err(v)
 	}
 
+	var next Overlay2
 	switch mount := vs[0]; mount {
 	case "root":
-		o.rootMount = true
+		next.rootMount = true
 	case "all":
-		o.rootMount = true
-		o.subMounts = true
+		next.rootMount = true
+		next.subMounts = true
 	default:
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	err := o.medium.Set(vs[1])
+	err := next.medium.Set(vs[1])
 	if err != nil {
 		return err
 	}
 
-	if len(parts) == 1 {
-		o.size = ""
-	} else if len(parts) == 2 {
+	if len(parts) == 2 {
 		sizeArg := parts[1]
 		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
 		if !cut {
 			return setOverlay2Err(v)
 		}
-		o.size = size
-	} else {
+		next.size = size
+	} else if len(parts) > 2 {
 		return setOverlay2Err(v)
 	}
 
+	*o = next
 	return nil
 }
 
@@ -1482,56 +1532,6 @@ func (p SidecarReleasePolicy) Applies() bool {
 	return p == SidecarReleaseAlways || (p == SidecarReleaseIfReleaseBuild && IsReleaseVersion(version.Version()))
 }
 
-// SidecarUsagePolicy controls when to use sidecar binaries vs embedded fallbacks.
-type SidecarUsagePolicy string
-
-// SidecarUsagePolicy values.
-const (
-	SidecarUsageDefault        SidecarUsagePolicy = "DEFAULT"
-	SidecarUsageStrict         SidecarUsagePolicy = "STRICT"
-	SidecarUsageLegacyEmbedded SidecarUsagePolicy = "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (p *SidecarUsagePolicy) Set(v string) error {
-	sp := SidecarUsagePolicy(strings.ToUpper(v))
-	switch sp {
-	case SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded:
-		*p = sp
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded)
-}
-
-// Ptr returns a pointer to `p`.
-// Useful in flag declaration line.
-func (p SidecarUsagePolicy) Ptr() *SidecarUsagePolicy {
-	return &p
-}
-
-// Get implements flag.Get.
-func (p *SidecarUsagePolicy) Get() any {
-	return *p
-}
-
-// String implements flag.String.
-func (p SidecarUsagePolicy) String() string {
-	return string(p)
-}
-
-// AllowEmbeddedFallback returns whether embedded fallback binaries can be used
-// if the on-disk sidecar binaries are not found.
-func (p SidecarUsagePolicy) AllowEmbeddedFallback() bool {
-	switch p {
-	case SidecarUsageDefault, SidecarUsageStrict:
-		return false
-	case SidecarUsageLegacyEmbedded:
-		return true
-	default:
-		panic(fmt.Sprintf("invalid sidecar usage policy: %q", p))
-	}
-}
-
 // releaseVersionRE matches the version strings of production release builds:
 // a `release-` or `g<lowercase>-` prefix, then the release date.
 var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$`)
@@ -1685,8 +1685,6 @@ const (
 	xdpModeStrRedirect = "redirect"
 	xdpModeStrTunnel   = "tunnel"
 )
-
-var xdpConfig XDP
 
 // Get implements flag.Getter.
 func (xd *XDP) Get() any {

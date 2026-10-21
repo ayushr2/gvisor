@@ -102,7 +102,7 @@ func (cc *cpusetCpus) Generate(ctx context.Context, buf *bytes.Buffer) error {
 //
 // +checklocksexclude:cc.cs.mu
 func (cc *cpusetCpus) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
@@ -123,10 +123,6 @@ func (cc *cpusetCpus) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	if err != nil {
 		return 0, linuxerr.EINVAL
 	}
-	if got, want := b.Maximum(), maxCpus; got > want {
-		return 0, linuxerr.EINVAL
-	}
-
 	cc.cs.mu.Lock()
 	defer cc.cs.mu.Unlock()
 	cc.cs.cpus = b
@@ -156,7 +152,7 @@ func (cm *cpusetMems) Generate(ctx context.Context, buf *bytes.Buffer) error {
 //
 // +checklocksexclude:cm.cs.mu
 func (cm *cpusetMems) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
@@ -173,10 +169,6 @@ func (cm *cpusetMems) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	if err != nil {
 		return 0, linuxerr.EINVAL
 	}
-	if got, want := b.Maximum(), maxMems; got > want {
-		return 0, linuxerr.EINVAL
-	}
-
 	cm.cs.mu.Lock()
 	defer cm.cs.mu.Unlock()
 	cm.cs.mems = b
