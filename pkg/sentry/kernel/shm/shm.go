@@ -189,7 +189,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 		return nil, linuxerr.EINVAL
 	}
 
-	if numPages := sizeAligned / hostarch.PageSize; r.totalPages+numPages > linux.SHMALL {
+	if numPages := sizeAligned >> hostarch.PageShift; r.totalPages+numPages > linux.SHMALL {
 		// "... allocating a segment of the requested size would cause the
 		// system to exceed the system-wide limit on shared memory (SHMALL)."
 		//   - man shmget(2)
@@ -242,7 +242,7 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 	if err := r.reg.Register(shm); err != nil {
 		return nil, err
 	}
-	r.totalPages += effectiveSize / hostarch.PageSize
+	r.totalPages += effectiveSize >> hostarch.PageShift
 
 	return shm, nil
 }
@@ -293,7 +293,7 @@ func (r *Registry) remove(s *Shm) {
 	}
 
 	r.reg.DissociateID(s.obj.ID)
-	r.totalPages -= s.effectiveSize / hostarch.PageSize
+	r.totalPages -= s.effectiveSize >> hostarch.PageShift
 }
 
 // Release drops the self-reference of each active shm segment in the registry.
@@ -339,6 +339,8 @@ func (r *Registry) Release(ctx context.Context) {
 //
 // +stateify savable
 type Shm struct {
+	memmap.MappableNoHugepages
+
 	// ShmRefs tracks the number of references to this segment.
 	//
 	// A segment holds a reference to itself until it is marked for
@@ -705,16 +707,22 @@ func (s *Shm) Set(ctx context.Context, ds *linux.ShmidDS) error {
 //
 // +checklocksexclude:s.mu
 // +checklocksexclude:s.registry.mu
-func (s *Shm) MarkDestroyed(ctx context.Context) {
-	s.registry.dissociateKey(s)
+func (s *Shm) MarkDestroyed(ctx context.Context) error {
+	creds := auth.CredentialsFromContext(ctx)
 
 	s.mu.Lock()
+	if !s.obj.CheckOwnership(creds) {
+		s.mu.Unlock()
+		return linuxerr.EPERM
+	}
 	if s.pendingDestruction {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	s.pendingDestruction = true
 	s.mu.Unlock()
+
+	s.registry.dissociateKey(s)
 
 	// Drop the self-reference so destruction occurs when all
 	// external references are gone.
@@ -722,4 +730,5 @@ func (s *Shm) MarkDestroyed(ctx context.Context) {
 	// N.B. This cannot be the final DecRef, as the caller also
 	// holds a reference.
 	s.DecRef(ctx)
+	return nil
 }

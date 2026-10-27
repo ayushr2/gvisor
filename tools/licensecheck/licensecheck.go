@@ -48,11 +48,11 @@ import (
 	"sync"
 	"time"
 
-	"archive/zip"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	yaml "gopkg.in/yaml.v3"
+	"gvisor.dev/gvisor/pkg/zip"
 )
 
 // Paths locates the audit's inputs and output, relative to the repo root.
@@ -263,11 +263,17 @@ func Fetch(p Paths) error {
 			SHA256:     r.fetched.sha256,
 			License:    r.fetched.license,
 		}
-		// Keep the old retrieval date when nothing changed, so that re-running
-		// fetch does not churn the file.
-		if o, ok := oldByName[d.name]; ok && o.Version == e.Version && o.Commit == e.Commit &&
-			o.SHA256 == e.SHA256 && slices.Equal(o.License, e.License) {
-			e.Retrieved = o.Retrieved
+		if o, ok := oldByName[d.name]; ok && o.Version == e.Version && o.SHA256 == e.SHA256 {
+			// Commit lookup is best-effort. A missing response does not
+			// invalidate known metadata for the same module archive.
+			if d.kind == kindGoModule && e.Commit == "" && e.SHA256 != "" {
+				e.Commit = o.Commit
+			}
+			// Keep the old retrieval date when nothing changed, so that
+			// re-running fetch does not churn the file.
+			if o.Commit == e.Commit && slices.Equal(o.License, e.License) {
+				e.Retrieved = o.Retrieved
+			}
 		}
 		fmt.Fprintf(os.Stderr, "%-60s %s\n", d.name, e.License)
 		entries = append(entries, e)
@@ -651,7 +657,8 @@ func fetchLicense(d dep) (*fetched, error) {
 	return f, nil
 }
 
-// licenseFileNames are candidate top-level license files, in priority order.
+// licenseFileNames are candidate root paths for GitHub raw-file requests.
+// Module ZIPs provide a directory listing and discover suffixed notices below.
 var licenseFileNames = []string{
 	"LICENSE", "LICENSE.txt", "LICENSE.md", "LICENSE.TXT", "LICENSE.MIT",
 	"LICENSE-APACHE-2.0.txt", "LICENCE", "COPYING", "License", "license.md",
@@ -660,7 +667,7 @@ var licenseFileNames = []string{
 var pseudoVersionRE = regexp.MustCompile(`\d{14}-([0-9a-f]{12})$`)
 
 // fetchGoModule downloads a module from the Go module proxy and classifies
-// the license file at its root.
+// the license notices at its root.
 func fetchGoModule(path, version string) (*fetched, error) {
 	escPath, err := module.EscapePath(path)
 	if err != nil {
@@ -706,44 +713,69 @@ func fetchGoModule(path, version string) (*fetched, error) {
 		return nil, fmt.Errorf("cannot download module zip: %w", err)
 	}
 	zipSum := sha256.Sum256(zipBody)
-	zipReader, err := zip.NewReader(bytes.NewReader(zipBody), int64(len(zipBody)))
+	licenses, err := moduleLicenses(zipBody, path+"@"+version+"/")
+	if err != nil {
+		return nil, err
+	}
+	return &fetched{commit: commit, sha256: hex.EncodeToString(zipSum[:]), license: licenses}, nil
+}
+
+// moduleLicenses classifies each root license notice, including files that split
+// grants between names such as LICENSE-BSD and LICENSE-MIT. A README may carry
+// the grant when there are no primary notices; it must not override them.
+func moduleLicenses(body []byte, prefix string) (Licenses, error) {
+	z, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
 		return nil, fmt.Errorf("cannot read module zip: %w", err)
 	}
-	rootFiles := make(map[string]*zip.File)
-	prefix := path + "@" + version + "/"
-	for _, f := range zipReader.File {
-		if rest, ok := strings.CutPrefix(f.Name, prefix); ok && !strings.Contains(rest, "/") {
-			rootFiles[rest] = f
-		}
-	}
-	for _, name := range licenseFileNames {
-		f, ok := rootFiles[name]
-		if !ok {
+	var notices, readmes []*zip.File
+	for _, f := range z.File {
+		name, ok := strings.CutPrefix(f.Name, prefix)
+		if !ok || strings.Contains(name, "/") || !f.Mode().IsRegular() {
 			continue
 		}
-		r, err := f.Open()
-		if err != nil {
-			return nil, err
+		// Go source files such as license.go are not license notices.
+		if strings.HasSuffix(name, ".go") {
+			continue
 		}
-		text, err := io.ReadAll(r)
-		r.Close()
-		if err != nil {
-			return nil, err
+		stem := strings.ToUpper(name)
+		if i := strings.IndexAny(stem, ".-_"); i >= 0 {
+			stem = stem[:i]
 		}
-		license, err := classify(string(text))
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
+		switch stem {
+		case "LICENSE", "LICENCE", "COPYING":
+			notices = append(notices, f)
+		case "README":
+			readmes = append(readmes, f)
 		}
-		return &fetched{commit: commit, sha256: hex.EncodeToString(zipSum[:]), license: license}, nil
 	}
-	return nil, errors.New("no license file at module root")
+	if len(notices) == 0 {
+		notices = readmes
+	}
+	if len(notices) == 0 {
+		return nil, errors.New("no license notice at module root")
+	}
+	var licenses Licenses
+	for _, f := range notices {
+		text, err := fs.ReadFile(z, f.Name)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read %s: %w", f.Name, err)
+		}
+		ids, err := classify(string(text))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", strings.TrimPrefix(f.Name, prefix), err)
+		}
+		licenses = append(licenses, ids...)
+	}
+	slices.Sort(licenses)
+	return slices.Compact(licenses), nil
 }
 
 var githubURLRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/`),
 	regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/archive/refs/tags/(.+?)\.(?:tar\.gz|tar\.xz|tar\.bz2|zip)$`),
 	regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/archive/(.+?)\.(?:tar\.gz|tar\.xz|tar\.bz2|zip)$`),
+	regexp.MustCompile(`^https://codeload\.github\.com/([^/]+)/([^/]+)/(?:tar\.gz|zip)/(.+)$`),
 	regexp.MustCompile(`^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/`),
 }
 

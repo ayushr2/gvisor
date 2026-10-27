@@ -17,6 +17,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -45,6 +46,30 @@ func TestDefault(t *testing.T) {
 	flags := c.ToFlags()
 	if len(flags) > 0 {
 		t.Errorf("default flags not set correctly for: %s", flags)
+	}
+}
+
+func TestRegisterFlagsXDPIsolation(t *testing.T) {
+	first := flag.NewFlagSet("first", flag.ContinueOnError)
+	RegisterFlags(first)
+	if err := first.Set("EXPERIMENTAL-xdp", "ns"); err != nil {
+		t.Fatal(err)
+	}
+
+	second := flag.NewFlagSet("second", flag.ContinueOnError)
+	RegisterFlags(second)
+	fl := second.Lookup("EXPERIMENTAL-xdp")
+	if got := fl.DefValue; got != "off" {
+		t.Errorf("second FlagSet default = %q, want off", got)
+	}
+	if got := fl.Value.String(); got != "off" {
+		t.Errorf("second FlagSet value = %q, want off", got)
+	}
+	if err := second.Set("EXPERIMENTAL-xdp", "redirect:eth0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Lookup("EXPERIMENTAL-xdp").Value.String(); got != "ns" {
+		t.Errorf("first FlagSet value = %q, want ns", got)
 	}
 }
 
@@ -267,14 +292,19 @@ func TestInvalidFlags(t *testing.T) {
 			error: "expected format is --overlay2",
 		},
 		{
-			name:  "sidecar-usage-policy",
-			value: "invalid",
-			error: "invalid value \"invalid\"; must be DEFAULT, STRICT, or LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
-		},
-		{
 			name:  "sidecar-release-enforcement-policy",
 			value: "invalid",
 			error: "invalid value \"invalid\"; must be NEVER, ALWAYS, or IF_RELEASE_BUILD",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "invalid",
+			error: "invalid value \"invalid\"; must be DEFAULT or STRICT",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
+			error: "the embedded sidecar fallback has been removed",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -409,13 +439,32 @@ func TestValidationFail(t *testing.T) {
 			},
 			error: "network-proxy-path flag is incompatible with XDP",
 		},
+		{
+			name: "platform_device_path:malformed-pair",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,/dev/other",
+			},
+			error: "expected format is --platform_device_path",
+		},
+		{
+			name: "platform_device_path:duplicate-platform",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,kvm=/dev/kvm2",
+			},
+			error: "names platform \"kvm\" more than once",
+		},
+		{
+			name: "platform_device_path:auto-single-path",
+			flags: map[string]string{
+				"platform":             PlatformAuto,
+				"platform_device_path": "/dev/kvm2",
+			},
+			error: "--platform=auto accepts only --platform_device_path={platform}={path}",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 			RegisterFlags(testFlags)
-			t.Cleanup(func() {
-				_ = testFlags.Lookup("EXPERIMENTAL-xdp").Value.Set("off")
-			})
 			for name, val := range tc.flags {
 				if err := testFlags.Lookup(name).Value.Set(val); err != nil {
 					t.Errorf("%s=%q: %v", name, val, err)
@@ -428,6 +477,57 @@ func TestValidationFail(t *testing.T) {
 	}
 }
 
+func TestPlatformDeviceFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		platform string
+		want     string
+	}{
+		{name: "unset", flag: "", platform: "kvm", want: ""},
+		{name: "single path applies to any platform", flag: "/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+		{name: "single path applies to platform without device", flag: "/dev/kvm2", platform: "systrap", want: "/dev/kvm2"},
+		{name: "pair matches", flag: "kvm=/dev/kvm2,other=/dev/other2", platform: "other", want: "/dev/other2"},
+		{name: "pair for other platform is ignored", flag: "kvm=/dev/kvm2", platform: "other", want: ""},
+		{name: "unknown platform name is tolerated", flag: "nosuch=/dev/nosuch,kvm=/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+			RegisterFlags(testFlags)
+			if err := testFlags.Lookup("platform_device_path").Value.Set(tc.flag); err != nil {
+				t.Fatalf("platform_device_path=%q: %v", tc.flag, err)
+			}
+			c, err := NewFromFlags(testFlags)
+			if err != nil {
+				t.Fatalf("NewFromFlags() failed: %v", err)
+			}
+			if got := c.PlatformDeviceFor(tc.platform); got != tc.want {
+				t.Errorf("PlatformDeviceFor(%q) with --platform_device_path=%q = %q, want %q", tc.platform, tc.flag, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlatformAutoAcceptsDevicePairs(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	for name, val := range map[string]string{
+		"platform":             PlatformAuto,
+		"platform_device_path": "kvm=/dev/kvm2",
+	} {
+		if err := testFlags.Lookup(name).Value.Set(val); err != nil {
+			t.Fatalf("%s=%q: %v", name, val, err)
+		}
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatalf("NewFromFlags() failed: %v", err)
+	}
+	if got, want := c.PlatformDeviceFor("kvm"), "/dev/kvm2"; got != want {
+		t.Errorf("PlatformDeviceFor(%q) = %q, want %q", "kvm", got, want)
+	}
+}
+
 func TestOverride(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
@@ -436,6 +536,18 @@ func TestOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.AllowFlagOverride = true
+
+	t.Run("XDP", func(t *testing.T) {
+		if err := c.Override(testFlags, "EXPERIMENTAL-xdp", "ns", false); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.XDP; got != (XDP{Mode: XDPModeNS}) {
+			t.Errorf("Override XDP = %+v, want ns", got)
+		}
+		if flags := c.ToFlags(); !slices.Contains(flags, "--EXPERIMENTAL-xdp=ns") {
+			t.Errorf("ToFlags() = %v, want --EXPERIMENTAL-xdp=ns", flags)
+		}
+	})
 
 	t.Run("string", func(t *testing.T) {
 		c.RootDir = "foobar"
@@ -759,7 +871,7 @@ func TestOverrideDeferredValidation(t *testing.T) {
 func TestBundles(t *testing.T) {
 	noChange := func(t *testing.T, old, new *Config) {
 		t.Helper()
-		if diff := cmp.Diff(old, new, cmp.AllowUnexported(Config{}, Overlay2{})); diff != "" {
+		if diff := cmp.Diff(old, new, cmp.AllowUnexported(Config{}, Overlay2{}, SandboxCPUPolicy{})); diff != "" {
 			t.Errorf("different configs:\n%+v\nvs\n%+v\nDiff:\n%s", old, new, diff)
 		}
 	}
@@ -1028,6 +1140,32 @@ func TestParseSerializeOverlay2(t *testing.T) {
 			t.Fatalf("String mismatch, expecting ll:memory,size=1g, got %q", o.String())
 		}
 	})
+	t.Run("Repeated Set", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("all:memory,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Set("root:self"); err != nil {
+			t.Fatal(err)
+		}
+		want := Overlay2{rootMount: true, medium: SelfOverlay}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
+	t.Run("Invalid Set preserves value", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("root:self,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		want := o
+		if err := o.Set("all:memory,invalid=1g"); err == nil {
+			t.Fatal("Set succeeded, want error")
+		}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
 }
 
 func TestSignalUnkillablePolicy(t *testing.T) {
@@ -1075,4 +1213,67 @@ func TestSignalUnkillablePolicy(t *testing.T) {
 		}()
 		_ = SignalUnkillablePolicy(-1).String()
 	})
+}
+
+func TestSandboxCPUPolicy(t *testing.T) {
+	if got := (SandboxCPUPolicy{}).String(); got != "1x" {
+		t.Errorf("zero value String() = %q, want %q", got, "1x")
+	}
+	if !DefaultSandboxLifecycleCPUPolicy.Implicit() {
+		t.Errorf("default policy is not implicit")
+	}
+	explicit := DefaultSandboxLifecycleCPUPolicy
+	if err := explicit.Set(DefaultSandboxLifecycleCPUPolicy.String()); err != nil {
+		t.Fatalf("Set(%q) failed: %v", DefaultSandboxLifecycleCPUPolicy, err)
+	}
+	if explicit.Implicit() || explicit.String() != DefaultSandboxLifecycleCPUPolicy.String() {
+		t.Errorf("policy set to the default value = %+v, want the same value and explicit", explicit)
+	}
+	const quota, period = 50000, 100000
+	for _, tc := range []struct {
+		val       string
+		str       string
+		wantQuota int64
+		wantErr   bool
+	}{
+		{val: "1x", str: "1x", wantQuota: quota},
+		{val: "1.0x", str: "1x", wantQuota: quota},
+		{val: "uncapped", str: "uncapped", wantQuota: -1},
+		{val: "2500m", str: "2500m", wantQuota: 250000},
+		{val: "3.5x", str: "3.5x", wantQuota: 175000},
+		{val: "1m", str: "1m", wantQuota: quota},
+		{val: "0.5x", str: "1x", wantQuota: quota},
+		{val: "9223372036854775807m", str: "9223372036854775807m", wantQuota: 1<<44 - 1},
+		{val: "max(4x,1000m)", str: "max(4x,1000m)", wantQuota: 200000},
+		{val: "max( 1000m , 4x )", str: "max(4x,1000m)", wantQuota: 200000},
+		{val: "max(0.5x,2000m,1x)", str: "2000m", wantQuota: 200000},
+		{val: "max(1x)", str: "1x", wantQuota: quota},
+		{val: "max(uncapped,4x)", str: "uncapped", wantQuota: -1},
+		{val: "max()", wantErr: true},
+		{val: "max(4x", wantErr: true},
+		{val: "max(4x,bogus)", wantErr: true},
+		{val: "0m", wantErr: true},
+		{val: "-1x", wantErr: true},
+		{val: "1.5m", wantErr: true},
+		{val: "2", wantErr: true},
+	} {
+		t.Run(tc.val, func(t *testing.T) {
+			var p SandboxCPUPolicy
+			if err := p.Set(tc.val); (err != nil) != tc.wantErr {
+				t.Fatalf("p.Set(%q) = %v, want error: %t", tc.val, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got := p.String(); got != tc.str {
+				t.Errorf("p.String() = %q, want %q", got, tc.str)
+			}
+			if got := p.Enabled(); got != (tc.str != "1x") {
+				t.Errorf("p.Enabled() = %t, want %t", got, tc.str != "1x")
+			}
+			if got := p.Quota(quota, period); got != tc.wantQuota {
+				t.Errorf("p.Quota(%d, %d) = %d, want %d", quota, period, got, tc.wantQuota)
+			}
+		})
+	}
 }

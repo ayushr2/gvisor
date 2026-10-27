@@ -37,7 +37,7 @@ import (
 // +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, sp hostarch.Addr) error {
 	addr = hostarch.UntaggedUserAddr(addr)
-	ar, ok := addr.RoundDown().ToRange(hostarch.PageSize)
+	ar, ok := addr.RoundDown().ToRange(uint64(hostarch.PageSize))
 	if !ok {
 		return linuxerr.EFAULT
 	}
@@ -161,7 +161,7 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 		// Get pmas and map as requested.
 		mm.populateVMAAndUnlock(ctx, vseg, ar, opts.PlatformEffect)
 
-	case opts.Mappable == nil && length <= hostarch.HugePageSize:
+	case opts.Mappable == nil && length <= hostarch.Addr(hostarch.HugePageSize):
 		// NOTE(b/63077076, b/63360184): Get pmas and map eagerly in the hope
 		// that doing so will save on future page faults. We only do this for
 		// anonymous mappings, since otherwise the cost of
@@ -490,6 +490,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		if vma.mappable != nil {
 			newOffset = vseg.mappableRange().End
 		}
+		mlockMode := vma.mlockMode
 		var vseg vmaIterator
 		var ar hostarch.AddrRange
 		var err error
@@ -511,7 +512,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			NameMut:         vma.nameMut,
 		}, droppedIDs)
 		if err == nil {
-			if vma.mlockMode == memmap.MLockEager {
+			if mlockMode == memmap.MLockEager {
 				mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit)
 			}
 			return oldAddr, nil
@@ -527,7 +528,13 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	var newAR hostarch.AddrRange
 	switch opts.Move {
 	case MRemapMayMove:
-		newAddr, err := mm.findAvailableLocked(newSize, findAvailableOpts{})
+		vma := vseg.ValuePtr()
+		newAddr, err := mm.findAvailableLocked(newSize, findAvailableOpts{
+			Mappable:  vma.mappable,
+			Offset:    vma.off + uint64(oldAddr-vseg.Start()),
+			GrowsDown: vma.growsDown,
+			Stack:     vma.isStack,
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -548,10 +555,15 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		}
 
 		// Check that the new region is valid.
+		vma := vseg.ValuePtr()
 		_, err := mm.findAvailableLocked(newSize, findAvailableOpts{
-			Addr:  newAddr,
-			Fixed: true,
-			Unmap: true,
+			Mappable:  vma.mappable,
+			Offset:    vma.off + uint64(oldAddr-vseg.Start()),
+			Addr:      newAddr,
+			Fixed:     true,
+			Unmap:     true,
+			GrowsDown: vma.growsDown,
+			Stack:     vma.isStack,
 		})
 		if err != nil {
 			return 0, err
@@ -1228,7 +1240,7 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 				psegAR := pseg.Range().Intersect(vsegAR)
 				if !psegAR.IsHugePageAligned() {
 					firstHugeStart := psegAR.Start.HugeRoundDown()
-					firstHugeEnd := firstHugeStart + hostarch.HugePageSize
+					firstHugeEnd := firstHugeStart + hostarch.Addr(hostarch.HugePageSize)
 					lastWholeHugeEnd := psegAR.End.HugeRoundDown()
 					if firstHugeStart != psegAR.Start {
 						// psegAR.Start is not hugepage-aligned.

@@ -20,6 +20,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -33,61 +34,61 @@ func TestGetMountAccessType(t *testing.T) {
 		{
 			name: "container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "pod=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "pod",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "share=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "shared",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "shared",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "default=shared",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source + "mismatch",
-				MountPrefix + "mount1.type":   "bind",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source + "mismatch",
+				sentryapi.MountPrefix + "mount1.type":   "bind",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessShared,
 		},
 		{
 			name: "tmpfs+container=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "container",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "tmpfs",
+				sentryapi.MountPrefix + "mount1.share":  "container",
 			},
 			want: config.FileAccessExclusive,
 		},
 		{
 			name: "tmpfs+pod=exclusive",
 			annotations: map[string]string{
-				MountPrefix + "mount1.source": source,
-				MountPrefix + "mount1.type":   "tmpfs",
-				MountPrefix + "mount1.share":  "pod",
+				sentryapi.MountPrefix + "mount1.source": source,
+				sentryapi.MountPrefix + "mount1.type":   "tmpfs",
+				sentryapi.MountPrefix + "mount1.share":  "pod",
 			},
 			want: config.FileAccessExclusive,
 		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
 			spec := &specs.Spec{Annotations: tst.annotations}
-			podHints, err := NewPodMountHints(spec)
+			podHints, err := sentryapi.NewPodMountHints(spec)
 			if err != nil {
 				t.Fatalf("newPodMountHints failed: %v", err)
 			}
@@ -177,91 +178,6 @@ func TestCgroupfsCPUDefaults(t *testing.T) {
 			}
 			if got := defaults["cpu.cfs_period_us"]; got != tc.wantPeriod {
 				t.Errorf("period = %d, want %d", got, tc.wantPeriod)
-			}
-		})
-	}
-}
-
-func TestParseFSCheckpointPaths(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		in      string
-		wantErr bool
-		wantLen int
-	}{
-		{
-			name:    "empty",
-			in:      "",
-			wantErr: false,
-			wantLen: 0,
-		},
-		{
-			name:    "all-tmpfs",
-			in:      "all-tmpfs",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "clean absolute path",
-			in:      "/data",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "container and clean absolute path",
-			in:      "c1:/data",
-			wantErr: false,
-			wantLen: 1,
-		},
-		{
-			name:    "multiple clean paths",
-			in:      "c1:/data, c2:/tmp, all-tmpfs",
-			wantErr: false,
-			wantLen: 3,
-		},
-		{
-			name:    "uncleaned trailing slash",
-			in:      "/data/",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned redundant slash",
-			in:      "/data//dir",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned root slashes",
-			in:      "//",
-			wantErr: true,
-		},
-		{
-			name:    "relative path",
-			in:      "data",
-			wantErr: true,
-		},
-		{
-			name:    "container with empty path",
-			in:      "c1:",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned dot",
-			in:      "/data/./sub",
-			wantErr: true,
-		},
-		{
-			name:    "uncleaned dot dot",
-			in:      "/data/../sub",
-			wantErr: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			paths, err := ParseFSCheckpointPaths(tc.in)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("ParseFSCheckpointPaths(%q) error = %v, wantErr %v", tc.in, err, tc.wantErr)
-			}
-			if err == nil && len(paths) != tc.wantLen {
-				t.Errorf("ParseFSCheckpointPaths(%q) len = %d, want %d", tc.in, len(paths), tc.wantLen)
 			}
 		})
 	}

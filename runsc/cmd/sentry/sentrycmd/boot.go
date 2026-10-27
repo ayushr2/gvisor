@@ -30,7 +30,6 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -43,10 +42,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -139,6 +139,10 @@ type Boot struct {
 	// cpuNum number of CPUs to create inside the sandbox.
 	cpuNum int
 
+	// lifecycleCPUNum is the number of CPUs that the sandbox can use during
+	// checkpoint and restore.
+	lifecycleCPUNum int
+
 	// cpuQuota and cpuPeriod carry the raw host CFS CPU settings that should be
 	// exposed through sandbox cgroupfs.
 	cpuQuota  int64
@@ -153,9 +157,6 @@ type Boot struct {
 
 	// userLogFD is the file descriptor to write user logs to.
 	userLogFD int
-
-	// startSyncFD is the file descriptor to synchronize runsc and sandbox.
-	startSyncFD int
 
 	// mountsFD is the file descriptor to read list of mounts after they have
 	// been resolved (direct paths, no symlinks). They are resolved outside the
@@ -211,6 +212,11 @@ type Boot struct {
 	// procfs mount isn't needed anymore.
 	procMountSyncFD int
 
+	// procUmounterFD is the /proc unmounter sidecar binary, which is spawned
+	// to unmount /proc on behalf of this process. Only set with setUpRoot
+	// and without rootless.
+	procUmounterFD int
+
 	// procMountSyncFile holds the *os.File for procMountSyncFD when this
 	// process continues without re-exec'ing itself (see
 	// `applyCapsAllThreads`). It keeps the FD alive.
@@ -230,6 +236,7 @@ type Boot struct {
 	// particular is uint32 and there is no flag.Uint32Var().
 	procDriverNvidiaParams             string
 	nvidiaFabricIMEXManagementDevMinor int64
+	nvidiaMNCCManagementDevMinor       int64
 
 	// uid and gid are the user and group IDs to switch to after setting up the
 	// user namespace.
@@ -264,6 +271,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&b.applyCaps, "apply-caps", false, "if true, apply capabilities defined in the spec to the process")
 	f.BoolVar(&b.setUpRoot, "setup-root", false, "if true, set up an empty root for the process")
 	f.IntVar(&b.cpuNum, "cpu-num", 0, "number of CPUs to create inside the sandbox")
+	f.IntVar(&b.lifecycleCPUNum, "lifecycle-cpu-num", 0, "number of CPUs that the sandbox can use during checkpoint and restore (0 means the same as --cpu-num)")
 	// cpu-quota defaults to -1 (unlimited), matching the Linux CFS default
 	// for cpu.cfs_quota_us. A positive value is passed through as-is to sandbox
 	// cgroupfs.
@@ -274,6 +282,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Int64Var(&b.cpuPeriod, "cpu-period", 0, "raw CFS cpu period in usecs to expose via sandbox cgroupfs (0 means use default 100ms)")
 	f.IntVar(&b.cpuDMALatencyFD, "cpu-dma-latency-fd", -1, "file descriptor holding /dev/cpu_dma_latency open")
 	f.IntVar(&b.procMountSyncFD, "proc-mount-sync-fd", -1, "file descriptor that has to be written to when /proc isn't needed anymore and can be unmounted")
+	f.IntVar(&b.procUmounterFD, "proc-umounter-fd", -1, "file descriptor of the /proc unmounter binary")
 	f.IntVar(&b.syncUsernsFD, "sync-userns-fd", -1, "file descriptor used to synchronize rootless user namespace initialization.")
 	f.Uint64Var(&b.totalMem, "total-memory", 0, "sets the initial amount of total memory to report back to the container")
 	f.Uint64Var(&b.totalHostMem, "total-host-memory", 0, "total memory reported by host /proc/meminfo")
@@ -298,7 +307,6 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
 	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
-	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
 	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is an optional file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
@@ -320,6 +328,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver ABI version to use, or 'latest' for the newest supported one")
 	f.StringVar(&b.procDriverNvidiaParams, "nvidia-host-params", "", "value of /proc/driver/nvidia/params on the host")
 	f.Int64Var(&b.nvidiaFabricIMEXManagementDevMinor, "nvidia-fabric-imex-mgmt-minor", -1, "DeviceFileMinor in /proc/driver/nvidia/capabilities/fabric-imex-mgmt on the host")
+	f.Int64Var(&b.nvidiaMNCCManagementDevMinor, "nvidia-mncc-mgmt-minor", -1, "DeviceFileMinor in /proc/driver/nvidia/capabilities/mncc-mgmt on the host")
 }
 
 // willReexec returns true if this boot process will re-execute itself to
@@ -342,7 +351,7 @@ func (b *Boot) willReexec() bool {
 // Execute implements subcommands.Command.Execute.  It starts a sandbox in a
 // waiting state.
 func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	if b.specFD == -1 || b.controllerFD == -1 || b.startSyncFD == -1 || f.NArg() != 1 {
+	if b.specFD == -1 || b.controllerFD == -1 || f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
@@ -436,7 +445,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	if specutils.NVProxyEnabled(spec, conf) {
 		if b.cpuDMALatencyFD < 0 {
 			// Best effort; requires root.
-			if gPlatform, err := platform.Lookup(conf.Platform); err == nil && gPlatform.Requirements().FrequentHostThreadWakeups {
+			if gPlatform, err := platformdesc.Lookup(conf.Platform); err == nil && gPlatform.Requirements.FrequentHostThreadWakeups {
 				if fd := sandboxsetup.MaybeCapCPUIdleStates(); fd >= 0 {
 					b.cpuDMALatencyFD = fd
 					argOverride["cpu-dma-latency-fd"] = strconv.Itoa(fd)
@@ -458,6 +467,10 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 					b.nvidiaFabricIMEXManagementDevMinor = int64(nvhs.FabricIMEXManagementDevMinor)
 					argOverride["nvidia-fabric-imex-mgmt-minor"] = strconv.FormatUint(uint64(nvhs.FabricIMEXManagementDevMinor), 10)
 				}
+				if nvhs.HaveMNCCManagement {
+					b.nvidiaMNCCManagementDevMinor = int64(nvhs.MNCCManagementDevMinor)
+					argOverride["nvidia-mncc-mgmt-minor"] = strconv.FormatUint(uint64(nvhs.MNCCManagementDevMinor), 10)
+				}
 			}
 		}
 		timer.Reached("set nvproxy flags")
@@ -474,7 +487,13 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			// /proc is umounted from a forked process, because the
 			// current one is going to drop capabilities and won't be
 			// able to umount it.
-			cmd, w := sandboxsetup.ExecProcUmounter()
+			if b.procUmounterFD < 0 {
+				util.Fatalf("--proc-umounter-fd is required to set up the root")
+			}
+			umounter := os.NewFile(uintptr(b.procUmounterFD), "proc umounter")
+			cmd, w := sandboxsetup.ExecProcUmounter(umounter)
+			umounter.Close()
+			argOverride["proc-umounter-fd"] = "-1"
 			if b.willReexec() {
 				defer cmd.Wait()
 				defer w.Close()
@@ -498,10 +517,6 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 				// Remove the args that have already been done before calling self.
 				args := sandboxsetup.PrepareArgs(b.Name(), f, argOverride)
 
-				// Note that we've already read the spec from the spec FD, and
-				// we will read it again after the exec call. This works
-				// because the ReadSpecFromFile function seeks to the beginning
-				// of the file before reading.
 				util.Fatalf("callSelfAsNobody(%v): %v", args, sandboxsetup.CallSelfAsNobody(args))
 
 				// This prevents the specFile finalizer from running and closed
@@ -518,11 +533,11 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	if b.applyCaps {
 		caps := &specs.LinuxCapabilities{}
 
-		gPlatform, err := platform.Lookup(conf.Platform)
+		gPlatform, err := platformdesc.Lookup(conf.Platform)
 		if err != nil {
 			util.Fatalf("loading platform: %v", err)
 		}
-		if gPlatform.Requirements().RequiresCapSysPtrace {
+		if gPlatform.Requirements.RequiresCapSysPtrace {
 			// Ptrace platform requires extra capabilities.
 			const c = "CAP_SYS_PTRACE"
 			caps.Bounding = append(caps.Bounding, c)
@@ -569,10 +584,6 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			// Remove the args that have already been done before calling self.
 			args := sandboxsetup.PrepareArgs(b.Name(), f, argOverride)
 
-			// Note that we've already read the spec from the spec FD, and
-			// we will read it again after the exec call. This works
-			// because the ReadSpecFromFile function seeks to the beginning
-			// of the file before reading.
 			util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, caps, sandboxsetup.SetCapsAndCallSelf(args, caps))
 
 			// This prevents the specFile finalizer from running and closed
@@ -641,28 +652,33 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		timer.Reached("resolved mounts read")
 	}
 
+	procSelfFD := -1
 	if conf.DirectFS {
 		// sandbox should run with a umask of 0, because we want to preserve file
 		// modes exactly as sent by the sentry, which would have already applied
 		// the application umask.
 		unix.Umask(0)
+
+		// Open the bind mount of procfs' self/fd directory set up by
+		// setUpChroot(). It must be opened before /proc is unmounted and
+		// remains usable afterwards.
+		procSelfFDPath := procSelfFDBindMount
+		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+			procSelfFDPath = "/proc/self/fd"
+		}
+		procSelfFD, err = unix.Open(procSelfFDPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			util.Fatalf("opening %q: %v", procSelfFDPath, err)
+		}
+		timer.Reached("procfs self/fd opened")
 	}
 
 	if conf.EnableCoreTags {
-		if err := coretag.Enable(); err != nil {
+		tag, err := coretag.Enable()
+		if err != nil {
 			util.Fatalf("Failed to core tag sentry: %v", err)
 		}
-
-		// Verify that all sentry threads are properly core tagged, and log
-		// current core tag.
-		coreTags, err := coretag.GetAllCoreTags(0)
-		if err != nil {
-			util.Fatalf("Failed read current core tags: %v", err)
-		}
-		if len(coreTags) != 1 {
-			util.Fatalf("Not all child threads were core tagged the same. Tags=%v", coreTags)
-		}
-		log.Infof("Core tag enabled (core tag=%d)", coreTags[0])
+		log.Infof("Core tag enabled (core tag=%d)", tag)
 		timer.Reached("core tags enabled")
 	}
 
@@ -708,9 +724,11 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
+		ProcSelfFD:          procSelfFD,
 		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
 		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,
+		LifecycleNumCPU:     b.lifecycleCPUNum,
 		CPUQuota:            b.cpuQuota,
 		CPUPeriod:           b.cpuPeriod,
 		TotalMem:            b.totalMem,
@@ -726,6 +744,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			ProcDriverNvidiaParams:       b.procDriverNvidiaParams,
 			HaveFabricIMEXManagement:     b.nvidiaFabricIMEXManagementDevMinor >= 0,
 			FabricIMEXManagementDevMinor: uint32(b.nvidiaFabricIMEXManagementDevMinor),
+			HaveMNCCManagement:           b.nvidiaMNCCManagementDevMinor >= 0,
+			MNCCManagementDevMinor:       uint32(b.nvidiaMNCCManagementDevMinor),
 		},
 		HostTHP:                  b.hostTHP,
 		SaveFDs:                  b.saveFDs.GetFDs(),
@@ -750,7 +770,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	if b.procMountSyncFD != -1 {
 		l.PreSeccompCallback = func() {
 			// Call validateOpenFDs() before umounting /proc.
-			validateOpenFDs(bootArgs.PassFDs)
+			validateOpenFDs(bootArgs.PassFDs, procSelfFD)
 			// This callback runs on the same goroutine as the rest of sandbox
 			// startup (for now at least...), so safe to record here.
 			timer.Reached("open FDs validated")
@@ -765,8 +785,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	// Prepare metrics.
 	// This needs to happen after the kernel is initialized (such that all metrics are registered)
-	// but before the start-sync file is notified, as the parent process needs to query for
-	// registered metrics prior to sending the start signal.
+	// but before the control server starts, as runsc queries registered metrics prior to sending
+	// the start signal.
 	metric.Initialize()
 	timer.Reached("metrics initialized")
 	var finalMetricsFile *os.File
@@ -786,17 +806,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		defer metric.StopProfilingMetrics()
 	}
 
-	// Notify the parent process the sandbox has booted (and that the controller
-	// is up).
-	timer.Reached("notifying parent")
-	startSyncFile := os.NewFile(uintptr(b.startSyncFD), "start-sync file")
-	buf := make([]byte, 1)
-	if w, err := startSyncFile.Write(buf); err != nil || w != 1 {
-		l.Destroy()
-		util.Fatalf("unable to write into the start-sync descriptor: %v", err)
-	}
-	// Closes startSyncFile because 'l.Run()' only returns when the sandbox exits.
-	startSyncFile.Close()
+	l.StartControlServer()
 
 	// Wait for the start signal from runsc.
 	l.WaitForStartSignal()
@@ -827,8 +837,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 }
 
 // validateOpenFDs checks that the sandbox process does not have any open
-// directory FDs.
-func validateOpenFDs(passFDs []boot.FDMapping) {
+// directory FDs other than procSelfFD.
+func validateOpenFDs(passFDs []sentryapi.FDMapping, procSelfFD int) {
 	passHostFDs := make(map[int]struct{})
 	for _, passFD := range passFDs {
 		passHostFDs[passFD.Host] = struct{}{}
@@ -856,6 +866,9 @@ func validateOpenFDs(passFDs []boot.FDMapping) {
 		fdNo, err := strconv.Atoi(d.Name())
 		if err != nil {
 			return fmt.Errorf("strconv.Atoi(%s) failed: %v", d.Name(), err)
+		}
+		if fdNo == procSelfFD {
+			return nil
 		}
 		dirLink, err := os.Readlink(path)
 		if err != nil {

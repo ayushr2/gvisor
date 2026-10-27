@@ -16,19 +16,18 @@
 // programs.
 package main
 
+// The example import is replaced by the genrule or removed in fastbuild mode.
 import (
 	_ "embed"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
-	"gvisor.dev/gvisor/runsc/flag"
-
-	// This import will be replaced by the one specified in the genrule,
-	// or removed if stubbed out in fastbuild mode.
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp/example" // REPLACED_IMPORT_THIS_IS_A_LOAD_BEARING_COMMENT
+	"gvisor.dev/gvisor/runsc/flag"
 )
 
 //go:embed precompiled_lib.tmpl.go
@@ -55,6 +54,9 @@ var loadProgramsFn = example.PrecompiledPrograms // PROGRAMS_FUNC_THIS_IS_A_LOAD
 
 func main() {
 	flag.Parse()
+
+	debug.SetGCPercent(1000)
+	debug.SetMemoryLimit(2 << 30)
 
 	// Get a sorted list of programs.
 	var programs []precompiledseccomp.Program

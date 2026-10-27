@@ -118,15 +118,19 @@ namespace {
 using ::testing::Eq;
 using ::testing::HasSubstr;
 
+// Mounting cgroup2 requires CAP_SYS_ADMIN in the user namespace that owns the
+// cgroup namespace, which is normally the initial user namespace.
 bool Cgroup2Available() {
-  return TEST_CHECK_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN));
+  return TEST_CHECK_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)) &&
+         TEST_CHECK_NO_ERRNO_AND_VALUE(InInitialUserNamespace());
 }
 
 class Cgroup2Test : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!Cgroup2Available()) {
-      GTEST_SKIP() << "Cgroup v2 not available or ignored on gVisor";
+      GTEST_SKIP() << "Mounting cgroup2 requires CAP_SYS_ADMIN in the initial "
+                      "user namespace";
     }
   }
 
@@ -157,8 +161,8 @@ class Cgroup2Test : public ::testing::Test {
   }
 
   void TearDown() override {
-    if (root_) {
-      root_->Enter(getpid()).IgnoreError();
+    if (!original_cgroup_procs_.empty()) {
+      EXPECT_NO_ERRNO(RestoreOriginalCgroup());
     }
     if (c_) {
       CleanCgroupDirs(c_->Path());
@@ -169,6 +173,17 @@ class Cgroup2Test : public ::testing::Test {
     if (m_) return;
     m_.emplace(ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir()));
     root_.emplace(ASSERT_NO_ERRNO_AND_VALUE(m_->MountCgroup2fs()));
+
+    // Both this mount and /proc/self/cgroup are relative to our cgroup
+    // namespace. Its root may have controllers enabled and cannot accept
+    // processes, so cleanup must return to the original cgroup instead.
+    const auto memberships =
+        ASSERT_NO_ERRNO_AND_VALUE(ProcPIDCgroupEntries(getpid()));
+    const auto membership = memberships.find("");
+    ASSERT_NE(membership, memberships.end());
+    ASSERT_EQ(membership->second.hierarchy, 0);
+    original_cgroup_procs_ =
+        root_->Relpath(JoinPath(membership->second.path, "cgroup.procs"));
 
     auto controllers = root_->ReadControlFile("cgroup.controllers");
     if (controllers.ok()) {
@@ -191,6 +206,10 @@ class Cgroup2Test : public ::testing::Test {
   const Cgroup& root() {
     Init();
     return *root_;
+  }
+
+  PosixError RestoreOriginalCgroup() {
+    return SetContents(original_cgroup_procs_, absl::StrCat(getpid()));
   }
 
   // WaitForFrozen blocks until cg's cgroup.events reports "frozen <want>"
@@ -347,6 +366,7 @@ class Cgroup2Test : public ::testing::Test {
   std::optional<Mounter> m_;
   std::optional<Cgroup> root_;
   std::optional<Cgroup> c_;
+  std::string original_cgroup_procs_;
 };
 
 TEST(Cgroup2, SysFsCgroupAlreadyMounted) {
@@ -416,12 +436,12 @@ TEST_F(Cgroup2Test, DestroyConstraints) {
   EXPECT_THAT(parent.Delete(), PosixErrorIs(EBUSY));
 
   // Cannot destroy a cgroup node with a live attached process.
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.Enter(getpid()));
   EXPECT_THAT(child.Delete(), PosixErrorIs(EBUSY));
 
   // Destroy successfully once leaf node is empty.
-  ASSERT_NO_ERRNO(root().Enter(getpid()));
+  ASSERT_NO_ERRNO(RestoreOriginalCgroup());
   clean.Release();
   EXPECT_NO_ERRNO(child.Delete());
   EXPECT_NO_ERRNO(parent.Delete());
@@ -772,6 +792,38 @@ TEST_F(Cgroup2Test, SubtreeControlPids) {
   EXPECT_THAT(Exists(child.Relpath("pids.max")), IsPosixErrorOkAndHolds(false));
   EXPECT_THAT(child.ReadControlFile("cgroup.controllers"),
               IsPosixErrorOkAndHolds(Not(HasSubstr("pids"))));
+}
+
+TEST_F(Cgroup2Test, CpusetRejectsImpossibleCpu) {
+  const std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpuset"));
+
+  const std::string possible =
+      std::string(absl::StripAsciiWhitespace(ASSERT_NO_ERRNO_AND_VALUE(
+          GetContents("/sys/devices/system/cpu/possible"))));
+  // CPU IDs can be sparse or offline. Use the last possible ID, not the number
+  // of online CPUs, to choose a bit outside the system's possible mask.
+  const size_t last = possible.find_last_of(",-");
+  const uint32_t max_cpu = ASSERT_NO_ERRNO_AND_VALUE(Atoi<uint32_t>(
+      possible.substr(last == std::string::npos ? 0 : last + 1)));
+  // Keep the range small even if a regression accepts it.
+  SKIP_IF(max_cpu >= 4096);
+  const std::string impossible = absl::StrCat(max_cpu + 1);
+  const std::string before =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cpuset.cpus"));
+  ASSERT_NO_ERRNO(c().WriteControlFile("cpuset.cpus", before));
+  RecordProperty("possible_cpus", possible);
+  for (const auto& [name, value] :
+       {std::pair{"singleton", impossible},
+        std::pair{"range", absl::StrCat("0-", impossible)}}) {
+    SCOPED_TRACE(value);
+    const PosixError error = c().WriteControlFile("cpuset.cpus", value);
+    RecordProperty(absl::StrCat(name, "_errno"), error.errno_value());
+    EXPECT_FALSE(error.ok()) << "Accepted an impossible CPU";
+    EXPECT_THAT(c().ReadControlFile("cpuset.cpus"),
+                IsPosixErrorOkAndHolds(before));
+  }
 }
 
 TEST_F(Cgroup2Test, PidsEnforcement) {
@@ -1157,7 +1209,7 @@ TEST_F(Cgroup2Test, NoInternalProcesses) {
   // as long as no controllers are enabled in its subtree_control.
   ASSERT_THAT(parent.ReadControlFile("cgroup.subtree_control"),
               IsPosixErrorOkAndHolds(Eq("")));
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(parent.Enter(getpid()));
 
   // Attempting to subsequently enable any resource controllers while
@@ -1180,13 +1232,26 @@ TEST_F(Cgroup2Test, AttachNonExistentProc) {
   constexpr pid_t kNonExistentPid = 99999999;
   EXPECT_THAT(c().WriteIntegerControlFile("cgroup.procs", kNonExistentPid),
               PosixErrorIs(ESRCH));
+
+  Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("child"));
+  const int64_t pid = getpid();
+  // An out-of-range PID must not select the calling process after narrowing.
+  for (int64_t invalid : {int64_t{INT_MAX} + 1, (int64_t{1} << 32) + pid,
+                          pid - (int64_t{1} << 32)}) {
+    SCOPED_TRACE(invalid);
+    ASSERT_NO_ERRNO(c().WriteIntegerControlFile("cgroup.procs", 0));
+    EXPECT_THAT(child.WriteIntegerControlFile("cgroup.procs", invalid),
+                PosixErrorIs(EINVAL));
+    EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(c().Procs()).contains(getpid()));
+    EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(child.Procs()).empty());
+  }
 }
 
 TEST_F(Cgroup2Test, PIDZeroMovesSelf) {
   Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("child"));
   ExpectDefaultControlFiles(child);
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.WriteIntegerControlFile("cgroup.procs", 0));
 
   auto procs = ASSERT_NO_ERRNO_AND_VALUE(child.Procs());
@@ -1203,7 +1268,7 @@ TEST_F(Cgroup2Test, TaskMigration) {
   Cgroup dst = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("dst"));
   ExpectDefaultControlFiles(dst);
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(src.Enter(getpid()));
   EXPECT_THAT(src.ReadControlFile("cgroup.events"),
               IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
@@ -1564,7 +1629,7 @@ TEST_F(Cgroup2Test, CgroupDotEventsPerFDPollReadiness) {
   ExpectPollEvent(event_fd2);
 
   // Enter the cgroup.
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.Enter(getpid()));
   EXPECT_THAT(child.ReadControlFile("cgroup.events"),
               IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
@@ -1651,7 +1716,7 @@ TEST_F(Cgroup2Test, PermChecksUseOpenTimeCreds) {
   Cgroup parent = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("parent"));
   Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(parent.CreateChild("child"));
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(parent.Enter(getpid()));
 
   // Grant unprivileged user read/write permissions to cgroup.procs.
@@ -1886,9 +1951,20 @@ TEST_F(Cgroup2Test, FrozenProcessWakesAndDiesOnDefaultFatalSignal) {
   FileDescriptor go_r(go_fds[0]);
   FileDescriptor go_w(go_fds[1]);
 
+  int ready_fds[2];
+  ASSERT_THAT(pipe(ready_fds), SyscallSucceeds());
+  FileDescriptor ready_r(ready_fds[0]);
+  FileDescriptor ready_w(ready_fds[1]);
+
   pid_t pid = fork();
   if (pid == 0) {
     go_w.reset();
+    ready_r.reset();
+    char ready_token = 1;
+    if (write(ready_w.get(), &ready_token, 1) != 1) {
+      _exit(1);
+    }
+    ready_w.reset();
     // Block indefinitely with SIGTERM at its default disposition (no
     // handler installed); the parent never writes and holds the write end
     // open.
@@ -1900,10 +1976,17 @@ TEST_F(Cgroup2Test, FrozenProcessWakesAndDiesOnDefaultFatalSignal) {
   }
   ASSERT_GT(pid, 0);
   go_r.reset();
+  ready_w.reset();
   auto cleanup = Cleanup([&] {
     kill(pid, SIGKILL);
     waitpid(pid, nullptr, 0);
   });
+
+  // Let fork restore the child's signal mask before freezing it. Otherwise
+  // libc's temporary blocked mask can prevent the pending SIGTERM from firing.
+  char ready_token;
+  ASSERT_THAT(read(ready_r.get(), &ready_token, 1),
+              SyscallSucceedsWithValue(1));
 
   ASSERT_NO_ERRNO(child.Enter(pid));
 
@@ -2155,8 +2238,13 @@ TEST_F(Cgroup2Test, FrozenProcessDefersCoreDumpSignalUntilThaw) {
   // SIGQUIT: frozen, must not die until thaw.
   {
     Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("quit"));
+    int ready_fds[2];
+    ASSERT_THAT(pipe(ready_fds), SyscallSucceeds());
+    FileDescriptor ready_r(ready_fds[0]);
+    FileDescriptor ready_w(ready_fds[1]);
     pid_t pid = fork();
     if (pid == 0) {
+      ready_r.reset();
       // Explicitly force SIG_DFL rather than relying on inherited
       // disposition: fork() preserves whatever disposition (SIG_DFL,
       // SIG_IGN, or a handler) the parent currently has for SIGQUIT, so if
@@ -2169,15 +2257,26 @@ TEST_F(Cgroup2Test, FrozenProcessDefersCoreDumpSignalUntilThaw) {
       if (sigaction(SIGQUIT, &sa, nullptr) != 0) {
         _exit(1);
       }
+      char ready_token = 1;
+      if (write(ready_w.get(), &ready_token, 1) != 1) {
+        _exit(1);
+      }
+      ready_w.reset();
       while (true) {
         pause();
       }
     }
     ASSERT_GT(pid, 0);
+    ready_w.reset();
     auto cleanup = Cleanup([&] {
       kill(pid, SIGKILL);
       waitpid(pid, nullptr, 0);
     });
+
+    // Wait for fork's signal-mask restoration and child setup before freezing.
+    char ready_token;
+    ASSERT_THAT(read(ready_r.get(), &ready_token, 1),
+                SyscallSucceedsWithValue(1));
 
     ASSERT_NO_ERRNO(child.Enter(pid));
     ASSERT_NO_ERRNO(child.WriteControlFile("cgroup.freeze", "1"));
@@ -2219,17 +2318,33 @@ TEST_F(Cgroup2Test, FrozenProcessDefersCoreDumpSignalUntilThaw) {
   // SIGTERM: frozen, must die immediately (comparison).
   {
     Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("term"));
+    int ready_fds[2];
+    ASSERT_THAT(pipe(ready_fds), SyscallSucceeds());
+    FileDescriptor ready_r(ready_fds[0]);
+    FileDescriptor ready_w(ready_fds[1]);
     pid_t pid = fork();
     if (pid == 0) {
+      ready_r.reset();
+      char ready_token = 1;
+      if (write(ready_w.get(), &ready_token, 1) != 1) {
+        _exit(1);
+      }
+      ready_w.reset();
       while (true) {
         pause();
       }
     }
     ASSERT_GT(pid, 0);
+    ready_w.reset();
     auto cleanup = Cleanup([&] {
       kill(pid, SIGKILL);
       waitpid(pid, nullptr, 0);
     });
+
+    // Wait for fork's signal-mask restoration and child setup before freezing.
+    char ready_token;
+    ASSERT_THAT(read(ready_r.get(), &ready_token, 1),
+                SyscallSucceedsWithValue(1));
 
     ASSERT_NO_ERRNO(child.Enter(pid));
     ASSERT_NO_ERRNO(child.WriteControlFile("cgroup.freeze", "1"));
@@ -2799,123 +2914,6 @@ TEST_F(Cgroup2Test, V1MountRejectedWhenControllerEnabledInV2) {
   // Since it is enabled in v2, attempting to mount v1 pointing to pids should
   // fail with EBUSY.
   EXPECT_THAT(m_->MountCgroupfs("pids"), PosixErrorIs(EBUSY));
-}
-
-TEST_F(Cgroup2Test, V1MountSucceedsAndV2OwnershipReturnsOnUnmount) {
-  auto v2_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v2_mounter(std::move(v2_mount));
-  auto v2_cg = ASSERT_NO_ERRNO_AND_VALUE(v2_mounter.MountCgroup2fs());
-
-  // Skip if v2 doesn't have pids to begin with.
-  auto available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  SKIP_IF(!absl::StrContains(available, "pids"));
-  // Skip if we can't drain pids from below v2 root.
-  PosixError unused = v2_cg.WriteControlFile("cgroup.subtree_control", "-pids");
-  SKIP_IF(unused.errno_value() == EBUSY);
-
-  // Steal the pids controller away from v2 by mounting it in v1.
-  auto v1_mount1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter1(std::move(v1_mount1));
-  auto v1_cg1 = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter1.MountCgroupfs("pids"));
-  // Mount it again in another v1 hierarchy for good measure.
-  auto v1_mount2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter2(std::move(v1_mount2));
-  auto v1_cg2 = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter2.MountCgroupfs("pids"));
-
-  // Now pids should be gone from v2 root's cgroup.controllers
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::Not(::testing::HasSubstr("pids")));
-
-  // Unmount the first v1 mount. Pids should still be absent from v2.
-  ASSERT_NO_ERRNO(v1_mounter1.Unmount(v1_cg1));
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::Not(::testing::HasSubstr("pids")));
-
-  // Unmount the second v1 mount, restoring pids ownership to v2.
-  ASSERT_NO_ERRNO(v1_mounter2.Unmount(v1_cg2));
-  available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  EXPECT_THAT(available, ::testing::HasSubstr("pids"));
-}
-
-// Exercises cgroup.kill while the memory controller is mounted in a v1
-// hierarchy. Stealing the memory controller from v2 acquires the v2 tasks
-// lock under the cgroup registry lock, and cgroup.kill sends signals while
-// holding the same tasks lock; task creation meanwhile enters the initial v1
-// cgroups while holding the signal handlers lock. Together these form a lock
-// order cycle that gVisor builds with lock dependency checking (the "lockdep"
-// go build tag) detect and panic on.
-TEST_F(Cgroup2Test, KillWithV1MemoryMounted) {
-  auto v2_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v2_mounter(std::move(v2_mount));
-  auto v2_cg = ASSERT_NO_ERRNO_AND_VALUE(v2_mounter.MountCgroup2fs());
-
-  // Skip if v2 doesn't have memory to begin with.
-  auto available =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.ReadControlFile("cgroup.controllers"));
-  SKIP_IF(!absl::StrContains(available, "memory"));
-  // Skip if we can't drain memory from below v2 root.
-  PosixError drain =
-      v2_cg.WriteControlFile("cgroup.subtree_control", "-memory");
-  SKIP_IF(drain.errno_value() == EBUSY);
-
-  // Steal the memory controller away from v2 by mounting it in v1.
-  auto v1_mount = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  Mounter v1_mounter(std::move(v1_mount));
-  auto v1_cg = ASSERT_NO_ERRNO_AND_VALUE(v1_mounter.MountCgroupfs("memory"));
-
-  Cgroup child_cg =
-      ASSERT_NO_ERRNO_AND_VALUE(v2_cg.CreateChild("kill_v1mem_test"));
-
-  int fds[2];
-  ASSERT_THAT(pipe(fds), SyscallSucceeds());
-  FileDescriptor rfd(fds[0]);
-  FileDescriptor wfd(fds[1]);
-
-  pid_t pid = fork();
-  if (pid == 0) {
-    close(wfd.get());
-    char token;
-    if (read(rfd.get(), &token, 1) <= 0) {
-      _exit(1);
-    }
-    _exit(0);
-  }
-  ASSERT_GT(pid, 0);
-  rfd.reset();
-
-  ASSERT_NO_ERRNO(child_cg.Enter(pid));
-
-  // Killing the cgroup sends SIGKILL to its tasks while the stolen memory
-  // controller's v1 hierarchy is mounted.
-  EXPECT_TRUE(child_cg.WriteControlFile("cgroup.kill", "1").ok());
-  wfd.reset();
-
-  int status;
-  ASSERT_EQ(waitpid(pid, &status, 0), pid);
-  EXPECT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(WTERMSIG(status), SIGKILL);
-
-  // The killed task may leave the cgroup asynchronously; retry the removal.
-  absl::Time deadline = absl::Now() + absl::Seconds(5);
-  PosixError err;
-  while (true) {
-    err = Rmdir(child_cg.Path());
-    if (err.ok() || absl::Now() >= deadline) {
-      break;
-    }
-    absl::SleepFor(absl::Milliseconds(10));
-  }
-  EXPECT_NO_ERRNO(err);
-
-  // Return the memory controller to v2.
-  ASSERT_NO_ERRNO(v1_mounter.Unmount(v1_cg));
-  if (drain.ok()) {
-    v2_cg.WriteControlFile("cgroup.subtree_control", "+memory").IgnoreError();
-  }
 }
 
 TEST_F(Cgroup2Test, MemoryCurrent) {

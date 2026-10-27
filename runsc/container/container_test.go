@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -38,20 +39,18 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -75,7 +74,7 @@ func TestMain(m *testing.M) {
 }
 
 func execute(conf *config.Config, cont *Container, name string, arg ...string) (unix.WaitStatus, error) {
-	args := &control.ExecArgs{
+	args := &controlapi.ExecArgs{
 		Filename: name,
 		Argv:     append([]string{name}, arg...),
 	}
@@ -96,10 +95,10 @@ func executeCombinedOutputWithStatus(conf *config.Config, cont *Container, execF
 	if execFile != nil {
 		name = ""
 	}
-	args := &control.ExecArgs{
+	args := &controlapi.ExecArgs{
 		Filename: name,
 		Argv:     append([]string{name}, arg...),
-		FilePayload: control.NewFilePayload(map[int]*os.File{
+		FilePayload: controlapi.NewFilePayload(map[int]*os.File{
 			0: os.Stdin, 1: w, 2: w,
 		}, execFile),
 	}
@@ -134,7 +133,7 @@ func executeCombinedOutput(conf *config.Config, cont *Container, execFile *os.Fi
 }
 
 // executeSync synchronously executes a new process.
-func (c *Container) executeSync(conf *config.Config, args *control.ExecArgs) (unix.WaitStatus, error) {
+func (c *Container) executeSync(conf *config.Config, args *controlapi.ExecArgs) (unix.WaitStatus, error) {
 	pid, err := c.Execute(conf, args)
 	if err != nil {
 		return 0, fmt.Errorf("error executing: %v", err)
@@ -147,7 +146,7 @@ func (c *Container) executeSync(conf *config.Config, args *control.ExecArgs) (un
 }
 
 // waitForProcessList waits for the given process list to show up in the container.
-func waitForProcessList(cont *Container, want []*control.Process) error {
+func waitForProcessList(cont *Container, want []*controlapi.Process) error {
 	cb := func() error {
 		got, err := cont.Processes()
 		if err != nil {
@@ -164,7 +163,7 @@ func waitForProcessList(cont *Container, want []*control.Process) error {
 }
 
 // waitForProcess waits for the given process to show up in the container.
-func waitForProcess(cont *Container, want *control.Process) error {
+func waitForProcess(cont *Container, want *controlapi.Process) error {
 	cb := func() error {
 		gots, err := cont.Processes()
 		if err != nil {
@@ -203,9 +202,9 @@ func waitForProcessCount(cont *Container, want int) error {
 // processes and returns them. The same PIDs must be observed in two
 // consecutive poll samples: a single sample can count a transient task in
 // place of a process that has not been forked yet.
-func waitForStableProcessList(cont *Container, want int) ([]*control.Process, error) {
-	var prev []kernel.ThreadID
-	var procs []*control.Process
+func waitForStableProcessList(cont *Container, want int) ([]*controlapi.Process, error) {
+	var prev []int32
+	var procs []*controlapi.Process
 	cb := func() error {
 		var err error
 		procs, err = cont.Processes()
@@ -214,7 +213,7 @@ func waitForStableProcessList(cont *Container, want int) ([]*control.Process, er
 			return &backoff.PermanentError{Err: err}
 		}
 		// Processes() returns the list sorted by PID.
-		pids := make([]kernel.ThreadID, 0, len(procs))
+		pids := make([]int32, 0, len(procs))
 		for _, p := range procs {
 			pids = append(pids, p.PID)
 		}
@@ -243,8 +242,66 @@ func blockUntilWaitable(pid int) error {
 	return err
 }
 
+func TestSetOOMScoreAdjExited(t *testing.T) {
+	cmd := exec.Command("/bin/cat")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close() })
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	})
+
+	pid := cmd.Process.Pid
+	if err := setOOMScoreAdj(pid, 1000); err != nil {
+		t.Fatalf("setOOMScoreAdj(%d, 1000) while alive: %v", pid, err)
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "1000" {
+		t.Fatalf("live oom_score_adj = %q, want 1000", got)
+	}
+
+	// Keep the child waitable but unreaped so its proc files still exist.
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := blockUntilWaitable(pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := setOOMScoreAdj(pid, 1000); err != nil {
+		t.Fatalf("setOOMScoreAdj(%d, 1000) after exit = %v, want nil", pid, err)
+	}
+}
+
+func TestSetOOMScoreAdjPermissionDenied(t *testing.T) {
+	// Probe without writing: a privileged caller may be able to change PID 1's
+	// score, in which case this permission-denied control does not apply.
+	f, err := os.OpenFile("/proc/1/oom_score_adj", os.O_WRONLY, 0)
+	if err == nil {
+		f.Close()
+		t.Skip("PID 1's oom_score_adj is writable")
+	}
+	if !errors.Is(err, unix.EACCES) {
+		t.Fatalf("opening PID 1's oom_score_adj: %v, want EACCES", err)
+	}
+	if running, err := specutils.IsProcessRunning(1, 0); err != nil || !running {
+		t.Fatalf("IsProcessRunning(1) = (%t, %v), want (true, nil)", running, err)
+	}
+	if err := setOOMScoreAdj(1, 1000); !errors.Is(err, unix.EACCES) {
+		t.Fatalf("setOOMScoreAdj(1, 1000) = %v, want EACCES", err)
+	}
+}
+
 // execPS executes `ps` inside the container and return the processes.
-func execPS(conf *config.Config, c *Container) ([]*control.Process, error) {
+func execPS(conf *config.Config, c *Container) ([]*controlapi.Process, error) {
 	out, err := executeCombinedOutput(conf, c, nil, "/bin/ps", "-e")
 	if err != nil {
 		return nil, err
@@ -253,7 +310,7 @@ func execPS(conf *config.Config, c *Container) ([]*control.Process, error) {
 	if len(lines) < 1 {
 		return nil, fmt.Errorf("missing header: %q", lines)
 	}
-	procs := make([]*control.Process, 0, len(lines)-1)
+	procs := make([]*controlapi.Process, 0, len(lines)-1)
 	for _, line := range lines[1:] {
 		if len(line) == 0 {
 			continue
@@ -268,8 +325,8 @@ func execPS(conf *config.Config, c *Container) ([]*control.Process, error) {
 		}
 		cmd := fields[3]
 		// Fill only the fields we need thus far.
-		procs = append(procs, &control.Process{
-			PID: kernel.ThreadID(pid),
+		procs = append(procs, &controlapi.Process{
+			PID: int32(pid),
 			Cmd: cmd,
 		})
 	}
@@ -279,7 +336,7 @@ func execPS(conf *config.Config, c *Container) ([]*control.Process, error) {
 // procListsEqual is used to check whether 2 Process lists are equal. Fields
 // set to -1 in wants are ignored. Timestamp and threads fields are always
 // ignored.
-func procListsEqual(gots, wants []*control.Process) bool {
+func procListsEqual(gots, wants []*controlapi.Process) bool {
 	if len(gots) != len(wants) {
 		return false
 	}
@@ -291,7 +348,7 @@ func procListsEqual(gots, wants []*control.Process) bool {
 	return true
 }
 
-func procEqual(got, want *control.Process) bool {
+func procEqual(got, want *controlapi.Process) bool {
 	if want.UID != math.MaxUint32 && want.UID != got.UID {
 		return false
 	}
@@ -314,12 +371,12 @@ func procEqual(got, want *control.Process) bool {
 }
 
 type processBuilder struct {
-	process control.Process
+	process controlapi.Process
 }
 
 func newProcessBuilder() *processBuilder {
 	return &processBuilder{
-		process: control.Process{
+		process: controlapi.Process{
 			UID:  math.MaxUint32,
 			PID:  -1,
 			PPID: -1,
@@ -333,17 +390,17 @@ func (p *processBuilder) Cmd(cmd string) *processBuilder {
 	return p
 }
 
-func (p *processBuilder) PID(pid kernel.ThreadID) *processBuilder {
+func (p *processBuilder) PID(pid int32) *processBuilder {
 	p.process.PID = pid
 	return p
 }
 
-func (p *processBuilder) PPID(ppid kernel.ThreadID) *processBuilder {
+func (p *processBuilder) PPID(ppid int32) *processBuilder {
 	p.process.PPID = ppid
 	return p
 }
 
-func (p *processBuilder) PGID(pgid kernel.ThreadID) *processBuilder {
+func (p *processBuilder) PGID(pgid int32) *processBuilder {
 	p.process.PGID = pgid
 	return p
 }
@@ -353,11 +410,11 @@ func (p *processBuilder) UID(uid auth.KUID) *processBuilder {
 	return p
 }
 
-func (p *processBuilder) Process() *control.Process {
+func (p *processBuilder) Process() *controlapi.Process {
 	return &p.process
 }
 
-func procListToString(pl []*control.Process) string {
+func procListToString(pl []*controlapi.Process) string {
 	strs := make([]string, 0, len(pl))
 	for _, p := range pl {
 		strs = append(strs, fmt.Sprintf("%+v", p))
@@ -478,7 +535,7 @@ var platforms = flag.String("test_platforms", os.Getenv("TEST_PLATFORMS"), "Plat
 func configs(t *testing.T, noOverlay bool) map[string]*config.Config {
 	var ps []string
 	if *platforms == "" {
-		ps = platform.List()
+		ps = platformdesc.List()
 	} else {
 		ps = strings.Split(*platforms, ",")
 	}
@@ -550,6 +607,68 @@ func TestPostStartHookFailure(t *testing.T) {
 	}
 }
 
+// TestSpecChangeAfterCreate checks that changes to config.json after create
+// don't affect the container.
+func TestSpecChangeAfterCreate(t *testing.T) {
+	spec, conf := sleepSpecConf(t)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	c, err := New(conf, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer c.Destroy()
+
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), nil, 0644); err != nil {
+		t.Fatalf("error truncating config.json: %v", err)
+	}
+	if err := c.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if out, err := executeCombinedOutput(conf, c, nil, "/bin/true"); err != nil {
+		t.Errorf("exec failed: %v, output: %s", err, out)
+	}
+}
+
+// TestRootStartFailureStops checks that a root container that the sandbox
+// fails to start is reported as stopped once its sandbox exits.
+func TestRootStartFailureStops(t *testing.T) {
+	spec, conf := sleepSpecConf(t)
+	spec.Process.Args = []string{"/does/not/exist"}
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	c, err := New(conf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer c.Destroy()
+	if err := c.Start(conf); err == nil {
+		t.Fatalf("starting a container with a missing executable succeeded")
+	}
+	if err := testutil.Poll(func() error {
+		loaded, err := Load(conf.RootDir, FullID{ContainerID: c.ID}, LoadOpts{})
+		if err != nil {
+			return &backoff.PermanentError{Err: err}
+		}
+		if loaded.Status != Stopped {
+			return fmt.Errorf("got status %v, expected %v", loaded.Status, Stopped)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestGetNetworkConfig(t *testing.T) {
 	for name, conf := range configs(t, false /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
@@ -608,7 +727,7 @@ func TestLifecycle(t *testing.T) {
 			defer cleanup()
 
 			// expectedPL lists the expected process state of the container.
-			expectedPL := []*control.Process{
+			expectedPL := []*controlapi.Process{
 				newProcessBuilder().Cmd("sleep").Process(),
 			}
 			// Create the container.
@@ -727,6 +846,91 @@ func TestLifecycle(t *testing.T) {
 				t.Errorf("expected loading destroyed container to fail, but it did not")
 			}
 		})
+	}
+}
+
+func TestGoferWillNeedHostRPC(t *testing.T) {
+	allIDs := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: math.MaxUint32}}
+	uidMappings, err := getIdentityMapping("uid_map")
+	if err != nil {
+		t.Fatalf("getIdentityMapping failed: %v", err)
+	}
+	gidMappings, err := getIdentityMapping("gid_map")
+	if err != nil {
+		t.Fatalf("getIdentityMapping failed: %v", err)
+	}
+	// Tests may run in a user namespace that doesn't map every ID, where the
+	// gofer may always need this process.
+	partialUserNS := !slices.Equal(uidMappings, allIDs) || !slices.Equal(gidMappings, allIDs)
+	userns := []specs.LinuxNamespace{{Type: specs.UserNamespace}}
+	shifted := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
+	idMapped := specs.Mount{Destination: "/mnt", Source: "/mnt", Type: "bind", UIDMappings: shifted, GIDMappings: shifted}
+	for _, tc := range []struct {
+		name string
+		spec *specs.Spec
+		want bool
+	}{
+		{name: "no userns", spec: &specs.Spec{Linux: &specs.Linux{}}, want: partialUserNS},
+		{name: "userns mapping all IDs", spec: &specs.Spec{Linux: &specs.Linux{Namespaces: userns, UIDMappings: allIDs, GIDMappings: allIDs}}, want: partialUserNS},
+		{name: "shifted userns", spec: &specs.Spec{Linux: &specs.Linux{Namespaces: userns, UIDMappings: shifted, GIDMappings: shifted}}, want: true},
+		{name: "id-mapped mount", spec: &specs.Spec{Linux: &specs.Linux{}, Mounts: []specs.Mount{idMapped}}, want: true},
+		{name: "host procfs mount", spec: &specs.Spec{Linux: &specs.Linux{}, Mounts: []specs.Mount{{Destination: "/mnt", Source: "/proc/1/ns", Type: "bind"}}}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := goferWillNeedHostRPC(tc.spec)
+			if err != nil {
+				t.Fatalf("goferWillNeedHostRPC failed: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("goferWillNeedHostRPC got %t, expected %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSandboxExitBeforeStart checks that if the sandbox exits before the
+// container starts (e.g. because it failed to boot), `start` still reports
+// it as exited, and the container can still be properly destroyed.
+func TestSandboxExitBeforeStart(t *testing.T) {
+	spec, conf := sleepSpecConf(t)
+	rootDir, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+	id := testutil.RandomContainerID()
+	c, err := New(conf, Args{ID: id, Spec: spec, BundleDir: bundleDir})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer c.Destroy()
+	if err := unix.Kill(c.SandboxPid(), unix.SIGKILL); err != nil {
+		t.Fatalf("error killing sandbox: %v", err)
+	}
+
+	// The sandbox process exits asynchronously.
+	var loaded *Container
+	if err := testutil.Poll(func() error {
+		var err error
+		if loaded, err = Load(rootDir, FullID{ContainerID: id}, LoadOpts{}); err != nil {
+			return &backoff.PermanentError{Err: err}
+		}
+		if got, want := loaded.Status, Stopped; got != want {
+			return fmt.Errorf("container status got %v, want %v", got, want)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Fatalf("container status check failed: %v", err)
+	}
+	const want = "the sandbox exited before the container started"
+	// loaded is Stopped, while c is still Created.
+	for _, cont := range []*Container{loaded, c} {
+		if err := cont.Start(conf); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("starting %v container got error %v, expected it to contain %q", cont.Status, err, want)
+		}
+	}
+	if err := c.Destroy(); err != nil {
+		t.Errorf("error destroying container: %v", err)
 	}
 }
 
@@ -914,7 +1118,7 @@ func TestExec(t *testing.T) {
 			}
 
 			// Wait until sleep is running to ensure the symlink was created.
-			expectedPL := []*control.Process{
+			expectedPL := []*controlapi.Process{
 				newProcessBuilder().Cmd("sh").Process(),
 				newProcessBuilder().Cmd("sleep").Process(),
 			}
@@ -924,71 +1128,71 @@ func TestExec(t *testing.T) {
 
 			for _, tc := range []struct {
 				name string
-				args control.ExecArgs
+				args controlapi.ExecArgs
 			}{
 				{
 					name: "complete",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Filename: "/bin/true",
 						Argv:     []string{"/bin/true"},
 					},
 				},
 				{
 					name: "filename",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Filename: "/bin/true",
 					},
 				},
 				{
 					name: "argv",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{"/bin/true"},
 					},
 				},
 				{
 					name: "filename resolution",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Filename: "true",
 						Envv:     []string{"PATH=/bin"},
 					},
 				},
 				{
 					name: "argv resolution",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{"true"},
 						Envv: []string{"PATH=/bin"},
 					},
 				},
 				{
 					name: "argv symlink",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{filepath.Join(dir, "symlink")},
 					},
 				},
 				{
 					name: "working dir",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv:             []string{"/bin/sh", "-c", `if [[ "${PWD}" != "/tmp" ]]; then exit 1; fi`},
 						WorkingDirectory: "/tmp",
 					},
 				},
 				{
 					name: "user",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{"/bin/sh", "-c", `if [[ "$(id -u)" != "343" ]]; then exit 1; fi`},
 						KUID: 343,
 					},
 				},
 				{
 					name: "group",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{"/bin/sh", "-c", `if [[ "$(id -g)" != "343" ]]; then exit 1; fi`},
 						KGID: 343,
 					},
 				},
 				{
 					name: "env",
-					args: control.ExecArgs{
+					args: controlapi.ExecArgs{
 						Argv: []string{"/bin/sh", "-c", `if [[ "${FOO}" != "123" ]]; then exit 1; fi`},
 						Envv: []string{"FOO=123"},
 					},
@@ -1014,9 +1218,9 @@ func TestExec(t *testing.T) {
 				}
 				defer unix.Close(fds[0])
 
-				_, err = cont.executeSync(conf, &control.ExecArgs{
+				_, err = cont.executeSync(conf, &controlapi.ExecArgs{
 					Argv: []string{"/nonexist"},
-					FilePayload: control.NewFilePayload(map[int]*os.File{
+					FilePayload: controlapi.NewFilePayload(map[int]*os.File{
 						0: os.NewFile(uintptr(fds[1]), "sock"),
 					}, nil),
 				})
@@ -1058,7 +1262,7 @@ func TestExecProcList(t *testing.T) {
 				t.Fatalf("error starting container: %v", err)
 			}
 
-			execArgs := &control.ExecArgs{
+			execArgs := &controlapi.ExecArgs{
 				Filename:         "/bin/sleep",
 				Argv:             []string{"/bin/sleep", "5"},
 				WorkingDirectory: "/",
@@ -1073,9 +1277,9 @@ func TestExecProcList(t *testing.T) {
 			}
 
 			// expectedPL lists the expected process state of the container.
-			expectedPL := []*control.Process{
+			expectedPL := []*controlapi.Process{
 				newProcessBuilder().PID(1).PPID(0).Cmd("sleep").UID(0).Process(),
-				newProcessBuilder().PID(kernel.ThreadID(pid2)).PPID(0).Cmd("sleep").UID(uid).Process(),
+				newProcessBuilder().PID(int32(pid2)).PPID(0).Cmd("sleep").UID(uid).Process(),
 			}
 			if err := waitForProcessList(cont, expectedPL); err != nil {
 				t.Fatalf("error waiting for processes: %v", err)
@@ -1123,7 +1327,7 @@ func TestKillPid(t *testing.T) {
 			if err != nil {
 				t.Fatalf("timed out waiting for processes to start: %v", err)
 			}
-			t.Logf("current process list:\n%v", control.ProcessListToTable(procs))
+			t.Logf("current process list:\n%v", controlapi.ProcessListToTable(procs))
 
 			// Kill the child process with the largest PID. Processes are
 			// created in a chain, so this is the deepest child.
@@ -1156,7 +1360,7 @@ func TestKillPid(t *testing.T) {
 				return nil
 			}, pollTimeout); err != nil {
 				procs, procsErr := cont.Processes()
-				t.Fatalf("error waiting for process %d to be killed: %v; current processes (err: %v):\n%v", pid, err, procsErr, control.ProcessListToTable(procs))
+				t.Fatalf("error waiting for process %d to be killed: %v; current processes (err: %v):\n%v", pid, err, procsErr, controlapi.ProcessListToTable(procs))
 			}
 		})
 	}
@@ -1253,10 +1457,14 @@ func TestSignalProcessGroup(t *testing.T) {
 // respond to the Sandbox.Wait RPC, in which case we fall back to the sandbox
 // process's own exit status, which reports the signal as `128+SIGKILL`.
 func killedBySIGKILL(ws unix.WaitStatus) bool {
+	return killedBySignal(ws, unix.SIGKILL)
+}
+
+func killedBySignal(ws unix.WaitStatus, sig unix.Signal) bool {
 	if ws.Signaled() {
-		return ws.Signal() == unix.SIGKILL
+		return ws.Signal() == sig
 	}
-	return ws.ExitStatus() == 128+int(unix.SIGKILL)
+	return ws.ExitStatus() == 128+int(sig)
 }
 
 // TestSignalUnkillablePolicy verifies Linux SIGNAL_UNKILLABLE semantics for PID 1:
@@ -1594,11 +1802,6 @@ func TestNoRootContainerRejectsRootArgs(t *testing.T) {
 			wantErr: "ConsoleSocket cannot be set with NoRootContainer",
 		},
 		{
-			name:    "fs restore image path",
-			args:    Args{FSRestoreImagePath: "/tmp/image"},
-			wantErr: "FSRestoreImagePath cannot be set with NoRootContainer",
-		},
-		{
 			name:    "pass files",
 			args:    Args{PassFiles: map[int]*os.File{3: os.Stdin}},
 			wantErr: "PassFiles and ExecFile cannot be set with NoRootContainer",
@@ -1644,6 +1847,64 @@ func TestNoRootContainerRejectsRootArgs(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("New() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestSignalUnkillablePolicyFaultKillsInit verifies that a fault in PID 1
+// terminates it under SignalUnkillableLinux. The sentry forces the SIGSEGV,
+// which ends the protection of the init process, analogous to Linux's
+// kernel/signal.c:force_sig_info_to_task().
+func TestSignalUnkillablePolicyFaultKillsInit(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			testConf := *conf
+			testConf.SignalUnkillablePolicy = config.SignalUnkillableLinux
+
+			spec := testutil.NewSpecWithArgs(app, "segfault")
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, &testConf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			cont, err := New(&testConf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(&testConf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			type waitResult struct {
+				ws  unix.WaitStatus
+				err error
+			}
+			done := make(chan waitResult, 1)
+			go func() {
+				ws, err := cont.Wait()
+				done <- waitResult{ws, err}
+			}()
+			select {
+			case res := <-done:
+				if res.err != nil {
+					t.Fatalf("cont.Wait: %v", res.err)
+				}
+				if !killedBySignal(res.ws, unix.SIGSEGV) {
+					t.Fatalf("expected container killed by SIGSEGV, got %v (status=%d)", res.ws, res.ws.ExitStatus())
+				}
+			case <-time.After(pollTimeout):
+				t.Fatalf("PID 1 is still running %v after faulting", pollTimeout)
 			}
 		})
 	}
@@ -1854,7 +2115,7 @@ func TestUnixDomainSockets(t *testing.T) {
 			}
 			defer contRestore.Destroy()
 
-			if err := contRestore.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+			if err := contRestore.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -2051,7 +2312,7 @@ func TestCapabilities(t *testing.T) {
 			}
 
 			// expectedPL lists the expected process state of the container.
-			expectedPL := []*control.Process{
+			expectedPL := []*controlapi.Process{
 				newProcessBuilder().Cmd("sleep").Process(),
 			}
 			if err := waitForProcessList(cont, expectedPL); err != nil {
@@ -2072,7 +2333,7 @@ func TestCapabilities(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			execArgs := &control.ExecArgs{
+			execArgs := &controlapi.ExecArgs{
 				Filename:         exePath,
 				Argv:             []string{exePath},
 				WorkingDirectory: "/",
@@ -2440,6 +2701,11 @@ func TestIDMappedMount(t *testing.T) {
 				t.Fatalf("error creating container: %v", err)
 			}
 			defer c.Destroy()
+			select {
+			case <-c.goferRPCDone:
+			default:
+				t.Errorf("New returned before the gofer was done with gofer-to-host RPCs")
+			}
 			if err := c.Start(conf); err != nil {
 				t.Fatalf("error starting container: %v", err)
 			}
@@ -2993,6 +3259,11 @@ func TestUIDMap(t *testing.T) {
 			testFile := path.Join(testDir, "testfile")
 
 			spec := testutil.NewSpecWithArgs("touch", "/tmp/testfile")
+			// This test supplies its own writable /tmp. Remove the helper's
+			// temporary-directory bind, which /tmp would hide when TmpDir is below it.
+			spec.Mounts = slices.DeleteFunc(spec.Mounts, func(m specs.Mount) bool {
+				return m.Destination == testutil.TmpDir()
+			})
 			uid := os.Getuid()
 			gid := os.Getgid()
 			spec.Linux = &specs.Linux{
@@ -3248,6 +3519,85 @@ func TestUserLog(t *testing.T) {
 	}
 	if want := "Unsupported syscall sched_rr_get_interval("; !strings.Contains(string(out), want) {
 		t.Errorf("user log file doesn't contain %q, out: %s", want, string(out))
+	}
+}
+
+// TestOCISeccompErrnoRet checks that an OCI seccomp profile's `errnoRet` is
+// honored end-to-end: the errno the application observes must be the one
+// named in the profile, and a rule that omits `errnoRet` must still default
+// to EPERM. This is the pattern glibc >= 2.34 relies on to fall back from
+// clone3(2) to clone(2): it only does so when clone3 fails with ENOSYS.
+// See gvisor.dev/issue/14688.
+func TestOCISeccompErrnoRet(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.OCISeccomp = true
+
+	// getsid(2) and getpgid(2) are both fully implemented by the sentry and
+	// are not on the Go runtime's startup path, so the only way test_app can
+	// observe a failure for either is through the seccomp filter below.
+	enosys := uint(unix.ENOSYS)
+	spec.Linux = &specs.Linux{
+		Seccomp: &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{
+				{
+					Names:    []string{"getsid"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &enosys,
+				},
+				{
+					// No ErrnoRet: must default to EPERM, like runc.
+					Names:  []string{"getpgid"},
+					Action: specs.ActErrno,
+				},
+			},
+		},
+	}
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		sysno int
+		want  error
+	}{
+		{name: "errno_ret_honored", sysno: unix.SYS_GETSID, want: unix.ENOSYS},
+		{name: "no_errno_ret_defaults_to_eperm", sysno: unix.SYS_GETPGID, want: unix.EPERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// test_app's "syscall" subcommand always exits 0; it prints the
+			// errno it observed, which is what we assert on.
+			out, err := executeCombinedOutput(conf, cont, nil, app, "syscall", "--syscall="+strconv.Itoa(tc.sysno))
+			if err != nil {
+				t.Fatalf("error executing test_app: %v", err)
+			}
+			if want := fmt.Sprintf("failed: %v", tc.want); !strings.Contains(string(out), want) {
+				t.Errorf("syscall(%d) output %q does not contain %q", tc.sysno, out, want)
+			}
+		})
 	}
 }
 
@@ -3783,7 +4133,7 @@ func TestPGIDField(t *testing.T) {
 		t.Fatalf("error starting container: %v", err)
 	}
 
-	expectedPL := []*control.Process{
+	expectedPL := []*controlapi.Process{
 		newProcessBuilder().PID(1).PPID(0).PGID(1).Cmd("sleep").Process(),
 	}
 	if err := waitForProcessList(c, expectedPL); err != nil {
@@ -4042,7 +4392,7 @@ func TestUsageFD(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -4252,7 +4602,7 @@ func TestSaveSystemdCgroup(t *testing.T) {
 	defer cont.Destroy()
 
 	cont.CompatCgroup = cgroup.CgroupJSON{Cgroup: cgroup.CreateMockSystemdCgroup()}
-	if err := cont.Saver.lock(BlockAcquire); err != nil {
+	if err := cont.Saver.lock(); err != nil {
 		t.Fatalf("cannot lock container metadata file: %v", err)
 	}
 	if err := cont.saveLocked(); err != nil {
@@ -4442,9 +4792,9 @@ func TestFDPassingExec(t *testing.T) {
 
 	// Prepare executing a command in the running container.
 	cmd := fmt.Sprintf("cat /proc/self/fd/%d > /proc/self/fd/%d", int(guestRead.Fd()), int(guestWrite.Fd()))
-	execArgs := &control.ExecArgs{
+	execArgs := &controlapi.ExecArgs{
 		Argv: []string{"/bin/bash", "-c", cmd},
-		FilePayload: control.NewFilePayload(map[int]*os.File{
+		FilePayload: controlapi.NewFilePayload(map[int]*os.File{
 			int(guestRead.Fd()):  guestRead,
 			int(guestWrite.Fd()): guestWrite,
 		}, nil),
@@ -4718,6 +5068,8 @@ find $dir -type l -o -type f | sort | xargs cat | md5sum`), 0755); err != nil {
 			name:    "image4",
 			options: "-E force-inode-compact -E noinline_data",
 		},
+		{name: "chunk-blockmap", options: "--chunksize=8192 -E force-inode-blockmap,force-inode-compact"},
+		{name: "chunk-indexes", options: "--chunksize=8192 -E force-chunk-indexes,force-inode-extended"},
 	}
 
 	var resultImages []erofsImageInfo
@@ -4866,8 +5218,8 @@ func TestMountEROFSConfig(t *testing.T) {
 }
 
 // createRootfsEROFS creates a rootfs directory and an EROFS rootfs image in
-// the directory dir.
-func createRootfsEROFS(dir string) (string, string, error) {
+// the directory dir, passing options to mkfs.erofs.
+func createRootfsEROFS(dir string, options ...string) (string, string, error) {
 	// Create a rootfs directory with busybox in root.
 	rootfsDir := filepath.Join(dir, "rootfs")
 	if err := os.Mkdir(rootfsDir, 0755); err != nil {
@@ -4892,7 +5244,7 @@ func createRootfsEROFS(dir string) (string, string, error) {
 
 	// Build the EROFS rootfs image.
 	rootfsImage := filepath.Join(dir, "rootfs.img")
-	if err := createImageEROFS(rootfsImage, rootfsDir, "-E noinline_data"); err != nil {
+	if err := createImageEROFS(rootfsImage, rootfsDir, append([]string{"-E noinline_data"}, options...)...); err != nil {
 		return "", "", fmt.Errorf("error creating EROFS image: %v", err)
 	}
 
@@ -4922,11 +5274,11 @@ func TestRootfsEROFS(t *testing.T) {
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
-	spec.Annotations[boot.RootfsPrefix+"type"] = erofs.Name
-	spec.Annotations[boot.RootfsPrefix+"source"] = rootfsImage
+	spec.Annotations[sentryapi.RootfsPrefix+"type"] = erofs.Name
+	spec.Annotations[sentryapi.RootfsPrefix+"source"] = rootfsImage
 	// Disable the overlay, as we want to be sure that rootfs will always be
 	// shown as EROFS in mountinfo.
-	spec.Annotations[boot.RootfsPrefix+"overlay"] = config.NoOverlay.String()
+	spec.Annotations[sentryapi.RootfsPrefix+"overlay"] = config.NoOverlay.String()
 
 	conf := testutil.TestConfig(t)
 	mountDir, err := os.MkdirTemp(testutil.TmpDir(), "mount_dir")
@@ -5404,7 +5756,7 @@ func TestSpecValidation(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			err = cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */)
+			err = cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
 			if err == nil {
 				if test.wantErr == "" {
 					return
@@ -5447,7 +5799,7 @@ func snapshotRootfsUpperLayer(conf *config.Config, spec *specs.Spec) (string, er
 		return "", fmt.Errorf("error starting container: %v", err)
 	}
 	// Exec the command in the container.
-	execArgs := &control.ExecArgs{
+	execArgs := &controlapi.ExecArgs{
 		Filename: app,
 		Argv:     []string{app, "fsTreeCreate", "--depth=3", "--file-per-level=2", "--file-size=1470", "--create-symlink", "--add-empty-files"},
 	}
@@ -5959,7 +6311,7 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 	checkpointOpts := sandbox.CheckpointOpts{
 		Resume:                 true,
 		SaveRestoreExecArgv:    hookPath,
-		SaveRestoreExecTimeout: control.DefaultSaveRestoreExecTimeout,
+		SaveRestoreExecTimeout: controlapi.DefaultSaveRestoreExecTimeout,
 	}
 	imageDir := func(name string) string {
 		path := filepath.Join(dir, name)
@@ -5969,12 +6321,17 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 		return path
 	}
 	wantHookLog := func(want string) {
-		got, err := os.ReadFile(hookLog)
-		if err != nil {
-			t.Fatalf("error reading hook log: %v", err)
-		}
-		if string(got) != want {
-			t.Errorf("save/restore binary invocations: got %q, want %q", got, want)
+		if err := testutil.Poll(func() error {
+			got, err := os.ReadFile(hookLog)
+			if err != nil {
+				return err
+			}
+			if string(got) != want {
+				return fmt.Errorf("save/restore binary invocations: got %q, want %q", got, want)
+			}
+			return nil
+		}, 30*time.Second); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -6006,8 +6363,10 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 		if err := cont.Checkpoint(conf, lastImage, checkpointOpts); err != nil {
 			t.Fatalf("checkpoint %d failed: %v", i+1, err)
 		}
+		// Wait for the resume hook before starting another checkpoint so that
+		// the save and resume hooks cannot run concurrently.
+		wantHookLog(strings.Repeat("save\nresume\n", i+1))
 	}
-	wantHookLog("save\nresume\nsave\nresume\n")
 	cont.Destroy()
 
 	// Restore the last checkpoint and checkpoint it once more. The restored
@@ -6028,7 +6387,7 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, lastImage, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, lastImage, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring: %v", err)
 	}
 	// Restore does not wait for its hook to finish. Wait before starting another

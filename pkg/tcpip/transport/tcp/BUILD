@@ -190,6 +190,7 @@ go_library(
     deps = [
         "//pkg/atomicbitops",
         "//pkg/buffer",
+        "//pkg/gomaxprocs",
         "//pkg/log",
         "//pkg/rand",
         "//pkg/refs",
@@ -220,6 +221,7 @@ go_test(
         "endpoint_test.go",
         "main_test.go",
         "rack_test.go",
+        "reno_test.go",
         "sack_scoreboard_test.go",
         "segment_test.go",
         "timer_test.go",

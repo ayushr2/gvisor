@@ -603,6 +603,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	if _, ok := mopts[moptDirectfs]; ok {
 		delete(mopts, moptDirectfs)
+		if procSelfFD < 0 {
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: directfs requires SetProcSelfFD()")
+			return nil, nil, linuxerr.EINVAL
+		}
 		fsopts.directfs.enabled = true
 	}
 	// fsopts.regularFilesUseSpecialFileFD can only be enabled by specifying
@@ -1132,6 +1136,8 @@ func (i *inode) destroy(ctx context.Context, d *dentry) {
 //
 // +stateify savable
 type dentry struct {
+	memmap.MappableNoHugepages
+
 	vfsd vfs.Dentry
 
 	// refs is the reference count. Each dentry holds a reference on its
@@ -1604,8 +1610,12 @@ func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats
 	mode := linux.FileMode(d.inode.mode.RacyLoad())
 	kuid := auth.KUID(d.inode.uid.RacyLoad())
 	kgid := auth.KGID(d.inode.gid.RacyLoad())
-	if err := vfs.GenericCheckPermissions(creds, ats, mode, nil, kuid, kgid); err != nil {
-		return err
+	// Linux only skips the read permission check for reads of security.*,
+	// system.*, and trusted.* xattrs, see fs/xattr.c:xattr_permission().
+	if ats.MayWrite() || vfs.XattrReadNeedsFilePermission(name) {
+		if err := vfs.GenericCheckPermissions(creds, ats, mode, nil, kuid, kgid); err != nil {
+			return err
+		}
 	}
 	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
 }
@@ -1800,10 +1810,23 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 				return
 			}
 		}
+		var ds *[]*dentry
 		if d.isDeleted() {
-			d.inode.watches.HandleDeletion(ctx)
+			// HandleDeletion sends IN_DELETE_SELF, which removes one-shot
+			// watches and calls OnZeroWatches on their targets while fs.renameMu
+			// is locked for writing. Hand it a list so OnZeroWatches does not
+			// re-enter checkCachingLocked. d.inode.watches is shared by all hard
+			// links to the inode, so the list may contain dentries other than d.
+			d.inode.watches.HandleDeletion(withCheckCachingList(ctx, &ds))
 		}
 		d.destroyLocked(ctx) // +checklocksforce: renameMu must be acquired at this point.
+		if ds != nil {
+			// d is destroyed now, so checkCachingLocked is a no-op for it.
+			for _, td := range *ds {
+				td.checkCachingLocked(ctx, true /* renameMuWriteLocked */) // +checklocksforce: renameMu must be acquired at this point.
+			}
+			putDentrySlice(ds)
+		}
 		return
 	}
 	if d.vfsd.IsEvictable() {
@@ -2145,7 +2168,6 @@ func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name 
 // Preconditions:
 //   - !d.inode.isSynthetic().
 //   - d.isRegularFile() || d.isDir().
-//   - fs.renameMu is locked.
 func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool) error {
 	// O_TRUNC unconditionally requires us to obtain a new handle (opened with
 	// O_TRUNC).
@@ -2309,20 +2331,21 @@ func (d *dentry) syncRemoteFile(ctx context.Context, dataOnly bool) error {
 func (d *dentry) syncRemoteFileLocked(ctx context.Context, dataOnly bool) error {
 	// Prefer syncing write handles over read handles, since some remote
 	// filesystem implementations may not sync changes made through write
-	// handles otherwise.
-	wh := d.inode.writeHandle()
-	if dataOnly {
-		wh.syncData(ctx)
-	} else {
-		wh.sync(ctx)
+	// handles otherwise. Only one handle needs to be synced, but its sync
+	// error must be reported to the caller (e.g. fsync(2) and O_SYNC/
+	// O_DSYNC writes).
+	if d.inode.isWriteHandleOk() {
+		wh := d.inode.writeHandle()
+		if dataOnly {
+			return wh.syncData(ctx)
+		}
+		return wh.sync(ctx)
 	}
 	rh := d.inode.readHandle()
 	if dataOnly {
-		rh.syncData(ctx)
-	} else {
-		rh.sync(ctx)
+		return rh.syncData(ctx)
 	}
-	return nil
+	return rh.sync(ctx)
 }
 
 func (d *dentry) syncCachedFile(ctx context.Context, forFilesystemSync bool, dataOnly bool) error {

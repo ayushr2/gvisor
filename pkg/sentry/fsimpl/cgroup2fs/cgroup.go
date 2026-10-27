@@ -1116,7 +1116,7 @@ func (c *cgroup) hasControllersEnabledLocked() bool {
 // attachProcess handles writes to cgroup.procs.
 // nsRoot is the root cgroup of the cgroupns of the task at the time of the
 // opening of the cgroup.procs fd.
-func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, nsRoot *cgroup, pid int64) error {
+func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, nsRoot *cgroup, pid kernel.ThreadID) error {
 	c.fs.treeMu.Lock()
 	defer c.fs.treeMu.Unlock()
 	if c.deleted.Load() {
@@ -1136,7 +1136,7 @@ func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, nsR
 	}
 	var targetTask *kernel.Task
 	if pid != 0 {
-		targetTask = t.PIDNamespace().TaskWithID(kernel.ThreadID(pid))
+		targetTask = t.PIDNamespace().TaskWithID(pid)
 	} else {
 		targetTask = t
 	}
@@ -1251,7 +1251,7 @@ func (c *cgroup) setSubtreeControl(ctx context.Context, enable []kernel.Cgroup2C
 }
 
 // kill() handles writes to cgroup.kill.
-func (c *cgroup) kill() error {
+func (c *cgroup) kill(ctx context.Context) error {
 	// cgroup-v2.rst says: "Killing a cgroup tree will deal with concurrent forks appropriately and
 	// is protected against migrations."
 	c.fs.treeMu.Lock()
@@ -1282,8 +1282,9 @@ func (c *cgroup) kill() error {
 		return true
 	})
 
+	writer := kernel.TaskFromContext(ctx)
 	for _, t := range toKill {
-		t.SendSignal(kernel.SignalInfoPriv(linux.SIGKILL))
+		t.SendSignalFrom(writer, kernel.SignalInfoPriv(linux.SIGKILL))
 	}
 	return nil
 }

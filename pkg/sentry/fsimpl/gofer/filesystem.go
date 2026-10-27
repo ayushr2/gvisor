@@ -610,6 +610,19 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	}
 	parent.childrenMu.Unlock()
 
+	if !dir && rp.MustBeDir() {
+		// The trailing slash makes this fail regardless, but the error depends
+		// on whether the child exists and is a directory.
+		child, err := fs.getChildLocked(ctx, parent, name, &ds)
+		if err != nil {
+			return err
+		}
+		if child.isDir() {
+			return linuxerr.EISDIR
+		}
+		return linuxerr.ENOTDIR
+	}
+
 	// Load child if sticky bit is set because we need to determine whether
 	// deletion is allowed.
 	var child *dentry
@@ -687,12 +700,6 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		if child != nil && child.isDir() {
 			vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
 			return linuxerr.EISDIR
-		}
-		if rp.MustBeDir() {
-			if child != nil {
-				vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
-			}
-			return linuxerr.ENOTDIR
 		}
 	}
 	if parent.inode.isSynthetic() {
@@ -856,14 +863,14 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		// If the parent is a setgid directory, use the parent's GID
 		// rather than the caller's and enable setgid.
-		kgid := creds.EffectiveKGID
+		kgid := creds.FilesystemKGID
 		mode := opts.Mode
 		if parent.inode.mode.Load()&linux.S_ISGID != 0 {
 			kgid = auth.KGID(parent.inode.gid.Load())
 			mode |= linux.S_ISGID
 		}
 
-		child, err := parent.mkdir(ctx, name, mode, creds.EffectiveKUID, kgid, true /* createDentry */)
+		child, err := parent.mkdir(ctx, name, mode, creds.FilesystemKUID, kgid, true /* createDentry */)
 		if err == nil {
 			if fs.opts.interop != InteropModeShared {
 				parent.incLinks()
@@ -879,8 +886,8 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		child = fs.newSyntheticDentry(&createSyntheticOpts{
 			name: name,
 			mode: linux.S_IFDIR | opts.Mode,
-			kuid: creds.EffectiveKUID,
-			kgid: creds.EffectiveKGID,
+			kuid: creds.FilesystemKUID,
+			kgid: creds.FilesystemKGID,
 		})
 		if fs.opts.interop != InteropModeShared {
 			parent.incLinks()
@@ -894,8 +901,8 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		child := fs.newSyntheticDentry(&createSyntheticOpts{
 			name: name,
 			mode: linux.S_IFDIR | opts.Mode,
-			kuid: creds.EffectiveKUID,
-			kgid: creds.EffectiveKGID,
+			kuid: creds.FilesystemKUID,
+			kgid: creds.FilesystemKGID,
 		})
 		parent.incLinks()
 		return child, nil
@@ -931,16 +938,16 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			return fs.newSyntheticDentry(&createSyntheticOpts{
 				name:     name,
 				mode:     opts.Mode,
-				kuid:     creds.EffectiveKUID,
-				kgid:     creds.EffectiveKGID,
+				kuid:     creds.FilesystemKUID,
+				kgid:     creds.FilesystemKGID,
 				endpoint: opts.Endpoint,
 			}), nil
 		case linux.S_IFIFO:
 			return fs.newSyntheticDentry(&createSyntheticOpts{
 				name: name,
 				mode: opts.Mode,
-				kuid: creds.EffectiveKUID,
-				kgid: creds.EffectiveKGID,
+				kuid: creds.FilesystemKUID,
+				kgid: creds.FilesystemKGID,
 				pipe: pipe.NewVFSPipe(true /* isNamed */, pipe.DefaultPipeSize),
 			}), nil
 		}
@@ -1090,6 +1097,13 @@ var logUnimplementedBlockDevOpenOnce sync.Once
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 
+	if ft := d.inode.fileType(); opts.FileExec && ft != linux.S_IFREG && ft != linux.S_IFLNK {
+		// Only regular files may be executed; reject before the open can
+		// block (e.g. on a FIFO with no writer), as in Linux's
+		// fs/namei.c:may_open(). Symlinks are exempt so that they produce
+		// ELOOP below, also per may_open().
+		return nil, linuxerr.EACCES
+	}
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
@@ -1101,12 +1115,8 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, err
 		}
 	}
-	if !d.inode.isSynthetic() {
-		// renameMu is locked here because it is required by d.openHandle(), which
-		// is called by d.ensureSharedHandle() and d.openSpecialFile() below. It is
-		// also required by d.connect() which is called by
-		// d.openSocketByConnecting(). Note that opening non-synthetic pipes may
-		// block, renameMu is unlocked separately in d.openSpecialFile() for pipes.
+	if d.inode.fileType() == linux.S_IFSOCK && !d.inode.isSynthetic() {
+		// d.connect(), called by d.openSocketByConnecting(), requires renameMu.
 		d.inode.fs.renameMu.RLock()
 		defer d.inode.fs.renameMu.RUnlock()
 	}
@@ -1129,7 +1139,10 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	switch d.inode.fileType() {
 	case linux.S_IFREG:
 		if !d.inode.fs.opts.regularFilesUseSpecialFileFD {
-			if err := d.ensureSharedHandle(ctx, ats.MayRead(), ats.MayWrite(), trunc); err != nil {
+			// Exec opens need a readable handle even without read permission;
+			// the sentry must read the executable to load it.
+			needReadHandle := ats.MayRead() || opts.FileExec
+			if err := d.ensureSharedHandle(ctx, needReadHandle, ats.MayWrite(), trunc); err != nil {
 				return nil, err
 			}
 			fd, err := newRegularFileFD(mnt, d, opts.Flags, rp.Credentials())
@@ -1200,20 +1213,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			emulate = rp.VirtualFilesystem().IsDeviceRegistered(vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor)
 		}
 		if emulate {
-			// Dispatch to the sentry's device registry with renameMu dropped (so
-			// that it may block and lock in peace).
-			//
-			// It is safe because renameMu guards the dentry tree (parents, names,
-			// children); this dispatch consults none of it. It passes only mnt,
-			// &d.vfsd, and the immutable device numbers, and d stays alive across
-			// the window because the caller holds a reference on it (see the
-			// child.IncRef in the open path). A concurrent rename may relink d
-			// while we are unlocked, but we read no tree state afterwards: we
-			// re-acquire only to satisfy the deferred RUnlock and return at once.
-			d.inode.fs.renameMu.RUnlock()
-			fd, err := rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, mnt, &d.vfsd, vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor, opts)
-			d.inode.fs.renameMu.RLock()
-			return fd, err
+			return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, mnt, &d.vfsd, vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor, opts)
 		}
 	case linux.S_IFBLK:
 		// This should be unreachable: block devices are rejected at walk time
@@ -1276,8 +1276,7 @@ func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptio
 
 // Preconditions:
 //   - !d.inode.isSynthetic().
-//   - fs.renameMu is locked. It may be released temporarily while pipe blocks.
-//   - If d is a pipe, no other locks (other than fs.renameMu) should be held.
+//   - If d is a pipe, no locks should be held.
 func (d *dentry) openSpecialFile(ctx context.Context, mnt *vfs.Mount, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if opts.Flags&linux.O_DIRECT != 0 && !d.inode.isRegularFile() {
@@ -1292,18 +1291,17 @@ func (d *dentry) openSpecialFile(ctx context.Context, mnt *vfs.Mount, opts *vfs.
 	// open, not whether the pipe was *previously* opened by a peer that has
 	// since closed its end.
 	isBlockingOpenOfNamedPipe := d.inode.fileType() == linux.S_IFIFO && opts.Flags&linux.O_NONBLOCK == 0
+	// Exec opens need a readable handle even without read permission; the
+	// sentry must read the executable to load it.
+	needReadHandle := ats.MayRead() || opts.FileExec
 retry:
-	h, err := d.openHandle(ctx, ats.MayRead(), ats.MayWrite(), opts.Flags&linux.O_TRUNC != 0)
+	h, err := d.openHandle(ctx, needReadHandle, ats.MayWrite(), opts.Flags&linux.O_TRUNC != 0)
 	if err != nil {
 		if isBlockingOpenOfNamedPipe && ats == vfs.MayWrite && linuxerr.Equals(linuxerr.ENXIO, err) {
 			// An attempt to open a named pipe with O_WRONLY|O_NONBLOCK fails
 			// with ENXIO if opening the same named pipe with O_WRONLY would
-			// block because there are no readers of the pipe. Release renameMu
-			// while blocking.
-			d.inode.fs.renameMu.RUnlock()
-			err := sleepBetweenNamedPipeOpenChecks(ctx)
-			d.inode.fs.renameMu.RLock()
-			if err != nil {
+			// block because there are no readers of the pipe.
+			if err := sleepBetweenNamedPipeOpenChecks(ctx); err != nil {
 				return nil, err
 			}
 			goto retry
@@ -1311,11 +1309,7 @@ retry:
 		return nil, err
 	}
 	if isBlockingOpenOfNamedPipe && ats == vfs.MayRead && h.fd >= 0 {
-		// Release renameMu while blocking.
-		d.inode.fs.renameMu.RUnlock()
-		err := blockUntilNonblockingPipeHasWriter(ctx, h.fd)
-		d.inode.fs.renameMu.RLock()
-		if err != nil {
+		if err := blockUntilNonblockingPipeHasWriter(ctx, h.fd); err != nil {
 			h.close(ctx)
 			return nil, err
 		}
@@ -1351,12 +1345,12 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	name := rp.Component()
 	// If the parent is a setgid directory, use the parent's GID rather
 	// than the caller's.
-	kgid := creds.EffectiveKGID
+	kgid := creds.FilesystemKGID
 	if d.inode.mode.Load()&linux.S_ISGID != 0 {
 		kgid = auth.KGID(d.inode.gid.Load())
 	}
 
-	child, h, err := d.openCreate(ctx, name, opts.Flags&linux.O_ACCMODE, opts.Mode, creds.EffectiveKUID, kgid, true /* createDentry */)
+	child, h, err := d.openCreate(ctx, name, opts.Flags&linux.O_ACCMODE, opts.Mode, creds.FilesystemKUID, kgid, true /* createDentry */)
 	if err != nil {
 		return nil, err
 	}
@@ -1537,7 +1531,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		newParent.opMu.Lock()
 		defer newParent.opMu.Unlock()
 	}
-	if newParent.isDeleted() {
+	if oldParent.isDeleted() || newParent.isDeleted() {
 		return linuxerr.ENOENT
 	}
 	replaced, err := fs.getChildLocked(ctx, newParent, newName, &ds) // +checklocksforce: newParent.opMu taken if newParent != oldParent.

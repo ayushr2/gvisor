@@ -49,6 +49,11 @@ func (c *mockClocks) MonotonicRawEnabled() bool {
 	return c.monotonicRawEnabled
 }
 
+// TSCSnapshot implements sentrytime.Clocks.TSCSnapshot. It reports no snapshot.
+func (*mockClocks) TSCSnapshot() (sentrytime.TSCSnapshot, bool) {
+	return sentrytime.TSCSnapshot{}, false
+}
+
 // GetTime implements sentrytime.Clocks.GetTime.
 func (c *mockClocks) GetTime(id sentrytime.ClockID) (int64, error) {
 	c.mu.Lock()
@@ -73,7 +78,7 @@ func (c *mockClocks) GetTime(id sentrytime.ClockID) (int64, error) {
 func stateTestClocklessTimekeeper(tb testing.TB) (*Timekeeper, *VDSOParamPage) {
 	ctx := contexttest.Context(tb)
 	mf := pgalloc.MemoryFileFromContext(ctx)
-	fr, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	fr, err := mf.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		tb.Fatalf("failed to allocate memory: %v", err)
 	}

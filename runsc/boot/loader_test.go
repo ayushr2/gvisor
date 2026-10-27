@@ -36,15 +36,18 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
-	"gvisor.dev/gvisor/runsc/fsgofer"
+	fsgofer "gvisor.dev/gvisor/runsc/gofer/fs"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+// procSelfFD is passed as Args.ProcSelfFD to every loader created by tests.
+var procSelfFD int
 
 func init() {
 	// Reserve the initial thread for main so capability tests use threads that
@@ -56,6 +59,11 @@ func init() {
 	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
 	}
+	fd, err := unix.Open("/proc/self/fd", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		panic(err)
+	}
+	procSelfFD = fd
 }
 
 func testConfig() *config.Config {
@@ -157,6 +165,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		GoferMountConfs:  []specutils.GoferMountConf{{Lower: specutils.Lisafs, Upper: specutils.NoOverlay}},
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
+		ProcSelfFD:       procSelfFD,
 		RootfsUpperTarFD: -1,
 		CPUDMALatencyFD:  -1,
 	}
@@ -252,6 +261,23 @@ func TestStartSignal(t *testing.T) {
 		// OK.
 	case <-time.After(50 * time.Millisecond):
 		t.Errorf("WaitForStartSignal did not complete but it should have")
+	}
+}
+
+// TestRestoreFailBeforeStart checks that a restore that fails before it starts
+// restoring reports the failure.
+func TestRestoreFailBeforeStart(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+	if err := l.ctrl.manager.Restore(&sentryapi.RestoreOpts{}, nil); err == nil {
+		t.Fatalf("restoring without files succeeded")
+	}
+	if err := l.waitRestore(); err == nil {
+		t.Errorf("waiting for the failed restore succeeded")
 	}
 }
 
@@ -643,7 +669,6 @@ func TestCreateMountPoint(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	cpuid.Initialize()
-	seccheck.Initialize()
 	os.Exit(m.Run())
 }
 
@@ -664,14 +689,14 @@ func TestNetworkConfig(t *testing.T) {
 		l.ctrl.manager.startResultChan <- nil
 	}()
 
-	args := &CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{
 			{
 				Name: "lo",
-				Addresses: []IPWithPrefix{
+				Addresses: []sentryapi.IPWithPrefix{
 					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
 				},
-				Routes: []Route{
+				Routes: []sentryapi.Route{
 					{
 						Destination: net.IPNet{
 							IP:   net.IP{127, 0, 0, 0},
@@ -685,7 +710,7 @@ func TestNetworkConfig(t *testing.T) {
 	if err := l.ctrl.manager.SetNetworkArgs(args, nil); err != nil {
 		t.Errorf("error calling SetNetworkConfig: %v", err)
 	}
-	var networkArgs CreateLinksAndRoutesArgs
+	var networkArgs sentryapi.CreateLinksAndRoutesArgs
 	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
 		t.Errorf("error calling NetworkConfig: %v", err)
 	}

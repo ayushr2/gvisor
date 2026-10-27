@@ -81,6 +81,7 @@ def _syscall_test(
         tags,
         debug,
         network = "none",
+        limit_ephemeral_ports = False,
         file_access = "exclusive",
         overlay = False,
         add_host_uds = False,
@@ -95,12 +96,15 @@ def _syscall_test(
         leak_check = False,
         save = False,
         save_resume = False,
-        netstack_sr = False,
         nftables = False,
         kvm_use_cpu_nums = True,
         in_sandbox_cgroup = "v1",
         requires_atime = False,
         **kwargs):
+    limit_ephemeral_ports = limit_ephemeral_ports and (network == "host" or platform == "native")
+    if limit_ephemeral_ports:
+        container = True
+
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
 
@@ -120,8 +124,6 @@ def _syscall_test(
         name += "_save"
     if save_resume:
         name += "_save_resume"
-    if save and netstack_sr:
-        name += "_netstack_save"
     if nftables:
         name += "_nftables"
 
@@ -195,13 +197,15 @@ def _syscall_test(
         "--leak-check=" + str(leak_check),
         "--save=" + str(save),
         "--save-resume=" + str(save_resume),
-        "--netstack-sr=" + str(netstack_sr),
         "--nftables=" + str(nftables),
         "--kvm-use-cpu-nums=" + str(kvm_use_cpu_nums),
     ]
 
     if in_sandbox_cgroup:
         runner_args.append("--in-sandbox-cgroup=" + in_sandbox_cgroup)
+
+    if limit_ephemeral_ports:
+        runner_args.append("--limit-ephemeral-ports")
 
     # Trace points are platform agnostic, so enable them for ptrace only.
     if platform == "ptrace":
@@ -247,7 +251,6 @@ def syscall_test_variants(
         size = "medium",
         timeout = None,
         overlay = False,
-        netstack_sr = False,
         nftables = False,
         kvm_use_cpu_nums = False,
         in_sandbox_cgroup = "v1",
@@ -277,7 +280,6 @@ def syscall_test_variants(
       timeout: timeout for the test.
       save_resume: save resume test.
       overlay: add overlayfs test variants.
-      netstack_sr: if save is true, add netstack save/restore test variants.
       nftables: if nftables is true, enable nftables.
       kvm_use_cpu_nums: use cpu numbers in kvm platform.
       in_sandbox_cgroup: cgroup version to use inside the sandbox.
@@ -306,7 +308,6 @@ def syscall_test_variants(
             size = size,
             timeout = timeout,
             overlay = overlay,
-            netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
@@ -333,7 +334,6 @@ def syscall_test_variants(
             save_resume = save_resume,
             size = size,
             timeout = timeout,
-            netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
@@ -362,7 +362,6 @@ def syscall_test_variants(
             save_resume = save_resume,
             size = size,
             timeout = timeout,
-            netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
@@ -389,7 +388,6 @@ def syscall_test_variants(
             save_resume = save_resume,
             size = size,
             timeout = timeout,
-            netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
@@ -414,7 +412,6 @@ def syscall_test_variants(
             save_resume = save_resume,
             size = size,
             timeout = timeout,
-            netstack_sr = netstack_sr,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
@@ -442,7 +439,6 @@ def syscall_test(
         save = None,
         size = "medium",
         overlay = False,
-        netstack_sr = False,
         nftables = False,
         perf = False,
         kvm_use_cpu_nums = False,
@@ -471,7 +467,6 @@ def syscall_test(
       save: enables save/restore and save/resume test variants.
       size: test size.
       overlay: add overlayfs test variants.
-      netstack_sr: if save is true, add netstack save/restore test variants.
       nftables: if nftables is true, enable nftables.
       perf: test is a benchmark.
       kvm_use_cpu_nums: use cpu numbers in kvm platform.
@@ -532,7 +527,6 @@ def syscall_test(
         False,  # save_resume, generate all tests without save_resume variant.
         size,
         overlay = overlay,
-        netstack_sr = False,
         nftables = nftables,
         kvm_use_cpu_nums = kvm_use_cpu_nums,
         in_sandbox_cgroup = in_sandbox_cgroup,
@@ -565,41 +559,11 @@ def syscall_test(
             False,  # save_resume, generate all tests without save_resume variant.
             "large",  # size, use size as large by default for all S/R tests.
             "long",  # timeout, use long timeout for S/R tests.
-            netstack_sr = False,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,
             **kwargs
         )
-
-        if netstack_sr:
-            syscall_test_variants(
-                test,
-                use_tmpfs,
-                add_fusefs,
-                add_overlay,
-                add_host_uds,
-                add_host_connector,
-                add_host_fifo,
-                add_host_tty,
-                add_hostinet,
-                add_directfs,
-                one_sandbox,
-                iouring,
-                allow_native,
-                leak_check,
-                debug,
-                container,
-                tags,
-                True,  # save, generate all tests with save variant.
-                False,  # save_resume, generate all tests without save_resume variant.
-                "large",  # size, use size as large by default for all S/R tests.
-                "long",  # timeout, use long timeout for S/R tests.
-                netstack_sr = True,  # netstack_sr, generate all tests with netstack s/r.
-                nftables = nftables,
-                kvm_use_cpu_nums = kvm_use_cpu_nums,
-                **kwargs
-            )
 
         # Add save resume variant to all other variants generated above.
         syscall_test_variants(
@@ -624,7 +588,6 @@ def syscall_test(
             True,  # save_resume, generate all tests with save_resume variant.
             "large",  # size, use size as large by default for all S/R tests.
             "long",  # timeout, use long timeout for S/R tests.
-            netstack_sr = False,
             nftables = nftables,
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             in_sandbox_cgroup = in_sandbox_cgroup,

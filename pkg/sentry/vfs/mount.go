@@ -433,6 +433,28 @@ func (vfs *VirtualFilesystem) mountHasLockedChildren(mnt *Mount, vd VirtualDentr
 	return false
 }
 
+// CheckClonePrivateMount returns a non-nil error if a private mount without
+// submounts cannot be cloned from vd, as Linux's clone_private_mount() checks:
+// vd's mount must be in the caller's mount namespace or be the root of an
+// anonymous mount namespace, creds must hold CAP_SYS_ADMIN in the user
+// namespace owning vd's mount namespace, and no locked mount can be mounted at
+// or below vd.
+func (vfs *VirtualFilesystem) CheckClonePrivateMount(ctx context.Context, creds *auth.Credentials, vd VirtualDentry) error {
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+	mnt := vd.mount
+	if !vfs.validInMountNS(ctx, mnt) && (mnt.umounted || mnt.ns == nil || !mnt.ns.anon || mnt != mnt.ns.root) {
+		return linuxerr.EINVAL
+	}
+	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, mnt.ns.Owner) {
+		return linuxerr.EPERM
+	}
+	if vfs.mountHasLockedChildren(mnt, vd) {
+		return linuxerr.EINVAL
+	}
+	return nil
+}
+
 // ConnectMountAt connects mnt at the path represented by target.
 //
 // Preconditions: mnt must be disconnected.
@@ -469,7 +491,7 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 // Roughly analogous to Linux fs/namespace.c:do_move_mount().
 func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Credentials, taskMountNs *MountNamespace, source *PathOperation, target *PathOperation) error {
 	// Lookup the source path
-	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{CheckSearchable: true})
+	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{})
 	if err != nil {
 		return err
 	}
@@ -493,7 +515,7 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 	}
 
 	// Lookup the target path
-	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{CheckSearchable: true})
+	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
 	if err != nil {
 		return err
 	}
