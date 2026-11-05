@@ -19,12 +19,14 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -97,6 +99,100 @@ func TestReadCPUFile(t *testing.T) {
 		}
 		if diff := cmp.Diff(expected, content); diff != "" {
 			t.Fatalf("Read returned unexpected data:\n--- want\n+++ got\n%v", diff)
+		}
+	}
+}
+
+func TestCPUDir(t *testing.T) {
+	// The test kernel has GOMAXPROCS application cores. Make sure that there
+	// are several, so that the per-CPU masks are not all the same.
+	const minCores = 4
+	if prev := runtime.GOMAXPROCS(0); prev < minCores {
+		runtime.GOMAXPROCS(minCores)
+		defer runtime.GOMAXPROCS(prev)
+	}
+	s := newTestSystem(t, "" /*pciTestDir*/)
+	defer s.Destroy()
+	cores := kernel.KernelFromContext(s.Ctx).ApplicationCores()
+	if cores < minCores {
+		t.Fatalf("test kernel has %d cores, want at least %d", cores, minCores)
+	}
+
+	nlink := func(p string) uint32 {
+		t.Helper()
+		stat, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot(p), &vfs.StatOptions{Mask: linux.STATX_NLINK})
+		if err != nil {
+			t.Fatalf("StatAt(%s): %v", p, err)
+		}
+		return stat.Nlink
+	}
+	// Directories are populated on first use. Their link count, which
+	// depends on their children, must be right before that.
+	if got, want := nlink("devices/system/cpu"), uint32(2+cores); got != want {
+		t.Errorf("cpu link count: got %d, want %d", got, want)
+	}
+	if got, want := nlink("devices/system/cpu/cpu1"), uint32(3); got != want {
+		t.Errorf("cpu1 link count: got %d, want %d", got, want)
+	}
+
+	want := map[string]testutil.DirentType{
+		"online":   linux.DT_REG,
+		"possible": linux.DT_REG,
+		"present":  linux.DT_REG,
+	}
+	for i := uint(0); i < cores; i++ {
+		want[fmt.Sprintf("cpu%d", i)] = linux.DT_DIR
+	}
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("devices/system/cpu")), want)
+
+	// Populate cpu0 while leaving cpu1 unpopulated; rmdir must fail with
+	// ENOTEMPTY whether populated or not.
+	s.ListDirents(s.PathOpAtRoot("devices/system/cpu/cpu0"))
+	for _, p := range []string{"devices/system/cpu/cpu0", "devices/system/cpu/cpu1"} {
+		if err := s.VFS.RmdirAt(s.Ctx, s.Creds, s.PathOpAtRoot(p)); !linuxerr.Equals(linuxerr.ENOTEMPTY, err) {
+			t.Errorf("RmdirAt(%s): got error %v, want ENOTEMPTY", p, err)
+		}
+	}
+
+	// mask returns the expected sysfs CPU mask with the given CPUs set.
+	mask := func(set func(cpu uint) bool) string {
+		var words []string
+		for base := uint(0); base < cores; base += 32 {
+			var w uint32
+			for b := uint(0); b < 32 && base+b < cores; b++ {
+				if set(base + b) {
+					w |= 1 << b
+				}
+			}
+			width := 8
+			if base+32 > cores {
+				width = int(cores-base+3) / 4
+			}
+			words = append([]string{fmt.Sprintf("%0*x", width, w)}, words...)
+		}
+		return strings.Join(words, ",") + "\n"
+	}
+	fullMask := mask(func(uint) bool { return true })
+	for i := uint(0); i < cores; i++ {
+		dir := fmt.Sprintf("devices/system/cpu/cpu%d", i)
+		s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot(dir)), map[string]testutil.DirentType{
+			"topology": linux.DT_DIR,
+		})
+		oneMask := mask(func(cpu uint) bool { return cpu == i })
+		for name, want := range map[string]string{
+			"core_cpus":       oneMask,
+			"core_siblings":   fullMask,
+			"package_cpus":    fullMask,
+			"thread_siblings": oneMask,
+		} {
+			p := path.Join(dir, "topology", name)
+			got, err := readTestFile(s, p)
+			if err != nil {
+				t.Fatalf("reading %s: %v", p, err)
+			}
+			if got != want {
+				t.Errorf("%s: got %q, want %q", p, got, want)
+			}
 		}
 	}
 }
@@ -230,7 +326,7 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	if err := os.MkdirAll(pciPath0, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
-	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0000:10")
+	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0007:10")
 	if err := os.MkdirAll(pciPath1, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
@@ -261,14 +357,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		{
 			group:             "2",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0",
+			pciAddress:        "0007:10:05.0",
 			name:              "vfio2",
 			nestedDeviceIndex: 3,
 		},
 		{
 			group:             "3",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0/0000:03:00.1",
+			pciAddress:        "0007:10:05.0/0007:03:00.1",
 			name:              "vfio3",
 			nestedDeviceIndex: -1,
 		},
@@ -298,6 +394,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 			t.Fatalf("Failed to symlink iommu_groups directory: %v", err)
 		}
 	}
+	// Non-PCI platform devices in IOMMU groups (e.g. on ARM64 hosts) must be ignored.
+	nonPCIIOMMUPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", "4", "devices")
+	if err := os.MkdirAll(nonPCIIOMMUPath, 0755); err != nil {
+		t.Fatalf("Failed to create non-PCI iommu_groups directory: %v", err)
+	}
+	if err := os.Symlink("../../../../devices/platform/arm-smmu-v3.0.auto", path.Join(nonPCIIOMMUPath, "arm-smmu-v3.0.auto")); err != nil {
+		t.Fatalf("Failed to symlink non-PCI iommu_group device: %v", err)
+	}
 	s := newTestSystem(t, sysfsTestDir)
 	defer s.Destroy()
 
@@ -324,6 +428,137 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 			path.Base(device.pciAddress): linux.DT_LNK,
 		})
 	}
+
+	// Read iommu_group symlinks via /bus/pci/devices to populate cached dentries.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/0"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/1"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Fatalf("ReadlinkAt(%q) = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+	}
+
+	// Swap IOMMU groups 0 and 1 on the host and run CompleteRestore.
+	for _, swap := range []struct {
+		pciAddr  string
+		oldGroup string
+		newGroup string
+	}{
+		{"0000:00:04.0", "0", "1"},
+		{"0000:00:05.0", "1", "0"},
+	} {
+		iommuLink := path.Join(pciPath0, swap.pciAddr, "iommu_group")
+		if err := os.Remove(iommuLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_group symlink: %v", err)
+		}
+		if err := os.Symlink(path.Join("..", "..", "..", "kernel", "iommu_groups", swap.newGroup), iommuLink); err != nil {
+			t.Fatalf("Failed to create new iommu_group symlink: %v", err)
+		}
+		oldDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.oldGroup, "devices", swap.pciAddr)
+		if err := os.Remove(oldDevLink); err != nil {
+			t.Fatalf("Failed to remove old iommu_groups device symlink: %v", err)
+		}
+	}
+	for _, swap := range []struct {
+		pciAddr  string
+		newGroup string
+	}{
+		{"0000:00:04.0", "1"},
+		{"0000:00:05.0", "0"},
+	} {
+		newDevLink := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", swap.newGroup, "devices", swap.pciAddr)
+		if err := os.Symlink(path.Join("..", "..", "..", "..", "devices", "pci0000:00", swap.pciAddr), newDevLink); err != nil {
+			t.Fatalf("Failed to create new iommu_groups device symlink: %v", err)
+		}
+	}
+
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+
+	// Verify that cached dentries were invalidated and the new IOMMU groups are visible.
+	for _, tc := range []struct {
+		pciAddr   string
+		wantGroup string
+		groupNum  string
+	}{
+		{"0000:00:04.0", "../../../kernel/iommu_groups/1", "1"},
+		{"0000:00:05.0", "../../../kernel/iommu_groups/0", "0"},
+	} {
+		pop := s.PathOpAtRoot(path.Join("bus", "pci", "devices", tc.pciAddr, "iommu_group"))
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q) after CompleteRestore failed: %v", tc.pciAddr, err)
+		}
+		if got != tc.wantGroup {
+			t.Errorf("ReadlinkAt(%q) after CompleteRestore = %q, want %q", tc.pciAddr, got, tc.wantGroup)
+		}
+		pop = s.PathOpAtRoot(path.Join("kernel", "iommu_groups", tc.groupNum, "devices"))
+		s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+			tc.pciAddr: linux.DT_LNK,
+		})
+	}
+}
+
+// Check that the DMI entries exist after mount and after CompleteRestore
+// rebuilds /sys/class and /sys/devices.
+func TestProductNameCompleteRestore(t *testing.T) {
+	sysfsTestDir := t.TempDir()
+	for _, dir := range []string{
+		path.Join(sysfsTestDir, "sys", "devices"),
+		path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create %q: %v", dir, err)
+		}
+	}
+	const productName = "Test Product"
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		ProductName:         productName,
+		EnableTPUProxyPaths: true,
+		TestSysfsPathPrefix: sysfsTestDir,
+	})
+	defer s.Destroy()
+
+	checkDMI := func(stage string) {
+		t.Helper()
+		pop := s.PathOpAtRoot("devices/virtual/dmi/id/product_name")
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("%s: OpenAt(product_name) failed: %v", stage, err)
+		}
+		defer fd.DecRef(s.Ctx)
+		content, err := s.ReadToEnd(fd)
+		if err != nil {
+			t.Fatalf("%s: Read(product_name) failed: %v", stage, err)
+		}
+		if want := productName + "\n"; content != want {
+			t.Errorf("%s: product_name = %q, want %q", stage, content, want)
+		}
+		pop = s.PathOpAtRoot("class/dmi/id")
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("%s: ReadlinkAt(class/dmi/id) failed: %v", stage, err)
+		}
+		if want := "../../devices/virtual/dmi/id"; got != want {
+			t.Errorf("%s: ReadlinkAt(class/dmi/id) = %q, want %q", stage, got, want)
+		}
+	}
+
+	checkDMI("before CompleteRestore")
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+	checkDMI("after CompleteRestore")
 }
 
 // rdmaTestPCIConfig is a fake raw PCI config space blob; deliberately not

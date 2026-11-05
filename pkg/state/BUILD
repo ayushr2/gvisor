@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -71,11 +71,24 @@ go_library(
         "deferred_list.go",
         "encode.go",
         "encode_unsafe.go",
+        "graph_addrmap.go",
+        "graph_buf_unsafe.go",
+        "graph_decode_callbacks_unsafe.go",
+        "graph_decode_unsafe.go",
+        "graph_decode_values_unsafe.go",
+        "graph_encode_objects_unsafe.go",
+        "graph_encode_stream_unsafe.go",
+        "graph_encode_unsafe.go",
+        "graph_encode_values_unsafe.go",
+        "graph_print_unsafe.go",
+        "graph_typecache_unsafe.go",
+        "graph_typeinfo_unsafe.go",
         "ods_list.go",
         "state.go",
         "state_norace.go",
         "state_race.go",
         "stats.go",
+        "typed.go",
         "types.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/state",
@@ -88,4 +101,19 @@ go_library(
         "//pkg/gohacks",
         "//pkg/state/wire",
     ],
+)
+
+go_test(
+    name = "state_test",
+    size = "small",
+    srcs = [
+        "graph_addrmap_test.go",
+        "graph_buf_test.go",
+        "graph_decode_callbacks_test.go",
+        "graph_print_test.go",
+        "graph_typeinfo_test.go",
+        "types_test.go",
+    ],
+    embed = [":state"],
+    deps = ["//pkg/state/wire"],
 )

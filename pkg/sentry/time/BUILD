@@ -24,6 +24,7 @@ go_library(
         "calibrated_clock.go",
         "clock_id.go",
         "clocks.go",
+        "host_tsc.go",
         "muldiv_amd64.s",
         "muldiv_arm64.s",
         "parameters.go",
@@ -33,9 +34,10 @@ go_library(
         "seqatomic_parameters_unsafe.go",
         "tsc_amd64.s",
         "tsc_arm64.s",
+        "tsc_offset_unsafe.go",
         "vdso.go",
-        "vdso_amd64.s",
-        "vdso_arm64.s",
+        "vdso_amd64.tmpl.s",
+        "vdso_arm64.tmpl.s",
     ],
     visibility = ["//:sandbox"],
     deps = [
@@ -55,12 +57,25 @@ go_test(
         "calibrated_clock_test.go",
         "parameters_test.go",
         "sampler_test.go",
+        "tsc_offset_test.go",
         "vdso_test.go",
     ],
     embed = [":time"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/sync",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "vdso_test",
+    srcs = ["vdso_test.go"],
+    embed = [":time"],
+    pure = True,
+    tags = ["nogotsan"],
+    deps = [
+        "//pkg/abi/linux",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

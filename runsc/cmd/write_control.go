@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -66,7 +66,7 @@ func (r *WriteControl) SetFlags(f *flag.FlagSet) {}
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (r *WriteControl) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -81,12 +81,12 @@ func (r *WriteControl) Execute(_ context.Context, f *flag.FlagSet, args ...any) 
 	}
 
 	conf := args[0].(*config.Config)
-	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
+	c, err := r.loadContainer(conf, f, container.LoadOpts{SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
 
-	err = c.Sandbox.CgroupsWriteControlFile(control.CgroupControlFile{
+	err = c.Sandbox.CgroupsWriteControlFile(controlapi.CgroupControlFile{
 		Controller: f.Arg(1),
 		Path:       f.Arg(2),
 		Name:       f.Arg(3),

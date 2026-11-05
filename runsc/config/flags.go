@@ -28,6 +28,10 @@ import (
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
+// PlatformAuto is the --platform value that selects the best platform usable
+// on the host. runsc replaces it with a concrete platform at startup.
+const PlatformAuto = "auto"
+
 // Reused flag names.
 const (
 	flagDebug                   = "debug"
@@ -89,6 +93,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Metrics flags.
 	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%RUNTIME_ROOT%' will be replaced by the root directory. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
 	flagSet.String("final-metrics-log", "", "if set, write all metric data to this file upon sandbox termination")
+	flagSet.String("boot-times-log", "", "if set, write the startup timeline of the sandbox to this file as JSON when the sandbox starts")
 	flagSet.String("profiling-metrics", "", "comma separated list of metric names which are going to be written to the profiling-metrics-log file from within the sentry in CSV format. profiling-metrics will be snapshotted at a rate specified by profiling-metrics-rate-us. Requires profiling-metrics-log to be set. (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profiling-metrics-log", "", "file name to use for profiling-metrics output; use the special value '-' to write to the user-visible logs. (DO NOT USE IN PRODUCTION)")
 	flagSet.Int("profiling-metrics-rate-us", 1000, "the target rate (in microseconds) at which profiling metrics will be snapshotted.")
@@ -100,8 +105,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("strace-event", false, "send strace to event.")
 
 	// Flags that control sandbox runtime behavior.
-	flagSet.String("platform", "systrap", "specifies which platform to use: systrap (default), ptrace, kvm.")
-	flagSet.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
+	flagSet.String("platform", "systrap", "specifies which platform to use: systrap (default), ptrace, kvm, auto. auto picks the best platform usable on the host.")
+	flagSet.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform), or comma-separated platform=path pairs (e.g. kvm=/dev/kvm2) that apply only to the named platforms. "+
+		"If unset, will use a sane platform-specific default. --platform=auto accepts only platform=path pairs.")
 	flagSet.String("watchdog-action", "log", "sets what action the watchdog takes when triggered: log (default), panic.")
 	flagSet.Int("panic-signal", -1, "register signal handling that panics. Usually set to SIGUSR2(12) to troubleshoot hangs. -1 disables it.")
 	flagSet.Int("dump-goroutines-signal", -1, "register signal handling that dumps all goroutine stacks. -1 disables it.")
@@ -121,7 +127,10 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("pod-init-config", "", "path to configuration file with additional steps to take during pod creation.")
 	flagSet.Var(HostSettingsCheck.Ptr(), "host-settings", "how to handle non-optimal host kernel settings: check (default, advisory-only), ignore (do not check), adjust (best-effort auto-adjustment), or enforce (auto-adjustment must succeed).")
 	flagSet.Var(SidecarReleaseIfReleaseBuild.Ptr(), "sidecar-release-enforcement-policy", "when spawned sidecar binaries must match runsc's release: NEVER, ALWAYS, or IF_RELEASE_BUILD. May be overridden by setting GVISOR_ENFORCE_RELEASE=SKIP as env var.")
-	flagSet.Var(SidecarUsageDefault.Ptr(), "sidecar-usage-policy", "policy for sidecar binaries: STRICT (sidecars must exist), LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK (use embedded fallbacks if sidecars are missing; will stop working after 2026-10).")
+	creationCPUPolicy := DefaultSandboxCreationCPUPolicy
+	flagSet.Var(&creationCPUPolicy, "sandbox-creation-cpu-policy", "CPU limit applied during sandbox creation and initialization, until the application starts. Takes the same values, and applies under the same conditions, as --sandbox-lifecycle-cpu-policy. Note that pre-cgroup-setup sandbox creation steps are not CPU-limited regardless of this flag's value. If you need to limit end-to-end sandbox creation, run gVisor in a CPU-limited cgroup.")
+	lifecycleCPUPolicy := DefaultSandboxLifecycleCPUPolicy
+	flagSet.Var(&lifecycleCPUPolicy, "sandbox-lifecycle-cpu-policy", "CPU limit of non-creation sandbox lifecycle operations: checkpoint, restore, and teardown (while the application is not running). Values: 'uncapped', '<N>m' (thousandths of a CPU, e.g. 2500m), '<N>x' (multiple of the OCI spec limit, e.g. 3.5x), or 'max(<value>,...)' for the largest of several values. 1x naturally means the OCI-spec-provided limit, and the limit never goes below it. Only applies when the OCI spec sets a CPU quota (`linux.resources.cpu.quota`, or `cpu.max` in `linux.resources.unified`), and only when `runsc` creates the sandbox cgroup itself; never to pods or pre-existing cgroups.")
 	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
 	flagSet.Bool("systrap-disable-syscall-patching", false, "disables syscall patching when using the Systrap platform. May be necessary to use in case the workload uses the GS register, or uses ptrace within gVisor. Has significant performance implications and is only recommended when the sandbox is known to run otherwise-incompatible workloads. Only relevant for x86.")
 	flagSet.Bool("systrap-disable-fast-path", false, "unconditionally disables the Systrap fast path.")
@@ -144,9 +153,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 		"    'mount' can be 'root' or 'all'\n"+
 		"    'medium' can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created\n"+
 		"    'size' optional parameter overrides default overlay upper layer size\n")
+	flagSet.Var(tarTimestampResolutionPtr(TarTimestampSeconds), "tar-timestamp-resolution", "resolution of modification times in tar archives of overlay upper layers and filesystem checkpoints. 'nanoseconds' adds about 1 KiB per tar entry. Values: seconds|nanoseconds, default: seconds")
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
 	flagSet.Var(charDevicePolicyPtr(CharDevEmulatedOnly), "character-device-policy", "controls how character device files on gofer mounts (rootfs and bind mounts) are handled. 'emulated-only' serves devices implemented by the sentry and fails opens of other devices with ENXIO (default and more secure); 'prefer-emulated' serves sentry-implemented devices from the sentry and opens the rest through the host; 'passthrough' opens all of them through the host. Values: emulated-only|prefer-emulated|passthrough, default: emulated-only")
+	flagSet.Var(inodeNumbersPtr(InodeNumbersPassthrough), "inode-numbers", "controls inode numbers on gofer mounts: 'passthrough' reports host inode numbers; 'virtual' assigns sandbox-private sequential numbers, which costs memory per file seen and a stat(2) per getdents(2) entry. Values: passthrough|virtual, default: passthrough")
 	flagSet.Bool("gvisor-marker-file", false, "enable the presence of the /proc/gvisor/kernel_is_gvisor file that can be used by applications to detect that gVisor is in use")
 	flagSet.String("override-procs", "", "comma-separated list of proc files to override with stubs (e.g. kallsyms)")
 
@@ -175,13 +186,14 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64(flagQDiscTBFBurst, defaultQDiscTBFBurst, "bucket depth in bytes when --qdisc=tbf.")
 	flagSet.Int("num-network-channels", 1, "number of underlying channels(FDs) to use for network link endpoints.")
 	flagSet.Int("network-processors-per-channel", 0, "number of goroutines in each channel for processng inbound packets. If 0, the link endpoint will divide GOMAXPROCS evenly among the number of channels specified by num-network-channels.")
-	flagSet.Var(&xdpConfig, "EXPERIMENTAL-xdp", `whether and how to use XDP. Can be one of: "off" (default), "ns", "redirect:<device name>", or "tunnel:<device name>"`)
+	flagSet.Var(&XDP{}, "EXPERIMENTAL-xdp", `whether and how to use XDP. Can be one of: "off" (default), "ns", "redirect:<device name>", or "tunnel:<device name>"`)
 	flagSet.Bool("EXPERIMENTAL-xdp-need-wakeup", true, "EXPERIMENTAL. Use XDP_USE_NEED_WAKEUP with XDP sockets.") // TODO(b/240191988): Figure out whether this helps and remove it as a flag.
 	flagSet.Bool("reproduce-nat", false, "Scrape the host netns NAT table and reproduce it in the sandbox.")
 	flagSet.Bool(flagReproduceNFTables, false, "Attempt to scrape and reproduce nftable rules inside the sandbox. Overrides reproduce-nat when true.")
 	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
 	flagSet.Bool(flagPauseExternalNetworking, false, "Start the sandbox with external networking disabled. Only supported when using the sandbox network type. The network can be unpaused manually after the sandbox is running.")
 	flagSet.Bool(flagAllowConnectedOnSave, false, "Allow network connections to stay established on save.")
+	flagSet.Var(StateEngineGraph.Ptr(), "state-engine", "selects the state serialization engine used when saving checkpoints: graph (default) or wire.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "LEGACY: enable support for Nvidia GPUs. GPU support gets automatically enabled if Nvidia devices are present in the OCI spec.")
@@ -344,6 +356,10 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 		if isFlagExplicitlySet(flagSet, name) {
 			conf.explicitlySet[name] = struct{}{}
 		}
+	}
+	if _, ok := conf.explicitlySet["state-engine"]; ok {
+		v := conf.StateEngine
+		conf.cliStateEngine = &v
 	}
 
 	if len(conf.RootDir) == 0 {
@@ -548,6 +564,26 @@ func getVal(field reflect.Value) string {
 	default:
 		panic("unknown type " + field.Kind().String())
 	}
+}
+
+// IsFlagExplicitlySet reports whether the given flag name was explicitly set on
+// the command line when this Config was created via NewFromFlags.
+func (c *Config) IsFlagExplicitlySet(name string) bool {
+	if c.explicitlySet == nil {
+		return false
+	}
+	_, ok := c.explicitlySet[name]
+	return ok
+}
+
+// CLIStateEngine returns the --state-engine policy explicitly passed on the
+// command line when this Config was created via NewFromFlags, unaffected by
+// subsequent OCI annotation or bundle overrides.
+func (c *Config) CLIStateEngine() (StateEnginePolicy, bool) {
+	if c.cliStateEngine == nil {
+		return 0, false
+	}
+	return *c.cliStateEngine, true
 }
 
 // IsFlagSafeToOverride returns true if the given flag name is in the override

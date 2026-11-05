@@ -79,7 +79,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 
 	contents := map[string]kernfs.Inode{
 		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newCPUInfoData(k)),
 		"devices":        fs.newInode(ctx, root, 0444, &devicesData{}),
 		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
 		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
@@ -138,10 +138,10 @@ func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, err
 	}
 
 	// Not a static entry. Try to lookup a corresponding task.
-	tid, err := strconv.ParseUint(name, 10, 64)
-	if err != nil {
+	tid, ok := parseIDName(name)
+	if !ok {
 		root := auth.NewRootCredentials(i.pidns.UserNamespace())
-		// If it failed to parse, check if it's one of the special handled files.
+		// Check if it's one of the specially handled files.
 		switch name {
 		case selfName:
 			return i.newSelfSymlink(ctx, root), nil
@@ -164,9 +164,9 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 	// fs/proc/internal.h: #define FIRST_PROCESS_ENTRY 256
 	const FIRST_PROCESS_ENTRY = 256
 
-	// Use maxTaskID to shortcut searches that will result in 0 entries.
-	const maxTaskID = kernel.TasksLimit + 1
-	if offset >= maxTaskID {
+	// FIRST_PROCESS_ENTRY + 2 + TasksLimit + 1 is the first position past all PIDs.
+	const endOff = FIRST_PROCESS_ENTRY + 2 + kernel.TasksLimit + 1
+	if offset >= endOff {
 		return offset, nil
 	}
 
@@ -224,18 +224,19 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 
 	sort.Ints(tids)
 	for _, tid := range tids {
+		// A process entry's directory offset is FIRST_PROCESS_ENTRY + 2 + tid.
+		offset = FIRST_PROCESS_ENTRY + 2 + int64(tid)
 		dirent := vfs.Dirent{
 			Name:    strconv.FormatUint(uint64(tid), 10),
 			Type:    linux.DT_DIR,
 			Ino:     i.fs.NextIno(),
-			NextOff: FIRST_PROCESS_ENTRY + 2 + int64(tid) + 1,
+			NextOff: offset + 1,
 		}
 		if err := cb.Handle(dirent); err != nil {
 			return offset, err
 		}
-		offset++
 	}
-	return maxTaskID, nil
+	return endOff, nil
 }
 
 // Open implements kernfs.Inode.Open.
@@ -272,29 +273,31 @@ func (i *tasksInode) DecRef(ctx context.Context) {
 	i.tasksInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
-// staticFileSetStat implements a special static file that allows inode
-// attributes to be set. This is to support /proc files that are readonly, but
-// allow attributes to be set.
+// cpuInfoData implements vfs.DynamicBytesSource for /proc/cpuinfo.
 //
 // +stateify savable
-type staticFileSetStat struct {
+type cpuInfoData struct {
 	dynamicBytesFileSetAttr
-	vfs.StaticData
+
+	// cpuFreq is recorded at mount time so /proc/cpuinfo is consistent for a
+	// restored sandbox.
+	freqMHz float64
 }
 
-var _ dynamicInode = (*staticFileSetStat)(nil)
+var _ dynamicInode = (*cpuInfoData)(nil)
 
-func newStaticFileSetStat(data string) *staticFileSetStat {
-	return &staticFileSetStat{StaticData: vfs.StaticData{Data: data}}
+func newCPUInfoData(k *kernel.Kernel) *cpuInfoData {
+	return &cpuInfoData{freqMHz: k.FeatureSet().CPUFreqMHz()}
 }
 
-func cpuInfoData(k *kernel.Kernel) string {
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *cpuInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	k := kernel.KernelFromContext(ctx)
 	features := k.FeatureSet()
-	var buf bytes.Buffer
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
-		features.WriteCPUInfoTo(i, max, &buf)
+		features.WriteCPUInfoTo(i, max, d.freqMHz, buf)
 	}
-	return buf.String()
+	return nil
 }
 
 func ipcData(v uint64) dynamicInode {

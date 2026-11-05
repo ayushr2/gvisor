@@ -229,7 +229,7 @@ func (cf *cgroupProcs) Write(ctx context.Context, fd *vfs.FileDescription, src u
 		return 0, err
 	}
 	str := strings.TrimSpace(string(data))
-	pid, err := strconv.ParseInt(str, 10, 64)
+	pid, err := strconv.ParseInt(str, 10, 32)
 	if err != nil || pid < 0 {
 		return 0, linuxerr.EINVAL
 	}
@@ -249,7 +249,7 @@ func (cf *cgroupProcs) Write(ctx context.Context, fd *vfs.FileDescription, src u
 		// namespace delegation boundary.
 		creds = auth.CredentialsFromContext(ctx)
 	}
-	if err := cf.c.attachProcess(ctx, creds, nsRoot, pid); err != nil {
+	if err := cf.c.attachProcess(ctx, creds, nsRoot, kernel.ThreadID(pid)); err != nil {
 		return 0, err
 	}
 
@@ -512,7 +512,7 @@ func (cf *cgroupKill) Write(ctx context.Context, fd *vfs.FileDescription, src us
 	if val != 1 {
 		return 0, linuxerr.ERANGE
 	}
-	if err := cf.c.kill(); err != nil {
+	if err := cf.c.kill(ctx); err != nil {
 		return 0, err
 	}
 	return src.NumBytes(), nil

@@ -20,7 +20,8 @@ import (
 
 const (
 	pagesFileFDDefaultMaxReadBytes  = 4 << 20
-	pagesFileFDDefaultMaxReads      = 12
+	pagesFileFDMaxReads             = 12
+	pagesFileFDMinReads             = 4
 	pagesFileFDDefaultMaxWriteBytes = 256 << 10
 	pagesFileFDDefaultMaxWrites     = 128
 )
@@ -34,14 +35,26 @@ const (
 func NewPagesFileFDReader(fd int32, maxReadBytes uint64, maxParallel int) *FDReader {
 	// Provision one range per page of maxReadBytes, since this is the maximum
 	// number of ranges that async page loading will use.
-	return NewFDReader(fd, maxReadBytes, int(maxReadBytes/hostarch.PageSize), maxParallel)
+	return NewFDReader(fd, maxReadBytes, int(maxReadBytes>>hostarch.PageShift), maxParallel)
+}
+
+// pagesFileFDReads returns the default number of concurrent reads of a
+// pages file by a sandbox that can use the given number of CPUs.
+// Concurrent reads into the sandbox's memory contend in the host kernel,
+// so going beyond the number of CPUs mostly just wastes CPU time.
+// But reads also wait for I/O, so good to have a few of them keep the
+// file busy even with fewer CPUs, especially for long-latency filesystem
+// (e.g. remote filesystems).
+func pagesFileFDReads(cpus int) int {
+	return min(pagesFileFDMaxReads, max(pagesFileFDMinReads, cpus))
 }
 
 // NewPagesFileFDReaderDefault returns a FDReader that reads a pages file from
 // the given host file descriptor, using defaults for MaxReadBytes and
-// MaxParallel. It takes ownership of the file descriptor.
-func NewPagesFileFDReaderDefault(fd int32) *FDReader {
-	return NewPagesFileFDReader(fd, pagesFileFDDefaultMaxReadBytes, pagesFileFDDefaultMaxReads)
+// MaxParallel for a sandbox that can use the given number of CPUs. It takes
+// ownership of the file descriptor.
+func NewPagesFileFDReaderDefault(fd int32, cpus int) *FDReader {
+	return NewPagesFileFDReader(fd, pagesFileFDDefaultMaxReadBytes, pagesFileFDReads(cpus))
 }
 
 // NewPagesFileFDWriter returns a FDWriter that writes a pages file to the
@@ -53,7 +66,7 @@ func NewPagesFileFDReaderDefault(fd int32) *FDReader {
 func NewPagesFileFDWriter(fd int32, maxWriteBytes uint64, maxParallel int) *FDWriter {
 	// Provision one range per page of maxWriteBytes, since this is the maximum
 	// number of ranges that async page saving will use.
-	return NewFDWriter(fd, maxWriteBytes, int(maxWriteBytes/hostarch.PageSize), maxParallel)
+	return NewFDWriter(fd, maxWriteBytes, int(maxWriteBytes>>hostarch.PageShift), maxParallel)
 }
 
 // NewPagesFileFDWriterDefault returns a FDWriter that writes to the given host

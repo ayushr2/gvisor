@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 )
@@ -81,9 +82,18 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
+	// ValidateMetadata indicates whether filesystem implementations backed by
+	// remote filesystems should refresh metadata during save so that restore
+	// can validate file sizes and/or modification timestamps.
+	ValidateMetadata bool
+
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
+
+	// GraphEngine, when non-nil, overrides the process-wide state engine for
+	// this save operation.
+	GraphEngine *bool
 }
 
 // Close releases resources owned by opts.
@@ -158,7 +168,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	if wt != 0 {
 		opts.Metadata[GvisorWallTimeKey] = wt.String()
 	}
-	addSaveMetadata(opts.Metadata)
+	addSaveMetadata(opts.Metadata, k)
 
 	// Open the statefile.
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
@@ -167,7 +177,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		vfsOpts := vfs.PrepareSaveOptions{
+			ValidateMetadata: opts.ValidateMetadata,
+		}
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil

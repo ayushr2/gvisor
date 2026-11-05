@@ -101,27 +101,6 @@ func (ods *objectDecodeState) addCallback(ic internalCallback) {
 	ods.callbacks = append(ods.callbacks, ic)
 }
 
-// findCycleFor returns when the given object is found in the blocking set.
-func (ods *objectDecodeState) findCycleFor(target *objectDecodeState) []*objectDecodeState {
-	for _, ic := range ods.callbacks {
-		other := ic.source()
-		if other != nil && other == target {
-			return []*objectDecodeState{target}
-		} else if childList := other.findCycleFor(target); childList != nil {
-			return append(childList, other)
-		}
-	}
-
-	// This should not occur.
-	Failf("no deadlock found?")
-	panic("unreachable")
-}
-
-// findCycle finds a dependency cycle.
-func (ods *objectDecodeState) findCycle() []*objectDecodeState {
-	return append(ods.findCycleFor(ods), ods)
-}
-
 // source implements internalCallback.source.
 func (ods *objectDecodeState) source() *objectDecodeState {
 	return ods
@@ -405,10 +384,11 @@ func (ds *decodeState) decodeStruct(ods *objectDecodeState, obj reflect.Value, e
 	}
 	ds.stats.start(ods.typ)
 	defer ds.stats.done()
-	if sl, ok := obj.Addr().Interface().(SaverLoader); ok {
-		// Note: may be a registered empty struct which does not
-		// implement the saver/loader interfaces.
-		sl.StateLoad(ds.ctx, Source{internal: od})
+	switch value := obj.Addr().Interface().(type) {
+	case SaverLoader:
+		value.StateLoad(ds.ctx, Source{internal: od})
+	case binaryObject:
+		loadBinary(value, rte.Name, Source{internal: od})
 	}
 }
 
@@ -418,10 +398,27 @@ func (ds *decodeState) decodeMap(ods *objectDecodeState, obj reflect.Value, enco
 		// See pointerTo.
 		obj.Set(reflect.MakeMap(obj.Type()))
 	}
+	keyType, valueType := obj.Type().Key(), obj.Type().Elem()
+	// Struct loaders and array element loaders can retain their addresses in
+	// delayed callbacks. Other kinds are copied into the map; interface values
+	// get independent dynamic storage in decodeInterface.
+	reuseKey := keyType.Kind() != reflect.Struct && keyType.Kind() != reflect.Array
+	reuseValue := valueType.Kind() != reflect.Struct && valueType.Kind() != reflect.Array
+	var kv, vv reflect.Value
 	for i := 0; i < len(encoded.Keys); i++ {
+		if i == 0 || !reuseKey {
+			kv = reflect.New(keyType).Elem()
+		} else {
+			// Nil wire values leave the destination unchanged.
+			kv.SetZero()
+		}
+		if i == 0 || !reuseValue {
+			vv = reflect.New(valueType).Elem()
+		} else {
+			vv.SetZero()
+		}
+
 		// Decode the objects.
-		kv := reflect.New(obj.Type().Key()).Elem()
-		vv := reflect.New(obj.Type().Elem()).Elem()
 		ds.decodeObject(ods, kv, encoded.Keys[i])
 		ds.decodeObject(ods, vv, encoded.Values[i])
 		ds.waitObject(ods, encoded.Keys[i], nil)
@@ -595,10 +592,41 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 	}
 }
 
+// findCycle finds a dependency cycle after all unblocked objects have completed.
+// Every remaining object has a blocker that is also incomplete. Following one
+// blocker per object must reach a cycle, even if the starting object is only
+// waiting on that cycle. No recursion is needed to construct the error report.
+//
+// Preconditions:
+//   - ds.pending is nonempty.
+//   - All unblocked objects have completed.
+func (ds *decodeState) findCycle() []*objectDecodeState {
+	blockers := make(map[*objectDecodeState]*objectDecodeState)
+	for elem := ds.pending.Front(); elem != nil; elem = elem.Next() {
+		for _, callback := range elem.ods.callbacks {
+			// User callbacks do not represent blocking dependencies.
+			if waiter := callback.source(); waiter != nil {
+				blockers[waiter] = elem.ods
+			}
+		}
+	}
+	visited := make(map[*objectDecodeState]int)
+	var path []*objectDecodeState
+	for obj := ds.pending.Front().ods; obj != nil; obj = blockers[obj] {
+		if start, ok := visited[obj]; ok {
+			return append(path[start:], obj)
+		}
+		visited[obj] = len(path)
+		path = append(path, obj)
+	}
+	Failf("incomplete object has no blocking dependency")
+	panic("unreachable")
+}
+
 // Load deserializes the object graph rooted at obj.
 //
 // This function may panic and should be run in safely().
-func (ds *decodeState) Load(obj reflect.Value) {
+func (ds *decodeState) Load(obj reflect.Value, numObjects uint64) {
 	ds.stats.init()
 	defer ds.stats.fini(func(id typeID) string {
 		return ds.types.LookupName(id)
@@ -606,15 +634,6 @@ func (ds *decodeState) Load(obj reflect.Value) {
 
 	// Add the root object with ID 1.
 	_ = ds.addObject(1, obj)
-
-	// Read the number of objects.
-	numObjects, object, err := ReadHeader(&ds.r)
-	if err != nil {
-		Failf("header error: %w", err)
-	}
-	if !object {
-		Failf("object missing")
-	}
 
 	// Decode all objects.
 	var (
@@ -698,9 +717,9 @@ func (ds *decodeState) Load(obj reflect.Value) {
 
 	// Check if we have any remaining dependency cycles. If there are any
 	// objects left in the pending list, then it must be due to a cycle.
-	if elem := ds.pending.Front(); elem != nil {
+	if ds.pending.Front() != nil {
 		// This must be the result of a dependency cycle.
-		cycle := elem.ods.findCycle()
+		cycle := ds.findCycle()
 		var buf bytes.Buffer
 		buf.WriteString("dependency cycle: {")
 		for i, cycleOS := range cycle {
@@ -714,25 +733,47 @@ func (ds *decodeState) Load(obj reflect.Value) {
 	}
 }
 
+// Header describes a framed region in a statefile stream.
+type Header struct {
+	// Length is the payload length: for legacy object graphs, the number of
+	// wire objects; for graph-engine object graphs and non-object regions,
+	// the length in bytes.
+	Length uint64
+
+	// Object reports whether this region is an encoded object graph rather
+	// than raw non-state data.
+	Object bool
+
+	// Graph reports whether an object graph uses the graph engine format.
+	Graph bool
+}
+
+// ReadHeaderMode reads an object header and returns its metadata.
+func ReadHeaderMode(r *wire.Reader) (Header, error) {
+	var raw uint64
+	if err := safely(func() {
+		raw = wire.LoadUint(r)
+	}); err != nil {
+		// On the header, pass raw I/O errors.
+		if sErr, ok := err.(*ErrState); ok {
+			return Header{}, sErr.Unwrap()
+		}
+		return Header{}, err
+	}
+
+	return Header{
+		Length: raw &^ (objectFlag | graphObjectFlag),
+		Object: raw&objectFlag != 0,
+		Graph:  raw&graphObjectFlag != 0,
+	}, nil
+}
+
 // ReadHeader reads an object header.
 //
 // Each object written to the statefile is prefixed with a header. See
 // WriteHeader for more information; these functions are exported to allow
 // non-state writes to the file to play nice with debugging tools.
 func ReadHeader(r *wire.Reader) (length uint64, object bool, err error) {
-	// Read the header.
-	err = safely(func() {
-		length = wire.LoadUint(r)
-	})
-	if err != nil {
-		// On the header, pass raw I/O errors.
-		if sErr, ok := err.(*ErrState); ok {
-			return 0, false, sErr.Unwrap()
-		}
-	}
-
-	// Decode whether the object is valid.
-	object = length&objectFlag != 0
-	length &^= objectFlag
-	return
+	hdr, err := ReadHeaderMode(r)
+	return hdr.Length, hdr.Object, err
 }

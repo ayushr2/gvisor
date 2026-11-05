@@ -277,6 +277,36 @@ func TestSandboxEnv(t *testing.T) {
 	}
 }
 
+func TestSandboxExecUser(t *testing.T) {
+	ctx := context.Background()
+
+	sb, err := sandbox.New(ctx, sandbox.WithNetwork(sandbox.NetworkModeNone))
+	if err != nil {
+		t.Fatalf("failed to start sandbox: %v", err)
+	}
+	defer sb.Close(ctx)
+
+	stdout := execOutput(ctx, t, sb, "id")
+	if !strings.Contains(stdout, "uid=0") || !strings.Contains(stdout, "gid=0") {
+		t.Errorf("unexpected user executed command: %s", stdout)
+	}
+
+	uid, gid := uint32(1000), uint32(2000)
+
+	res, err := sb.Exec(ctx, []string{"id"}, sandbox.WithExecUser(uid, gid))
+	if err != nil {
+		t.Fatalf("failed to execute id in sandbox: %v", err)
+	}
+
+	if res.ExitCode != 0 {
+		t.Fatalf("id exited with %d, stderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if !strings.Contains(res.Stdout, "uid=1000") || !strings.Contains(res.Stdout, "gid=2000") {
+		t.Errorf("unexpected user executed command: %s", res.Stdout)
+	}
+}
+
 func TestSandboxInvalidEnvFormat(t *testing.T) {
 	ctx := context.Background()
 
@@ -436,5 +466,34 @@ func TestSandboxCustomProcMount(t *testing.T) {
 	output := execOutput(ctx, t, sb, "cat", "/custom_proc/self/status")
 	if !strings.Contains(output, "Name:") {
 		t.Errorf("output of cat /custom_proc/self/status missing 'Name:', got: %v", output)
+	}
+}
+
+// TestExecNewPIDNamespace checks that WithExecNewPIDNamespace runs the command
+// as PID 1, and that the sandbox outlives the command.
+func TestExecNewPIDNamespace(t *testing.T) {
+	ctx := context.Background()
+
+	sb, err := sandbox.New(ctx, sandbox.WithNetwork(sandbox.NetworkModeNone))
+	if err != nil {
+		t.Fatalf("failed to start sandbox: %v", err)
+	}
+	defer sb.Close(ctx)
+
+	argv := []string{"/bin/sh", "-c", "echo $$"}
+	res, err := sb.Exec(ctx, argv, sandbox.WithExecNewPIDNamespace())
+	if err != nil {
+		t.Fatalf("failed to execute %v in sandbox: %v", argv, err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("%v exited with %d, stderr: %s", argv, res.ExitCode, res.Stderr)
+	}
+	if got := strings.TrimSpace(res.Stdout); got != "1" {
+		t.Errorf("command ran as PID %q, want 1", got)
+	}
+
+	// The sandbox keeps running after the command exits, so Exec still works.
+	if got := strings.TrimSpace(execOutput(ctx, t, sb, argv...)); got == "1" {
+		t.Errorf("command without WithExecNewPIDNamespace ran as PID 1")
 	}
 }

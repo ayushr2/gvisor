@@ -24,6 +24,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	bin "gvisor.dev/gvisor/pkg/binary"
@@ -57,9 +58,13 @@ func (info *DUTInfo) ConnectToDUT(t *testing.T) DUT {
 
 	n := info.Net
 	posixServerAddress := net.JoinHostPort(n.POSIXServerIP.String(), fmt.Sprintf("%d", n.POSIXServerPort))
-	conn, err := grpc.Dial(posixServerAddress, grpc.WithInsecure(), grpc.WithKeepaliveParams(keepalive.ClientParameters{Timeout: RPCKeepalive}))
+	conn, err := grpc.NewClient(
+		posixServerAddress,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Timeout: RPCKeepalive}),
+	)
 	if err != nil {
-		t.Fatalf("failed to grpc.Dial(%s): %s", posixServerAddress, err)
+		t.Fatalf("failed to grpc.NewClient(%s): %s", posixServerAddress, err)
 	}
 	posixServer := NewPOSIXClient(conn)
 	return DUT{
@@ -726,6 +731,20 @@ func (dut *DUT) Recv(t *testing.T, sockfd, len, flags int32) []byte {
 		t.Fatalf("failed to recv: %s", err)
 	}
 	return buf
+}
+
+// ExpectEOF reads EOF and verifies that the socket remains in wantState. It
+// fails immediately if data is available or the receive side is still open.
+func (dut *DUT) ExpectEOF(t *testing.T, sockfd int32, wantState uint32) {
+	t.Helper()
+
+	ret, buf, err := dut.RecvWithErrno(context.Background(), t, sockfd, 1, unix.MSG_DONTWAIT)
+	if ret != 0 || len(buf) != 0 || err != unix.Errno(0) {
+		t.Fatalf("recv after FIN = (%d, %q, %v), want (0, empty, errno 0)", ret, buf, err)
+	}
+	if got := uint32(dut.GetSockOptTCPInfo(t, sockfd).State); got != wantState {
+		t.Fatalf("TCP state after EOF = %d, want %d", got, wantState)
+	}
 }
 
 // RecvWithErrno calls recv on the DUT.

@@ -25,11 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"golang.org/x/sys/unix"
-
-	taskServer "gvisor.dev/gvisor/pkg/shim/v1/taskserver"
-	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
+	"time"
 
 	cgroups "github.com/containerd/cgroups/v3"
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
@@ -40,6 +36,7 @@ import (
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
 	types "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/shim"
@@ -51,10 +48,12 @@ import (
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	taskServer "gvisor.dev/gvisor/pkg/shim/v1/taskserver"
+	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -77,19 +76,53 @@ const (
 	cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
 )
 
+// oomStatus is the outcome of an exit-time OOM check. The exit status and the
+// TaskOOM event ask different questions of it: whether a kill happened, and
+// whether it still needs announcing.
+type oomStatus int
+
+const (
+	// oomNotKilled means no OOM kill was found for the container.
+	oomNotKilled oomStatus = iota
+	// oomKilledPublished means the container was OOM-killed and the async
+	// watcher has already published a TaskOOM for that kill.
+	oomKilledPublished
+	// oomKilledUnpublished means the container was OOM-killed and no TaskOOM
+	// has been published for that kill yet.
+	oomKilledUnpublished
+)
+
+// killed reports whether an OOM kill was established, whether or not it has
+// already been announced.
+func (s oomStatus) killed() bool { return s != oomNotKilled }
+
+func (s oomStatus) String() string {
+	switch s {
+	case oomNotKilled:
+		return "not-killed"
+	case oomKilledPublished:
+		return "killed-published"
+	case oomKilledUnpublished:
+		return "killed-unpublished"
+	default:
+		return fmt.Sprintf("oomStatus(%d)", int(s))
+	}
+}
+
 type oomPoller interface {
 	io.Closer
 	// add adds `cg` cgroup to oom poller. `cg` is cgroups.Cgroup in v1 and
-	// `cgroupsv2.Manager` in v2
+	// `*cgroupV2` in v2
 	add(id string, cg any) error
 	// run monitors oom event and notifies the shim about them
 	run(ctx context.Context)
-	// isOOM reports whether the caller should publish TaskOOM before TaskExit.
-	// In cgroups v2 it checks memory.events and claims the count, but does not
-	// wait for an event already claimed by the async path to be published.
-	// The cgroup reference is consumed on the first call, so subsequent calls
-	// for the same id return false.
-	isOOM(id string) bool
+	// isOOM reports whether the container was OOM-killed and whether that
+	// kill still needs a TaskOOM, by reading the cgroup's memory events.
+	// Called at container exit, so that the exit status and the TaskOOM event
+	// do not depend on the async notification having arrived. The cgroup
+	// reference is consumed on the first call, so subsequent calls for the
+	// same id report nothing.
+	isOOM(id string) oomStatus
 }
 
 // runscService is the shim implementation of a remote shim over gRPC. It converts
@@ -190,14 +223,41 @@ func (s *runscService) Create(ctx context.Context, r *task.CreateTaskRequest) (*
 	})
 }
 
+// hasPodCgroupParent reports whether the sandbox's cgroup at cgPath is nested
+// directly under the pod cgroup.
+//
+// OCI does not specify the cgroup hierarchy; each container manager lays it
+// out as it likes. Only Kubernetes with the systemd cgroup driver is
+// recognized here; the exit-time OOM fallback is disabled for the rest.
+func hasPodCgroupParent(bundle, cgPath string) bool {
+	spec, err := utils.ReadSpec(bundle)
+	if err != nil {
+		log.L.Errorf("Failed to read spec from %q: %v", bundle, err)
+		return false
+	}
+	if specutils.SpecContainerType(spec) == specutils.ContainerTypeUnspecified {
+		// No CRI annotation, so not Kubernetes.
+		return false
+	}
+	if spec.Linux == nil {
+		return false
+	}
+	// runc reads a "slice:prefix:name" cgroups path as the systemd driver and
+	// anything else as a cgroupfs path.
+	fields := strings.Split(spec.Linux.CgroupsPath, ":")
+	if len(fields) != 3 {
+		return false
+	}
+	// The slice the spec asked for has to be the one the sandbox actually
+	// landed in, otherwise the parent of cgPath is some other cgroup.
+	return fields[0] == filepath.Base(filepath.Dir(cgPath))
+}
+
 // CreateWithFSRestore is the same as Create, but it additionally restores the
 // container's filesystem from a snapshot.
 //
 // +checklocksexclude:s.mu
 func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
 		Bundle:             rfs.Create.Bundle,
@@ -214,7 +274,9 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		return nil, err
 	}
 
+	s.mu.Lock()
 	s.containers[rfs.Create.ID] = c
+	s.mu.Unlock()
 
 	p, err := c.Process("")
 	if err != nil {
@@ -237,7 +299,11 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 			var cgPath string
 			cgPath, err = cgroupsv2.PidGroupPath(pid)
 			if err == nil {
-				cg, err = cgroupsv2.Load(cgPath)
+				var mgr *cgroupsv2.Manager
+				mgr, err = cgroupsv2.Load(cgPath)
+				if err == nil {
+					cg = &cgroupV2{mgr: mgr, path: cgPath, podParent: hasPodCgroupParent(rfs.Create.Bundle, cgPath)}
+				}
 			}
 		} else {
 			cg, err = cgroup1.Load(cgroup1.PidPath(pid))
@@ -647,17 +713,20 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	// exec processes share the sandbox cgroup and would produce spurious
 	// events.
 	// Use the per-container id for TaskOOM routing.
-	isOOM := isInit && s.oomPoller.isOOM(containerID)
+	oom := oomNotKilled
+	if isInit {
+		oom = s.oomPoller.isOOM(containerID)
+	}
 	// When the memcg kill lands on the sentry itself, `runsc wait` cannot
 	// recover the real signal status and the shim substitutes the generic
 	// InternalErrorCode. Since the cgroup confirms an OOM kill, report the
 	// status tooling expects for SIGKILL (137). A real status reported by
 	// runsc is never overridden.
-	if isOOM && e.Status == proc.InternalErrorCode {
+	if oom.killed() && e.Status == proc.InternalErrorCode {
 		e.Status = 128 + int(unix.SIGKILL)
 	}
 	p.SetExited(e.Status)
-	if isOOM {
+	if oom == oomKilledUnpublished {
 		s.send(&events.TaskOOM{ContainerID: containerID})
 	}
 	s.send(&events.TaskExit{
@@ -690,7 +759,12 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 	if err != nil {
 		return nil, err
 	}
-	ps, err := p.(*proc.Init).Runtime().Ps(ctx, c.ID)
+	var ps []int
+	err = p.(*proc.Init).RuntimeCall(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+		var err error
+		ps, err = runtime.Ps(ctx, c.ID)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -701,24 +775,27 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 	return pids, nil
 }
 
-// publishFailureIsFatal reports whether a failure to publish an event is fatal.
-// An empty TTRPC_ADDRESS means no event sink is configured (as under CRI-O), so
-// the publisher can never connect and publish errors are expected.
-func publishFailureIsFatal() bool {
-	return os.Getenv("TTRPC_ADDRESS") != ""
-}
-
+// forward publishes events until s.events is closed on shutdown, then closes
+// the publisher. This matches the runc shim.
+//
+// A publish error is logged rather than fatal. The publisher has already queued
+// the event for retry, and it fails for transient reasons such as containerd
+// restarting, or permanently when no event sink is configured (as under CRI-O).
+// Exiting the shim instead would take down every container it serves, which is
+// the whole pod with shim grouping.
 func (s *runscService) forward(ctx context.Context, publisher shim.Publisher) {
-	isFatal := publishFailureIsFatal()
+	// Detach from the shim context, which is done once shutdown completes, so
+	// that events still queued at that point don't fail immediately. This is
+	// best effort: the shim exits as soon as shutdown completes.
+	ns, _ := namespaces.Namespace(ctx)
+	ctx = namespaces.WithNamespace(context.Background(), ns)
 	for e := range s.events {
-		if err := publisher.Publish(ctx, getTopic(e), e); err != nil {
-			if isFatal {
-				// Should not happen when an event sink is configured.
-				panic(fmt.Errorf("post event: %w", err))
-			}
-			log.L.Warningf("Failed to post event (no containerd event sink): %v", err)
+		topic := getTopic(e)
+		if err := publisher.Publish(ctx, topic, e); err != nil {
+			log.L.WithError(err).Warningf("Failed to post event, topic: %q", topic)
 		}
 	}
+	publisher.Close()
 }
 
 func getTopic(e any) string {
@@ -862,9 +939,6 @@ func (g *GvisorTaskServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		return nil, fmt.Errorf("process is not init process")
 	}
 
-	// Set debug options on the runtime for this execution
-	runsc := setDebug(initProc.Runtime(), req.GetDebug())
-
 	opts := &runsccmd.CheckpointOpts{
 		ImagePath:                 req.GetImagePath(),
 		LeaveRunning:              req.GetLeaveRunning(),
@@ -879,14 +953,14 @@ func (g *GvisorTaskServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		FSPath:                    req.GetFsPath(),
 	}
 
-	if req.GetFsCheckpoint() {
-		if err := runsc.FSCheckpoint(ctx, c.ID, opts); err != nil {
-			return nil, err
+	if err := initProc.Checkpoint(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+		runtime = setDebug(runtime, req.GetDebug())
+		if req.GetFsCheckpoint() {
+			return runtime.FSCheckpoint(ctx, c.ID, opts)
 		}
-	} else {
-		if err := runsc.Checkpoint(ctx, c.ID, opts); err != nil {
-			return nil, err
-		}
+		return runtime.Checkpoint(ctx, c.ID, opts)
+	}); err != nil {
+		return nil, err
 	}
 
 	return &pb.CheckpointResponse{}, nil
@@ -942,8 +1016,10 @@ func (g *GvisorTaskServer) State(ctx context.Context, req *pb.StateRequest) (*pb
 	if c, err := g.s.getContainer(req.GetId()); err == nil {
 		if p, err := c.Process(""); err == nil {
 			if initProc, ok := p.(*proc.Init); ok {
-				runsc := setDebug(initProc.Runtime(), req.GetDebug())
-				if _, err := runsc.State(ctx, c.ID); err != nil {
+				if err := initProc.RuntimeCall(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+					_, err := setDebug(runtime, req.GetDebug()).State(ctx, c.ID)
+					return err
+				}); err != nil {
 					log.L.Debugf("State with debug failed: %v", err)
 				}
 			}
@@ -980,11 +1056,14 @@ func (g *GvisorTaskServer) State(ctx context.Context, req *pb.StateRequest) (*pb
 
 // Version implements taskServer.GvisorTaskServiceExt.
 func (g *GvisorTaskServer) Version(ctx context.Context, req *pb.VersionRequest) (*pb.VersionResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	command := runsccmd.DefaultCommand
 	if configured := g.s.versionCommand.Load(); configured != nil && *configured != "" {
 		command = *configured
 	}
-	cmd := exec.Command(command, "-version")
+	cmd := exec.CommandContext(ctx, command, "-version")
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get runsc version: %w, output: %s", err, string(out))

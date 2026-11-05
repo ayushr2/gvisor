@@ -117,11 +117,11 @@ func (d *cpusData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 //
 // +checklocksexclude:d.c.mu
 func (d *cpusData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
-	buf := copyScratchBufferFromContext(ctx, hostarch.PageSize)
+	buf := copyScratchBufferFromContext(ctx, int(hostarch.PageSize))
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, err
@@ -131,11 +131,6 @@ func (d *cpusData) WriteBackground(ctx context.Context, src usermem.IOSequence) 
 	b, err := bitmap.ParseList(string(buf), d.c.maxCpus)
 	if err != nil {
 		log.Warningf("cgroupfs cpuset controller: Failed to parse bitmap: %v", err)
-		return 0, linuxerr.EINVAL
-	}
-
-	if got, want := b.Maximum(), d.c.maxCpus; got > want {
-		log.Warningf("cgroupfs cpuset controller: Attempted to specify cpuset.cpus beyond highest available cpu: got %d, want %d", got, want)
 		return 0, linuxerr.EINVAL
 	}
 
@@ -171,11 +166,11 @@ func (d *memsData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 //
 // +checklocksexclude:d.c.mu
 func (d *memsData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
-	if src.NumBytes() > hostarch.PageSize {
+	if src.NumBytes() > int64(hostarch.PageSize) {
 		return 0, linuxerr.EINVAL
 	}
 
-	buf := copyScratchBufferFromContext(ctx, hostarch.PageSize)
+	buf := copyScratchBufferFromContext(ctx, int(hostarch.PageSize))
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, err
@@ -185,11 +180,6 @@ func (d *memsData) WriteBackground(ctx context.Context, src usermem.IOSequence) 
 	b, err := bitmap.ParseList(string(buf), d.c.maxMems)
 	if err != nil {
 		log.Warningf("cgroupfs cpuset controller: Failed to parse bitmap: %v", err)
-		return 0, linuxerr.EINVAL
-	}
-
-	if got, want := b.Maximum(), d.c.maxMems; got > want {
-		log.Warningf("cgroupfs cpuset controller: Attempted to specify cpuset.mems beyond highest available node: got %d, want %d", got, want)
 		return 0, linuxerr.EINVAL
 	}
 

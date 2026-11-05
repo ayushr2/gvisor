@@ -27,6 +27,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bitmap"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -49,16 +50,12 @@ import (
 
 // MarkSavable marks f as savable.
 func (f *MemoryFile) MarkSavable() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.savable = true
+	f.savable.Store(true)
 }
 
 // IsSavable returns true if f is savable.
 func (f *MemoryFile) IsSavable() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.savable
+	return f.savable.Load()
 }
 
 // ResourceID returns the resource ID for f.
@@ -182,6 +179,11 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If ExitAfterSaving is true, the sentry exits soon after SaveTo()
+	// returns, so SaveTo() may leave zero pages that are already committed on
+	// the host in place rather than decommit them.
+	ExitAfterSaving bool
 }
 
 // SaveTo writes f's state to the given stream.
@@ -245,11 +247,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newCommittedBytes       uint64
 		alreadyUncommittedBytes uint64
 		newUncommittedBytes     uint64
+		hostHoleBytes           uint64
+		queuedPageBytes         uint64
 	)
 	asyncWritePages := func(fr memmap.FileRange) {}
 	if amfs != nil {
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
+			queuedPageBytes += amount
 			amfs.pf.mu.Lock()
 			amfs.pf.unsaved.PushBack(apsRange{
 				amfs:      amfs,
@@ -287,7 +292,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		// (1) All of decommitPendingFR lies within a single huge page.
 		// (2) decommitPendingFR.End is hugepage-aligned iff
 		// decommitPendingFR.Length() == 0.
-		end := off + hostarch.PageSize
+		end := off + uint64(hostarch.PageSize)
 		if decommitPendingFR.End == off {
 			// Merge with the existing range. By invariants, the page {off,
 			// end} must be within the same huge page as the rest of
@@ -373,6 +378,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		return maseg
 	}
 
+	dataSeeker := f.newHostFileDataSeeker()
+	// With dataSeeker, every page scanned below is already committed on the
+	// host, so keeping committed zero pages in place does not raise memory
+	// usage.
+	decommitZeroPages := !opts.ExitAfterSaving || dataSeeker == nil
 	zeroPage := make([]byte, hostarch.PageSize)
 	// f.mu is unlocked below, allowing concurrent calls to f.UpdateUsage() to
 	// observe pages that we transiently commit (for comparisons to zero) or
@@ -383,12 +393,78 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 	f.isSaving = true
 	defer func() { f.isSaving = false }()
+	// An f.updateUsageLocked() that is still in progress skips merging the
+	// segments it split in f.memAcct, since we hold an iterator into it
+	// across f.mu unlocks below.
+	f.memAcct.MergeAll()
 	// Reset f.commitSeq and memAcctInfo.commitSeq to 0 to make more segments
 	// in f.memAcct mergeable. This is safe because f.updateUsageLocked() is
 	// excluded by f.isSaving being set to true.
 	f.commitSeq = 0
 	maseg := f.memAcct.FirstSegment()
 	unscannedStart := uint64(0)
+	scanRange := func(fr memmap.FileRange, wasCommitted bool) {
+		if fr.Length() == 0 {
+			return
+		}
+		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			bs := chunk.sliceAt(chunkFR)
+			pageSize := int(hostarch.PageSize)
+			for pgoff := 0; pgoff < len(bs); pgoff += pageSize {
+				pg := bs[pgoff : pgoff+pageSize]
+				off := chunkFR.Start + uint64(pgoff)
+				isZeroed := bytes.Equal(pg, zeroPage)
+				if isZeroed {
+					if !wasCommitted {
+						alreadyUncommittedBytes += uint64(hostarch.PageSize)
+						if decommitZeroPages {
+							decommitAddPage(off)
+						}
+					} else {
+						newUncommittedBytes += uint64(hostarch.PageSize)
+					}
+				} else {
+					if !wasCommitted {
+						newCommittedBytes += uint64(hostarch.PageSize)
+					} else {
+						alreadyCommittedBytes += uint64(hostarch.PageSize)
+					}
+				}
+				maseg = updateAddRange(maseg, memmap.FileRange{Start: off, End: off + uint64(hostarch.PageSize)}, wasCommitted, !isZeroed)
+			}
+			// f.UpdateUsage() may be called concurrently with f.SaveTo();
+			// occasionally unlock f.mu to ensure that the former can promptly
+			// observe f.isSaving and return. Assume that maseg is not
+			// invalidated while f.mu is unlocked, since it should still be the
+			// case that nothing is concurrently trying to mutate f.
+			f.mu.Unlock()
+			f.mu.Lock()
+			return true
+		})
+	}
+	scanPossiblyCommittedRange := func(fr memmap.FileRange) error {
+		if dataSeeker == nil {
+			scanRange(fr, false /* wasCommitted */)
+			return nil
+		}
+		for fr.Length() != 0 {
+			data, err := dataSeeker.dataAtOrAfter(fr.Start)
+			if err != nil {
+				return err
+			}
+			hole := memmap.FileRange{fr.Start, min(data.Start, fr.End)}
+			if hole.Length() != 0 {
+				alreadyUncommittedBytes += hole.Length()
+				hostHoleBytes += hole.Length()
+				maseg = updateAddRange(maseg, hole, false /* wasCommitted */, false /* nowCommitted */)
+			}
+			dataFR := memmap.FileRange{hole.End, min(data.End, fr.End)}
+			scanRange(dataFR, false /* wasCommitted */)
+			fr.Start = dataFR.End
+		}
+		return nil
+	}
+	var scanErr error
 	for maseg.Ok() {
 		ma := maseg.ValuePtr()
 		if ma.wasteOrReleasing {
@@ -404,46 +480,17 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		allocatedBytes += fr.Length()
 		ma.commitSeq = 0
 		wasCommitted := ma.knownCommitted
-		if !opts.ExcludeCommittedZeroPages && wasCommitted {
+		switch {
+		case scanErr != nil:
+			// Keep resetting commitSeq above; the save fails below.
+		case wasCommitted && !opts.ExcludeCommittedZeroPages:
 			alreadyCommittedBytes += fr.Length()
 			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
-			maseg = updateFlush(maseg)
-			if maseg.End() == unscannedStart {
-				maseg = maseg.NextSegment()
-			}
-			continue
+		case wasCommitted:
+			scanRange(fr, true /* wasCommitted */)
+		default:
+			scanErr = scanPossiblyCommittedRange(fr)
 		}
-		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			bs := chunk.sliceAt(chunkFR)
-			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
-				pg := bs[pgoff : pgoff+hostarch.PageSize]
-				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
-				if isZeroed {
-					if !wasCommitted {
-						alreadyUncommittedBytes += hostarch.PageSize
-						decommitAddPage(off)
-					} else {
-						newUncommittedBytes += hostarch.PageSize
-					}
-				} else {
-					if !wasCommitted {
-						newCommittedBytes += hostarch.PageSize
-					} else {
-						alreadyCommittedBytes += hostarch.PageSize
-					}
-				}
-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
-			}
-			// f.UpdateUsage() may be called concurrently with f.SaveTo();
-			// occasionally unlock f.mu to ensure that the former can promptly
-			// observe f.isSaving and return. Assume that maseg is not
-			// invalidated while f.mu is unlocked, since it should still be the
-			// case that nothing is concurrently trying to mutate f.
-			f.mu.Unlock()
-			f.mu.Lock()
-			return true
-		})
 		// We need to flush batched updates to f.memAcct whenever potentially
 		// reaching the end of a segment, in order to maintain the invariant
 		// that updatePendingFR corresponds to a single segment.
@@ -458,23 +505,33 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		decommitNow(decommitPendingFR)
 		decommitPendingFR = memmap.FileRange{}
 	}
+	if scanErr != nil {
+		return fmt.Errorf("failed to find data ranges in MemoryFile backing file: %w", scanErr)
+	}
 
 	durScan := time.Duration(gohacks.Nanotime() - timeScanStart)
-	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
+	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected including %d bytes of host holes, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v ExitAfterSaving=%v",
 		f,
 		durScan,
 		allocatedBytes,
 		alreadyUncommittedBytes+newUncommittedBytes,
 		alreadyUncommittedBytes,
+		hostHoleBytes,
 		decommitCount,
 		newUncommittedBytes,
 		alreadyCommittedBytes+newCommittedBytes,
 		alreadyCommittedBytes,
 		newCommittedBytes,
-		opts.ExcludeCommittedZeroPages)
+		opts.ExcludeCommittedZeroPages,
+		opts.ExitAfterSaving)
 
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
+	if amfs != nil && queuedPageBytes != f.knownCommittedBytes {
+		// MemoryFiles share a pages file, so a mismatch shifts the
+		// PagesFileOffset used to restore every subsequent MemoryFile.
+		return fmt.Errorf("async page save queued %d bytes, but metadata describes %d bytes", queuedPageBytes, f.knownCommittedBytes)
+	}
 	pb := f.exportMetadataProto()
 	data, err := proto.Marshal(pb)
 	if err != nil {
@@ -515,12 +572,77 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			if ioErr != nil {
 				return ioErr
 			}
+			bytesSaved += maFR.Length()
 		}
 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
 		log.Infof("MemoryFile(%p): saved pages in %s (%d bytes, %.3f MB/s)", f, durPages, bytesSaved, float64(bytesSaved)*1e-6/durPages.Seconds())
 	}
 
 	return nil
+}
+
+// hostFileDataSeeker iterates over the data ranges of a MemoryFile's backing
+// file.
+type hostFileDataSeeker struct {
+	fd   int
+	size uint64
+	cur  memmap.FileRange
+}
+
+// newHostFileDataSeeker returns nil if f's backing file may be on a filesystem
+// whose SEEK_DATA does not report dirty page cache pages.
+func (f *MemoryFile) newHostFileDataSeeker() *hostFileDataSeeker {
+	if f.opts.DiskBackedFile && !f.seekDataReportsDirtyPages() {
+		return nil
+	}
+	return &hostFileDataSeeker{fd: f.FD(), size: f.TotalSize()}
+}
+
+// seekDataReportsDirtyPages reports whether SEEK_DATA on f's backing file
+// reports dirty page cache pages. This is an allowlist: FUSE forwards SEEK_DATA
+// to its server, which has not seen pages that are not written back, and
+// fstatfs on overlayfs does not identify the filesystem that answers SEEK_DATA.
+func (f *MemoryFile) seekDataReportsDirtyPages() bool {
+	var statfs unix.Statfs_t
+	if err := unix.Fstatfs(f.FD(), &statfs); err != nil {
+		log.Warningf("MemoryFile(%p): fstatfs failed, scanning all possibly committed pages: %v", f, err)
+		return false
+	}
+	switch statfs.Type {
+	case linux.TMPFS_MAGIC, linux.EXT_SUPER_MAGIC, linux.XFS_SUPER_MAGIC, linux.BTRFS_SUPER_MAGIC:
+		return true
+	default:
+		return false
+	}
+}
+
+// dataAtOrAfter returns the first page-aligned data range at or after off, or
+// an empty range at the end of the file if there is none.
+//
+// Preconditions: off must be >= the off passed to any previous call.
+func (d *hostFileDataSeeker) dataAtOrAfter(off uint64) (memmap.FileRange, error) {
+	if d.cur.End <= off {
+		data, err := unix.Seek(d.fd, int64(off), unix.SEEK_DATA)
+		if err == unix.ENXIO {
+			d.cur = memmap.FileRange{d.size, d.size}
+			return d.cur, nil
+		}
+		if err != nil {
+			return memmap.FileRange{}, fmt.Errorf("SEEK_DATA from %#x: %w", off, err)
+		}
+		hole, err := unix.Seek(d.fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			return memmap.FileRange{}, fmt.Errorf("SEEK_HOLE from %#x: %w", data, err)
+		}
+		if data < int64(off) || uint64(data) >= d.size || hole <= data {
+			return memmap.FileRange{}, fmt.Errorf("SEEK_DATA from %#x returned %#x, SEEK_HOLE returned %#x, file size %#x", off, data, hole, d.size)
+		}
+		d.cur = memmap.FileRange{
+			Start: hostarch.PageRoundDown(uint64(data)),
+			End:   min(hostarch.MustPageRoundUp(uint64(hole)), d.size),
+		}
+	}
+	return memmap.FileRange{max(off, d.cur.Start), d.cur.End}, nil
 }
 
 // AsyncPagesFileSave holds async page saving state for a single pages file.
@@ -1229,6 +1351,10 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// If throttled is true, a read of pages without waiters starts only when
+	// no other read is in flight.
+	throttled atomicbitops.Bool
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1412,9 +1538,16 @@ func (op *aplOp) off() int64 {
 	return int64(op.end - op.total)
 }
 
+// AsyncPagesFileLoadOpts contains options to StartAsyncPagesFileLoad.
+type AsyncPagesFileLoadOpts struct {
+	// If Throttled is true, reads of pages without waiters are throttled
+	// until AsyncPagesFileLoad.Unthrottle() is called.
+	Throttled bool
+}
+
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
-func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
+func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
 		ar.Close()
@@ -1428,6 +1561,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		doneCallback:     doneCallback,
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		throttled:        atomicbitops.FromBool(opts.Throttled),
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1446,6 +1580,14 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+// Unthrottle allows apfl to read pages without waiters at full parallelism.
+// It is idempotent.
+func (apfl *AsyncPagesFileLoad) Unthrottle() {
+	if apfl.throttled.Swap(false) {
+		apfl.lfStatus.Notify(aplLFPending)
+	}
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -1837,7 +1979,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		throttled := apfl.throttled.Load()
+		if apfl.canEnqueue() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1865,18 +2008,25 @@ func (apfl *AsyncPagesFileLoad) main() {
 					// We need to take page references during reading to
 					// prevent pages from becoming waste due to concurrent
 					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+					var n uint64
+					if throttled && apfl.curOp != nil {
+						// Only extend the single throttled read.
+						n = apfl.combine(amfl, ulFR, ul.off, true /* tempRef */)
+					} else {
+						n = apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+					}
 					if n == 0 {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
 						break amflsLoop
 					}
+					partial := n < ulFR.Length()
 					ulFR.End = ulFR.Start + n
 					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
 					amfl.f.incRefLocked(ulFR)
-					if !apfl.canEnqueue() {
+					if (throttled && partial) || !apfl.canEnqueue() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
 						break amflsLoop

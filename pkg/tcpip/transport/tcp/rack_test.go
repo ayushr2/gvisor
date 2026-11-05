@@ -262,6 +262,134 @@ func TestRACKReorderTimerDeclaresLossOnFirstExpiry(t *testing.T) {
 	}
 }
 
+// TestRACKInitialDeliverySequence starts transmissions at the clock origin.
+// An unset delivery timestamp must not compare their sequence numbers with zero.
+func TestRACKInitialDeliverySequence(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		iss  seqnum.Value
+	}{
+		{name: "low_isn", iss: 1234},
+		{name: "high_isn", iss: 1 << 31},
+		{name: "sequence_wrap", iss: ^seqnum.Value(0) - 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+			// Initialize the same connection-relative state as initSender.
+			ctx.snd.rc.init(&ctx.snd, test.iss)
+			ctx.addSegment(test.iss.Add(1), clock.NowMonotonic())
+			later := ctx.addSegment(test.iss.Add(2), clock.NowMonotonic())
+
+			clock.Advance(time.Millisecond)
+			if got, want := ctx.snd.rc.detectLoss(clock.NowMonotonic()), 0; got != want {
+				t.Errorf("losses before any delivery = %d, want %d", got, want)
+			}
+
+			// The first delivered segment also has transmission timestamp zero.
+			// It must advance the marker, including when its end wraps to zero.
+			ack := newOutgoingSegment(stack.TransportEndpointID{}, clock, buffer.Buffer{}, 0)
+			defer ack.DecRef()
+			ctx.snd.rc.update(later, ack)
+			if got, want := ctx.snd.rc.EndSequence, test.iss.Add(3); got != want {
+				t.Errorf("first delivery end = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestRACKInitialDSACKWindow(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		iss  seqnum.Value
+	}{
+		{name: "low_isn", iss: 1234},
+		{name: "high_isn", iss: 1 << 31},
+		{name: "sequence_wrap", iss: ^seqnum.Value(0) - 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := newRACKTestContext(faketime.NewManualClock(), 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+			ctx.snd.rc.init(&ctx.snd, test.iss)
+			ctx.snd.SndUna = test.iss.Add(1)
+			ctx.snd.SndNxt = test.iss.Add(4)
+			ctx.snd.rc.minRTT = 100 * time.Millisecond
+			ctx.snd.rtt.Lock()
+			ctx.snd.rtt.TCPRTTState.SRTT = 100 * time.Millisecond
+			ctx.snd.rtt.Unlock()
+
+			// The first DSACK must expand the reordering window regardless
+			// of where the connection starts in sequence space.
+			ctx.snd.rc.DSACKSeen = true
+			ctx.snd.rc.updateRACKReorderWindow()
+			if got, want := ctx.snd.rc.ReoWnd, 50*time.Millisecond; got != want {
+				t.Errorf("first DSACK window = %s, want %s", got, want)
+			}
+			if got, want := ctx.snd.rc.RTTSeq, ctx.snd.SndNxt; got != want {
+				t.Errorf("DSACK round boundary = %d, want %d", got, want)
+			}
+
+			// Another DSACK in the same round cannot expand it again.
+			ctx.snd.rc.DSACKSeen = true
+			ctx.snd.rc.updateRACKReorderWindow()
+			if got, want := ctx.snd.rc.ReoWnd, 50*time.Millisecond; got != want {
+				t.Errorf("same-round DSACK window = %s, want %s", got, want)
+			}
+
+			// Acknowledging the round boundary allows a new expansion,
+			// including when that boundary wraps through zero.
+			ctx.snd.SndUna = ctx.snd.SndNxt
+			ctx.snd.rc.DSACKSeen = true
+			ctx.snd.rc.updateRACKReorderWindow()
+			if got, want := ctx.snd.rc.ReoWnd, 75*time.Millisecond; got != want {
+				t.Errorf("next-round DSACK window = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestRACKRetransmissionTimestampWrap(t *testing.T) {
+	const wrap = 1 << 32 * time.Millisecond
+	const rtt = 5 * time.Millisecond
+	for _, test := range []struct {
+		name       string
+		retransmit time.Duration
+		echo       time.Duration
+		wantRTT    time.Duration
+	}{
+		// An echo from before the wrap belongs to the original transmission.
+		{"original", wrap + time.Millisecond, wrap - time.Millisecond, 0},
+		// A later echo can acknowledge a retransmission from before the wrap.
+		{"retransmission", wrap - time.Millisecond, wrap + time.Millisecond, rtt},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+
+			clock.Advance(test.retransmit)
+			seg := ctx.addSegment(1, clock.NowMonotonic())
+			seg.xmitCount = 2
+			clock.Advance(rtt)
+			ack := newOutgoingSegment(stack.TransportEndpointID{}, clock, buffer.Buffer{}, 0)
+			defer ack.DecRef()
+			ack.parsedOptions.TS = true
+			ack.parsedOptions.TSEcr = ctx.snd.ep.tsVal(tcpip.MonotonicTime{}.Add(test.echo))
+			ctx.snd.rc.update(seg, ack)
+			if got, want := ctx.snd.rc.RTT, test.wantRTT; got != want {
+				t.Errorf("RACK RTT = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestRACKEqualTransmitTimeOrdersByEndSequence(t *testing.T) {
 	clock := faketime.NewManualClock()
 	ctx := newRACKTestContext(clock, 0)

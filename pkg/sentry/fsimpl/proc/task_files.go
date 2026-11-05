@@ -198,11 +198,11 @@ func GetMetadata(ctx context.Context, mm *mm.MemoryManager, buf *bytes.Buffer, t
 		// https://elixir.bootlin.com/linux/v4.20/source/fs/proc/base.c#L208
 		// we'll return one page total between argv and envp because of the
 		// above page restrictions.
-		if buf.Len() >= hostarch.PageSize {
+		if buf.Len() >= int(hostarch.PageSize) {
 			// Returned at least one page already, nothing else to add.
 			return nil
 		}
-		remaining := hostarch.PageSize - buf.Len()
+		remaining := int(hostarch.PageSize) - buf.Len()
 		if int(arEnvv.Length()) > remaining {
 			end, ok := arEnvv.Start.AddLength(uint64(remaining))
 			if !ok {
@@ -279,7 +279,7 @@ type commInode struct {
 
 func (fs *filesystem) newComm(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	inode := &commInode{task: task}
-	inode.DynamicBytesFile.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
+	inode.DynamicBytesFile.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
 	return inode
 }
 
@@ -372,7 +372,7 @@ func (d *idMapData) Write(ctx context.Context, _ *vfs.FileDescription, src userm
 	// the system page size, and the write must be performed at the start of
 	// the file ..." - user_namespaces(7)
 	srclen := src.NumBytes()
-	if srclen >= hostarch.PageSize || offset != 0 {
+	if srclen >= int64(hostarch.PageSize) || offset != 0 {
 		return 0, linuxerr.EINVAL
 	}
 	b := make([]byte, srclen)
@@ -446,7 +446,7 @@ func (d *setgroupsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (d *setgroupsData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	srclen := src.NumBytes()
-	if srclen >= hostarch.PageSize || offset != 0 {
+	if srclen >= int64(hostarch.PageSize) || offset != 0 {
 		return 0, linuxerr.EINVAL
 	}
 	b := make([]byte, srclen)
@@ -493,7 +493,7 @@ type memInode struct {
 func (fs *filesystem) newMemInode(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
 	inode := &memInode{task: task}
-	inode.init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	inode.init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
 	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
@@ -510,9 +510,9 @@ func (f *memInode) init(ctx context.Context, creds *auth.Credentials, devMajor, 
 func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	m := getMM(f.task)
 	for {
-		// TODO(gvisor.dev/issue/260): Add check for PTRACE_MODE_ATTACH_FSCREDS
-		// Permission to read this file is governed by PTRACE_MODE_ATTACH_FSCREDS
-		// Since we dont implement setfsuid/setfsgid we can just use PTRACE_MODE_ATTACH
+		// TODO(gvisor.dev/issue/260): Permission to read this file is governed by
+		// PTRACE_MODE_ATTACH_FSCREDS, which checks the filesystem IDs; this uses
+		// the real IDs of PTRACE_MODE_ATTACH_REALCREDS instead.
 		if !kernel.ContextCanTrace(ctx, f.task, true) {
 			return nil, linuxerr.EACCES
 		}
@@ -526,8 +526,14 @@ func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.De
 	if err := checkTaskState(f.task); err != nil {
 		return nil, err
 	}
+	// The file must use the mm that the access check above was performed
+	// against: a concurrent execve may have already substituted a new,
+	// possibly non-dumpable mm that the check did not apply to. Linux's
+	// proc_mem_open() similarly captures the mm returned by mm_access(). No
+	// user reference is held; as in Linux, reads fail once the mm has no
+	// users left (see PRead).
 	fd := &memFD{
-		mm: getMM(f.task),
+		mm: m,
 	}
 	if err := fd.Init(rp.Mount(), d, f, opts.Flags, rp.Credentials()); err != nil {
 		return nil, err
@@ -850,7 +856,11 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfProcessGroup(s.task.ThreadGroup().ProcessGroup()))
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfSession(s.task.ThreadGroup().Session()))
 	fmt.Fprintf(buf, "0 0 " /* tty_nr tpgid */)
-	fmt.Fprintf(buf, "0 " /* flags */)
+	flags := 0
+	if s.task.ExitState() >= kernel.TaskExitInitiated {
+		flags |= linux.PF_EXITING
+	}
+	fmt.Fprintf(buf, "%d ", flags)
 	fmt.Fprintf(buf, "0 0 0 0 " /* minflt cminflt majflt cmajflt */)
 	var cputime usage.CPUStats
 	if s.tgstats {
@@ -876,7 +886,7 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d ", vss, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d ", vss, rss>>hostarch.PageShift)
 
 	// rsslim.
 	fmt.Fprintf(buf, "%d ", s.task.ThreadGroup().Limits().Get(limits.Rss).Cur)
@@ -917,7 +927,7 @@ func (s *statmData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
 	}
-	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss/hostarch.PageSize, rss/hostarch.PageSize)
+	fmt.Fprintf(buf, "%d %d 0 0 0 0 0\n", vss>>hostarch.PageShift, rss>>hostarch.PageShift)
 	return nil
 }
 
@@ -971,7 +981,7 @@ func (fs *filesystem) newStatusInode(ctx context.Context, task *kernel.Task, pid
 		task:  task,
 		pidns: pidns,
 	}
-	inode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeRegular|perm)
+	inode.InodeAttrs.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeRegular|perm)
 	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
@@ -1036,9 +1046,11 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	ruid := creds.RealKUID.In(s.userns).OrOverflow()
 	euid := creds.EffectiveKUID.In(s.userns).OrOverflow()
 	suid := creds.SavedKUID.In(s.userns).OrOverflow()
+	fsuid := creds.FilesystemKUID.In(s.userns).OrOverflow()
 	rgid := creds.RealKGID.In(s.userns).OrOverflow()
 	egid := creds.EffectiveKGID.In(s.userns).OrOverflow()
 	sgid := creds.SavedKGID.In(s.userns).OrOverflow()
+	fsgid := creds.FilesystemKGID.In(s.userns).OrOverflow()
 	var fds int
 	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
@@ -1051,10 +1063,8 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		rss = mm.ResidentSetSize()
 		data = mm.VirtualDataSize()
 	}
-	// Filesystem user/group IDs aren't implemented; effective UID/GID are used
-	// instead.
-	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, euid)
-	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, egid)
+	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, fsuid)
+	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, fsgid)
 	fmt.Fprintf(buf, "FDSize:\t%d\n", fds)
 	buf.WriteString("Groups:\t")
 	// There is a space between each pair of supplemental GIDs, as well as an
@@ -1159,7 +1169,7 @@ func (o *oomScoreAdj) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	}
 
 	// Limit input size so as not to impact performance if input size is large.
-	src = src.TakeFirst(hostarch.PageSize - 1)
+	src = src.TakeFirst(int(hostarch.PageSize) - 1)
 
 	str, err := usermem.CopyStringIn(ctx, src.IO, src.Addrs.Head().Start, int(src.Addrs.Head().Length()), src.Opts)
 	if err != nil && err != linuxerr.ENAMETOOLONG {
@@ -1205,7 +1215,7 @@ func (fs *filesystem) newExeSymlink(ctx context.Context, task *kernel.Task, ino 
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1283,7 +1293,7 @@ func (fs *filesystem) newCwdSymlink(ctx context.Context, task *kernel.Task, ino 
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1350,7 +1360,7 @@ func (fs *filesystem) newRootSymlink(ctx context.Context, task *kernel.Task, ino
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1492,7 +1502,7 @@ func (fs *filesystem) newNamespaceSymlink(ctx context.Context, task *kernel.Task
 	inode := &namespaceSymlink{task: task, nsType: nsType}
 
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, "")
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, "")
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	return taskInode
@@ -1506,7 +1516,7 @@ func (fs *filesystem) newFakeNamespaceSymlink(ctx context.Context, task *kernel.
 
 	inode := &namespaceSymlink{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	return taskInode
@@ -1782,7 +1792,7 @@ func (c *coredumpFilterData) Write(ctx context.Context, _ *vfs.FileDescription, 
 	}
 
 	// Limit input size so as not to impact performance if input size is large.
-	src = src.TakeFirst(hostarch.PageSize - 1)
+	src = src.TakeFirst(int(hostarch.PageSize) - 1)
 
 	str, err := usermem.CopyStringIn(ctx, src.IO, src.Addrs.Head().Start, int(src.Addrs.Head().Length()), src.Opts)
 	if err != nil && err != linuxerr.ENAMETOOLONG {

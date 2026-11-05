@@ -19,11 +19,11 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -633,12 +633,15 @@ type ExecOption func(*execOptions)
 
 // execOptions holds the configuration for one Exec call.
 type execOptions struct {
-	args         []string
-	execPath     string
-	stdin        io.Reader
-	stdout       io.Writer
-	stderr       io.Writer
-	relaySignals bool
+	args            []string
+	execPath        string
+	gid             *uint32
+	uid             *uint32
+	stdin           io.Reader
+	stdout          io.Writer
+	stderr          io.Writer
+	relaySignals    bool
+	newPIDNamespace bool
 }
 
 // WithExecStdio streams the command's standard streams to the given ones. A
@@ -657,12 +660,29 @@ func WithExecSignalRelay() ExecOption {
 	}
 }
 
+// WithExecUser sets the uid and gid of the user the command is executed by.
+func WithExecUser(uid, gid uint32) ExecOption {
+	return func(o *execOptions) {
+		o.uid = &uid
+		o.gid = &gid
+	}
+}
+
 // WithExecPath sets the path of the program to execute. If unset, the program
 // is resolved from argv[0]. Setting it lets the caller pass an argv[0] that
 // differs from the program path, like execve(2) does.
 func WithExecPath(path string) ExecOption {
 	return func(o *execOptions) {
 		o.execPath = path
+	}
+}
+
+// WithExecNewPIDNamespace runs the command as PID 1 of a new PID namespace that
+// is a child of the sandbox's. When the command exits, every process left in
+// that namespace is killed. The sandbox itself keeps running.
+func WithExecNewPIDNamespace() ExecOption {
+	return func(o *execOptions) {
+		o.newPIDNamespace = true
 	}
 }
 
@@ -705,8 +725,18 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, opts ...ExecOption) (
 		defer os.Remove(pidFile)
 		args = append(args, "--internal-pid-file", pidFile)
 	}
+	if options.uid != nil && options.gid != nil {
+		args = append(
+			args,
+			"--user",
+			strconv.FormatUint(uint64(*options.uid), 10)+":"+strconv.FormatUint(uint64(*options.gid), 10),
+		)
+	}
 	if options.execPath != "" {
 		args = append(args, "--exec-path", options.execPath)
+	}
+	if options.newPIDNamespace {
+		args = append(args, "--new-pidns")
 	}
 	args = append(append(args, s.id), options.args...)
 	cmd := exec.CommandContext(ctx, s.runscPath, args...)

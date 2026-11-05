@@ -17,6 +17,7 @@ package testutil
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"debug/elf"
 	"encoding/base32"
@@ -323,9 +324,59 @@ func ConfigForBenchmark(b *testing.B) *config.Config {
 	return conf
 }
 
+// PlatformConfig pairs a sub-test or sub-benchmark name with its sandbox
+// configuration.
+type PlatformConfig struct {
+	Name string
+	Conf *config.Config
+}
+
+// PlatformConfigs returns two sandbox configurations (created via newConf) for
+// each comma-separated platform in platforms: "<platform>" (Overlay2="none")
+// and "<platform>_overlay" (Overlay2="root:self"). It filters out "runc" and
+// "ptrace".
+func PlatformConfigs(tb testing.TB, platforms string, newConf func() *config.Config) []PlatformConfig {
+	tb.Helper()
+	var ps []string
+	for _, p := range strings.Split(platforms, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			ps = append(ps, p)
+		}
+	}
+	ps = slices.DeleteFunc(ps, func(s string) bool {
+		return s == "runc" || s == "ptrace"
+	})
+	if len(ps) == 0 {
+		tb.Skipf("no supported platforms in %q", platforms)
+	}
+
+	var cs []PlatformConfig
+	for _, p := range ps {
+		c := newConf()
+		c.Overlay2.Set("none")
+		c.Platform = p
+		cs = append(cs, PlatformConfig{Name: p, Conf: c})
+	}
+
+	// Overlay versions use "root:self", the runsc default.
+	for _, p := range ps {
+		c := newConf()
+		c.Overlay2.Set("root:self")
+		c.Platform = p
+		cs = append(cs, PlatformConfig{Name: p + "_overlay", Conf: c})
+	}
+	slices.SortFunc(cs, func(a, b PlatformConfig) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	return cs
+}
+
 // Measure executes fn while the benchmark timer is running. It starts the timer
 // immediately before calling fn, pauses it when fn returns (even if fn panics or
-// fails), and returns the elapsed duration of fn.
+// fails), and returns the elapsed duration of fn. The benchmark framework uses
+// the timer to report the average duration of fn as ns/op. The framework does
+// not keep each duration, so Measure returns it for percentiles (see
+// ReportPercentiles).
 func Measure(b *testing.B, fn func()) time.Duration {
 	b.StartTimer()
 	start := time.Now()
@@ -541,7 +592,44 @@ func WaitForHTTP(ip string, port int, timeout time.Duration) error {
 	return Poll(cb, timeout)
 }
 
-// Reaper reaps child processes.
+// ownedMu protects owned, the set of children started by StartCmd. Reapers
+// leave those children for exec.Cmd.Wait. StartCmd holds ownedMu across the
+// fork, so a Reaper never sees such a child before it is in owned.
+var (
+	ownedMu sync.Mutex
+	owned   = make(map[int]struct{})
+)
+
+// StartCmd starts cmd so that no Reaper reaps it. The caller must wait for
+// cmd with WaitCmd instead of cmd.Wait.
+func StartCmd(cmd *exec.Cmd) error {
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	owned[cmd.Process.Pid] = struct{}{}
+	return nil
+}
+
+// WaitCmd waits for a command started by StartCmd.
+func WaitCmd(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	ownedMu.Lock()
+	delete(owned, cmd.Process.Pid)
+	ownedMu.Unlock()
+	return err
+}
+
+// RunCmd is like cmd.Run, but a running Reaper does not race with it.
+func RunCmd(cmd *exec.Cmd) error {
+	if err := StartCmd(cmd); err != nil {
+		return err
+	}
+	return WaitCmd(cmd)
+}
+
+// Reaper reaps child processes, except those started by StartCmd.
 type Reaper struct {
 	// mu protects ch, which will be nil if the reaper is not running.
 	mu sync.Mutex
@@ -574,14 +662,54 @@ func (r *Reaper) Start() {
 				// Channel closed.
 				return
 			}
-			for {
-				cpid, _ := unix.Wait4(-1, nil, unix.WNOHANG, nil)
-				if cpid < 1 {
-					break
-				}
-			}
+			reapChildren()
 		}
 	}()
+}
+
+// reapChildren reaps every exited child that StartCmd did not start.
+func reapChildren() {
+	ownedMu.Lock()
+	defer ownedMu.Unlock()
+
+	if len(owned) == 0 {
+		for {
+			cpid, _ := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+			if cpid < 1 {
+				return
+			}
+		}
+	}
+	// Some children are owned, so don't use wait4(-1).
+	// Reap the others one at a time.
+	for _, pid := range childPIDs() {
+		if _, ok := owned[pid]; !ok {
+			unix.Wait4(pid, nil, unix.WNOHANG, nil)
+		}
+	}
+}
+
+// childPIDs returns the PIDs of this process's children. Each child is listed
+// under the thread that forked it, so all threads are read.
+func childPIDs() []int {
+	files, err := filepath.Glob("/proc/self/task/*/children")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			// The thread exited.
+			continue
+		}
+		for _, field := range strings.Fields(string(data)) {
+			if pid, err := strconv.Atoi(field); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
 }
 
 // Stop stops reaping child processes.

@@ -18,6 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,89 +30,237 @@ import (
 	apievents "github.com/containerd/containerd/api/events"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	coreevents "github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	"gvisor.dev/gvisor/pkg/shim/v1/runtimeoptions"
+	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-// errorPublisher is a publisher that always returns an error.
-type errorPublisher struct{}
+func TestCheckpointAPISerializesRuntimeCalls(t *testing.T) {
+	for _, filesystem := range []bool{false, true} {
+		for _, cancelCheckpoint := range []bool{false, true} {
+			t.Run(fmt.Sprintf("filesystem=%t/cancel=%t", filesystem, cancelCheckpoint), func(t *testing.T) {
+				dir := t.TempDir()
+				gate := filepath.Join(dir, "checkpoint-gate")
+				if err := unix.Mkfifo(gate, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				writer, err := os.OpenFile(gate, os.O_RDWR|unix.O_NONBLOCK, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release := sync.OnceFunc(func() { _ = writer.Close() })
+				t.Cleanup(release)
+				marker := filepath.Join(dir, "checkpoint-started")
+				unexpected := filepath.Join(dir, "unexpected-command")
+				argsPath := filepath.Join(dir, "checkpoint-args")
+				command := filepath.Join(dir, "runsc")
+				script := "#!/bin/sh\nfor arg do\ncase \"$arg\" in\ncheckpoint|fscheckpoint)\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\n: > " + strconv.Quote(marker) + "\nexec cat " + strconv.Quote(gate) + " >/dev/null\n;;\nesac\ndone\n: > " + strconv.Quote(unexpected) + "\nexit 1\n"
+				if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				runtime := &runsccmd.Runsc{Command: command, Root: dir}
+				p := proc.New("test", runtime, stdio.Stdio{})
+				p.Rootfs = dir
+				c := &Container{ID: "test", task: p}
+				s := &runscService{containers: map[string]*Container{"test": c}}
+				g := NewGvisorTaskServer(s)
+				req := &pb.CheckpointRequest{
+					Id:           "test",
+					FsCheckpoint: filesystem,
+					ImagePath:    filepath.Join(dir, "image path"),
+					LeaveRunning: true,
+					Debug:        &pb.Debug{DebugLog: filepath.Join(dir, "debug.log")},
+				}
+				ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelOwner()
+				done := make(chan error, 1)
+				go func() { _, err := g.Checkpoint(ownerCtx, req); done <- err }()
+				wait := sync.OnceValue(func() error { return <-done })
+				t.Cleanup(func() { release(); cancelOwner(); _ = wait() })
+				deadline := time.Now().Add(time.Second)
+				for {
+					if _, err := os.Stat(marker); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("checkpoint API did not reach the runtime")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				calls := []func(context.Context) error{
+					func(ctx context.Context) error {
+						return c.Kill(ctx, &task.KillRequest{ID: "test", Signal: uint32(unix.SIGKILL), All: true})
+					},
+					func(ctx context.Context) error { return p.Delete(ctx) },
+					func(ctx context.Context) error { return c.Pause(ctx, &task.PauseRequest{ID: "test"}) },
+					func(ctx context.Context) error { return c.Resume(ctx, &task.ResumeRequest{ID: "test"}) },
+					func(ctx context.Context) error { _, err := s.getContainerPids(ctx, c); return err },
+					func(ctx context.Context) error { _, err := g.State(ctx, &pb.StateRequest{Id: "test"}); return err },
+				}
+				for i, call := range calls {
+					ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+					start := time.Now()
+					err := call(ctx)
+					cancel()
+					if elapsed := time.Since(start); err == nil || elapsed < 40*time.Millisecond || elapsed > time.Second {
+						t.Fatalf("runtime call %d during checkpoint: %v after %v", i, err, elapsed)
+					}
+				}
+				if _, err := os.Stat(unexpected); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("another command reached the runtime during checkpoint: %v", err)
+				}
+				args, err := os.ReadFile(argsPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				operation := "checkpoint"
+				if filesystem {
+					operation = "fscheckpoint"
+				}
+				for _, arg := range []string{operation, "--image-path=" + req.ImagePath, "--leave-running", "--debug", "--debug-log=" + req.Debug.DebugLog} {
+					if !strings.Contains("\n"+string(args), "\n"+arg+"\n") {
+						t.Errorf("checkpoint lost argument %q: %s", arg, args)
+					}
+				}
+				if runtime.Debug || runtime.DebugLog != "" {
+					t.Fatal("per-request debug settings changed the shared runtime")
+				}
+				if cancelCheckpoint {
+					cancelOwner()
+				} else {
+					release()
+				}
+				if err := wait(); (err != nil) != cancelCheckpoint {
+					t.Fatalf("checkpoint result = %v, canceled = %t", err, cancelCheckpoint)
+				}
+				if err := os.WriteFile(command, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := g.Checkpoint(context.Background(), req); err != nil {
+					t.Fatalf("checkpoint retry: %v", err)
+				}
+			})
+		}
+	}
+}
 
-func (p *errorPublisher) Publish(_ context.Context, _ string, _ coreevents.Event) error {
+func TestVersionObservesCancellation(t *testing.T) {
+	command := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nexec sleep 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &runscService{}
+	s.versionCommand.Store(&command)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := NewGvisorTaskServer(s).Version(ctx, &pb.VersionRequest{}); err == nil {
+		t.Fatal("canceled Version succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Version ignored caller cancellation for %v", elapsed)
+	}
+}
+
+// errorPublisher is a publisher that always returns an error. It records the
+// contexts it is called with and whether it was closed.
+type errorPublisher struct {
+	ctxs   []context.Context
+	closed bool
+}
+
+func (p *errorPublisher) Publish(ctx context.Context, _ string, _ coreevents.Event) error {
+	p.ctxs = append(p.ctxs, ctx)
 	return fmt.Errorf("dial unix: missing address")
 }
 
-func (p *errorPublisher) Close() error { return nil }
-
-// TestForwardDoesNotPanicOnPublishError verifies that the event forward
-// function logs errors instead of panicking when the publisher fails and no
-// event sink is configured (empty TTRPC_ADDRESS). This is how the shim runs
-// under CRI-O, where publish errors are expected and non-fatal.
-func TestForwardDoesNotPanicOnPublishError(t *testing.T) {
-	// Empty TTRPC_ADDRESS means no event sink is configured (as under CRI-O).
-	t.Setenv("TTRPC_ADDRESS", "")
-
-	s := &runscService{
-		events: make(chan any, 2),
-	}
-	s.events <- &apievents.TaskCreate{ContainerID: "test"}
-	s.events <- &apievents.TaskExit{ContainerID: "test"}
-	close(s.events)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.forward(context.Background(), &errorPublisher{})
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("forward did not complete within timeout")
-	}
+func (p *errorPublisher) Close() error {
+	p.closed = true
+	return nil
 }
 
-// TestForwardPanicsOnPublishErrorUnderContainerd verifies that, when a
-// containerd event sink is configured (TTRPC_ADDRESS set), a publish failure
-// remains fatal (panics) as it did before CRI-O support was added. This keeps
-// the non-fatal behavior scoped to the CRI-O case only.
-func TestForwardPanicsOnPublishErrorUnderContainerd(t *testing.T) {
-	t.Setenv("TTRPC_ADDRESS", "/run/containerd/containerd.sock.ttrpc")
+// TestForwardDoesNotPanicOnPublishError verifies that the event forward loop
+// logs publish errors instead of panicking, whether or not an event sink is
+// configured (TTRPC_ADDRESS is empty under CRI-O). The publisher queues failed
+// events for retry, and with shim grouping a panic would take down every
+// container in the pod. It also verifies that events are published with a live
+// context that keeps the namespace, even once the shim context is done, and
+// that the publisher is closed once all events are drained.
+func TestForwardDoesNotPanicOnPublishError(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ttrpcAddress string
+	}{
+		{name: "no-event-sink", ttrpcAddress: ""},
+		{name: "containerd", ttrpcAddress: "/run/containerd/containerd.sock.ttrpc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TTRPC_ADDRESS", tc.ttrpcAddress)
 
-	s := &runscService{
-		events: make(chan any, 1),
-	}
-	s.events <- &apievents.TaskCreate{ContainerID: "test"}
-	close(s.events)
+			s := &runscService{
+				events: make(chan any, 2),
+			}
+			s.events <- &apievents.TaskCreate{ContainerID: "test"}
+			s.events <- &apievents.TaskExit{ContainerID: "test"}
+			close(s.events)
 
-	panicked := make(chan any, 1)
-	go func() {
-		defer func() { panicked <- recover() }()
-		s.forward(context.Background(), &errorPublisher{})
-	}()
+			// The shim context is done once shutdown completes.
+			ctx, cancel := context.WithCancel(namespaces.WithNamespace(context.Background(), "k8s.io"))
+			cancel()
 
-	select {
-	case r := <-panicked:
-		if r == nil {
-			t.Fatal("forward did not panic on publish error under containerd")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("forward did not complete within timeout")
+			pub := &errorPublisher{}
+			panicked := make(chan any, 1)
+			go func() {
+				defer func() { panicked <- recover() }()
+				s.forward(ctx, pub)
+			}()
+
+			select {
+			case r := <-panicked:
+				if r != nil {
+					t.Fatalf("forward panicked on publish error: %v", r)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("forward did not complete within timeout")
+			}
+			if got, want := len(pub.ctxs), 2; got != want {
+				t.Errorf("forward published %d events, want %d", got, want)
+			}
+			for _, pctx := range pub.ctxs {
+				if err := pctx.Err(); err != nil {
+					t.Errorf("event published with a done context: %v", err)
+				}
+				if ns, _ := namespaces.Namespace(pctx); ns != "k8s.io" {
+					t.Errorf("event published in namespace %q, want %q", ns, "k8s.io")
+				}
+			}
+			if !pub.closed {
+				t.Error("forward did not close the publisher")
+			}
+		})
 	}
 }
 
 // fakeOOMPoller reports a fixed OOM verdict per container id.
 type fakeOOMPoller struct {
-	oom map[string]bool
+	status map[string]oomStatus
 }
 
 func (f *fakeOOMPoller) add(string, any) error { return nil }
 func (f *fakeOOMPoller) run(context.Context)   {}
-func (f *fakeOOMPoller) isOOM(id string) bool  { return f.oom[id] }
-func (f *fakeOOMPoller) Close() error          { return nil }
+func (f *fakeOOMPoller) isOOM(id string) oomStatus {
+	return f.status[id]
+}
+func (f *fakeOOMPoller) Close() error { return nil }
 
 // nopPlatform is a no-op console platform for proc.Init.
 type nopPlatform struct{}
@@ -129,7 +281,7 @@ func TestCheckProcessesOOMExitStatus(t *testing.T) {
 	const sigkillStatus = 137 // 128 + SIGKILL
 	for _, tc := range []struct {
 		name        string
-		oom         bool
+		oom         oomStatus
 		exitStatus  int
 		wantStatus  int
 		wantTaskOOM bool
@@ -137,15 +289,25 @@ func TestCheckProcessesOOMExitStatus(t *testing.T) {
 		{
 			// Sentry OOM-killed: wait failed (128) and cgroup confirms OOM.
 			name:        "oom-internal-error-becomes-137",
-			oom:         true,
+			oom:         oomKilledUnpublished,
 			exitStatus:  proc.InternalErrorCode,
 			wantStatus:  sigkillStatus,
 			wantTaskOOM: true,
 		},
 		{
+			// The async watcher already published TaskOOM before the exit was
+			// processed: no duplicate event, but the exit status must still
+			// become 137 -- the kill happened whoever announced it.
+			name:        "oom-async-already-published-still-137",
+			oom:         oomKilledPublished,
+			exitStatus:  proc.InternalErrorCode,
+			wantStatus:  sigkillStatus,
+			wantTaskOOM: false,
+		},
+		{
 			// OOM confirmed but runsc reported a real status: keep it.
 			name:        "oom-real-status-preserved",
-			oom:         true,
+			oom:         oomKilledUnpublished,
 			exitStatus:  2,
 			wantStatus:  2,
 			wantTaskOOM: true,
@@ -153,7 +315,7 @@ func TestCheckProcessesOOMExitStatus(t *testing.T) {
 		{
 			// Wait failure without OOM: generic status stays 128.
 			name:        "no-oom-internal-error-preserved",
-			oom:         false,
+			oom:         oomNotKilled,
 			exitStatus:  proc.InternalErrorCode,
 			wantStatus:  proc.InternalErrorCode,
 			wantTaskOOM: false,
@@ -170,7 +332,9 @@ func TestCheckProcessesOOMExitStatus(t *testing.T) {
 			s := &runscService{
 				events:     make(chan any, 4),
 				containers: map[string]*Container{cid: c},
-				oomPoller:  &fakeOOMPoller{oom: map[string]bool{cid: tc.oom}},
+				oomPoller: &fakeOOMPoller{
+					status: map[string]oomStatus{cid: tc.oom},
+				},
 			}
 
 			s.checkProcesses(context.Background(), proc.Exit{
@@ -320,5 +484,202 @@ func TestCgroupNoUpdate(t *testing.T) {
 				t.Errorf("setPodCgroup(%+v), got: %v, want: false", tc.spec.Linux, updated)
 			}
 		})
+	}
+}
+
+// TestHasPodCgroupParent covers the gate on the exit-time OOM fallback. The
+// parent cgroup may stand in for the sandbox's own only when the sandbox sits
+// in a scope under the pod slice, which happens under Kubernetes with the
+// systemd cgroup driver and nowhere else.
+func TestHasPodCgroupParent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		cgroupsPath string
+		cgPath      string
+		noLinux     bool
+		want        bool
+	}{
+		{
+			name:        "k8s-systemd-containerd",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "kubepods-burstable-pod4a846df6_57ff_4ead_b37f_51b0d766508e.slice:cri-containerd:6bb325afe8a0",
+			cgPath:      "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod4a846df6_57ff_4ead_b37f_51b0d766508e.slice/cri-containerd-6bb325afe8a0.scope",
+			want:        true,
+		},
+		{
+			name:        "k8s-systemd-crio",
+			annotations: map[string]string{specutils.CRIOContainerTypeAnnotation: specutils.CRIOContainerTypeSandbox},
+			cgroupsPath: "kubepods-besteffort-pod4a846df6.slice:crio:6bb325afe8a0",
+			cgPath:      "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod4a846df6.slice/crio-6bb325afe8a0.scope",
+			want:        true,
+		},
+		{
+			// The spec asks for the pod slice but the sandbox landed
+			// elsewhere, so the parent is not the pod cgroup.
+			name:        "k8s-systemd-parent-mismatch",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "kubepods-burstable-pod4a846df6.slice:cri-containerd:6bb325afe8a0",
+			cgPath:      "/system.slice/cri-containerd-6bb325afe8a0.scope",
+		},
+		{
+			// The sandbox joins the pod cgroup instead of nesting under it,
+			// so the parent is the QoS slice shared by every burstable pod.
+			name:        "k8s-cgroupfs",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			cgroupsPath: "/kubepods/burstable/pod4a846df6/6bb325afe8a0",
+			cgPath:      "/kubepods/burstable/pod4a846df6",
+		},
+		{
+			// The parent is /system.slice, shared with sshd and containerd.
+			name:        "docker-systemd",
+			cgroupsPath: "system.slice:docker:6bb325afe8a0",
+			cgPath:      "/system.slice/docker-6bb325afe8a0.scope",
+		},
+		{
+			name:        "docker-cgroupfs",
+			cgroupsPath: "/docker/6bb325afe8a0",
+			cgPath:      "/docker/6bb325afe8a0",
+		},
+		{
+			name:        "no-linux-section",
+			annotations: map[string]string{specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox},
+			noLinux:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			spec := &specs.Spec{Annotations: tc.annotations}
+			if !tc.noLinux {
+				spec.Linux = &specs.Linux{CgroupsPath: tc.cgroupsPath}
+			}
+			if err := utils.WriteSpec(bundle, spec); err != nil {
+				t.Fatalf("WriteSpec: %v", err)
+			}
+			if got := hasPodCgroupParent(bundle, tc.cgPath); got != tc.want {
+				t.Errorf("hasPodCgroupParent(%q) = %v, want %v", tc.cgPath, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasPodCgroupParentNoSpec verifies that an unreadable bundle leaves the
+// fallback disabled rather than arming it on a guess.
+func TestHasPodCgroupParentNoSpec(t *testing.T) {
+	if hasPodCgroupParent(filepath.Join(t.TempDir(), "missing"), "/kubepods.slice/pod.slice/c.scope") {
+		t.Error("hasPodCgroupParent() = true for a bundle with no spec")
+	}
+}
+
+// TestCreateDoesNotBlockOtherContainers verifies that runscService.Create does
+// not hold s.mu across NewContainer, so RPCs for other containers in the pod
+// can proceed while runsc create is in flight.
+func TestCreateDoesNotBlockOtherContainers(t *testing.T) {
+	dir := t.TempDir()
+	enteredFIFO := filepath.Join(dir, "entered.fifo")
+	releaseFIFO := filepath.Join(dir, "release.fifo")
+	if err := unix.Mkfifo(enteredFIFO, 0o600); err != nil {
+		t.Fatalf("Mkfifo(entered): %v", err)
+	}
+	if err := unix.Mkfifo(releaseFIFO, 0o600); err != nil {
+		t.Fatalf("Mkfifo(release): %v", err)
+	}
+
+	bundle := filepath.Join(dir, "bundle")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bundle): %v", err)
+	}
+	if err := utils.WriteSpec(bundle, &specs.Spec{}); err != nil {
+		t.Fatalf("WriteSpec: %v", err)
+	}
+
+	pidFile := filepath.Join(bundle, "init.pid")
+	script := filepath.Join(dir, "fake-runsc")
+	scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '0' >%q\nprintf 'x' >%q\ncat %q >/dev/null\nexit 0\n", pidFile, enteredFIFO, releaseFIFO)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake-runsc): %v", err)
+	}
+
+	configPath := filepath.Join(dir, "config.toml")
+	configBody := fmt.Sprintf("binary_name = %q\nroot = %q\n", script, filepath.Join(dir, "root"))
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("WriteFile(config.toml): %v", err)
+	}
+	optsAny, err := typeurl.MarshalAnyToProto(&runtimeoptions.Options{ConfigPath: configPath})
+	if err != nil {
+		t.Fatalf("MarshalAnyToProto: %v", err)
+	}
+
+	existingInit := proc.New("existing", &runsccmd.Runsc{Command: script}, stdio.Stdio{})
+	s := &runscService{
+		containers: map[string]*Container{
+			"existing": {
+				ID:   "existing",
+				task: existingInit,
+			},
+		},
+	}
+
+	ctx := namespaces.WithNamespace(t.Context(), "test")
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := s.Create(ctx, &task.CreateTaskRequest{
+			ID:      "creating",
+			Bundle:  bundle,
+			Options: optsAny,
+		})
+		createDone <- err
+	}()
+
+	// Wait until fake-runsc is executing inside NewContainer.
+	enteredFile, err := os.Open(enteredFIFO)
+	if err != nil {
+		t.Fatalf("Open(enteredFIFO): %v", err)
+	}
+	var buf [1]byte
+	if _, err := enteredFile.Read(buf[:]); err != nil {
+		enteredFile.Close()
+		t.Fatalf("Read(enteredFIFO): %v", err)
+	}
+	enteredFile.Close()
+
+	// While Create for "creating" is blocked in runsc create, lookups for
+	// "existing" must not block on s.mu.
+	connectDone := make(chan error, 1)
+	go func() {
+		_, err := s.Connect(ctx, &task.ConnectRequest{ID: "existing"})
+		if err == nil {
+			_, err = s.getContainer("existing")
+		}
+		connectDone <- err
+	}()
+
+	select {
+	case err := <-connectDone:
+		if err != nil {
+			t.Errorf("Connect/getContainer(existing) failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("Connect/getContainer(existing) blocked while another container's Create was in flight")
+	}
+
+	// Unblock fake-runsc and wait for Create to finish.
+	releaseFile, err := os.OpenFile(releaseFIFO, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile(releaseFIFO): %v", err)
+	}
+	releaseFile.Close()
+
+	select {
+	case err := <-createDone:
+		if err != nil {
+			t.Fatalf("Create(creating) failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Create(creating) did not finish after releasing fake-runsc")
+	}
+
+	if _, err := s.getContainer("creating"); err != nil {
+		t.Errorf("getContainer(creating) after Create: %v", err)
 	}
 }

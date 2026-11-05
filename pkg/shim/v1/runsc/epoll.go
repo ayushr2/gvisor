@@ -74,8 +74,11 @@ func (e *epoller) run(ctx context.Context) {
 				if err == unix.EINTR || err == unix.EAGAIN {
 					continue
 				}
-				// Should not happen.
-				panic(fmt.Errorf("cgroups: epoll wait: %w", err))
+				// The remaining errors (EBADF, EFAULT, EINVAL) are permanent, so
+				// retrying would spin. Stop reporting OOM events rather than exit
+				// the shim, which would take down every container it serves.
+				log.L.WithError(err).Error("cgroups: epoll wait failed, no longer reporting OOM events")
+				return
 			}
 			for i := 0; i < n; i++ {
 				e.process(ctx, uintptr(events[i].Fd))
@@ -107,11 +110,11 @@ func (e *epoller) add(id string, cgx any) error {
 	return unix.EpollCtl(e.fd, unix.EPOLL_CTL_ADD, int(fd), &event)
 }
 
-// isOOM is not implemented for cgroups v1. The epoll-based eventfd mechanism
-// used in v1 provides direct kernel notification and is not subject to the
-// same race condition as v2's inotify-based EventChan.
-func (e *epoller) isOOM(id string) bool {
-	return false
+// isOOM is not implemented for cgroups v1. The epoll-based eventfd
+// mechanism used in v1 provides direct kernel notification and is not subject
+// to the same race condition as v2's inotify-based EventChan.
+func (e *epoller) isOOM(id string) oomStatus {
+	return oomNotKilled
 }
 
 // +checklocksexclude:e.mu
@@ -134,11 +137,9 @@ func (e *epoller) process(ctx context.Context, fd uintptr) {
 	if err := e.publisher.Publish(ctx, runtime.TaskOOMEventTopic, &TaskOOM{
 		ContainerID: i.id,
 	}); err != nil {
-		if publishFailureIsFatal() {
-			// Should not happen when an event sink is configured.
-			panic(fmt.Errorf("publish OOM event: %w", err))
-		}
-		log.L.Warningf("Failed to publish OOM event (no containerd event sink): %v", err)
+		// Not fatal, as in runscService.forward: the publisher has already
+		// queued the event for retry.
+		log.L.WithError(err).Warningf("Failed to publish OOM event, id: %q", i.id)
 	}
 }
 

@@ -18,15 +18,12 @@ import (
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
-
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // Register platforms to precompile filters for.
 	"gvisor.dev/gvisor/pkg/sync"
-
-	// Import platforms that we need to precompile filters for.
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms"
 )
 
 // Variable names used in precompiled filters.
@@ -37,6 +34,10 @@ const (
 
 	// selfPIDVarName is the variable name for the current process ID.
 	selfPIDVarName = "self_pid"
+
+	// procSelfFDVarName is the variable name for `Options.ProcSelfFD` used in
+	// the precompiled seccomp filters.
+	procSelfFDVarName = "proc_self_fd"
 )
 
 // allPrecompiledPlatforms returns a list of `platform.SeccompInfo` instances
@@ -132,6 +133,19 @@ func optionsToPrecompile() ([]Options, error) {
 			rdmaProxyNo.RDMAProxy = false
 			return []Options{rdmaProxyYes, rdmaProxyNo}, nil
 		},
+
+		// Expand the sets of vendor syscalls that may be available.
+		func(opt Options) ([]Options, error) {
+			noVendorSyscalls := opt
+			noVendorSyscalls.VendorSyscalls = nil
+			opts := []Options{noVendorSyscalls}
+			for _, names := range vendorSyscallSetsToPrecompile {
+				optCopy := opt
+				optCopy.VendorSyscalls = precompiledseccomp.PrecompileSyscallNumbers(names...)
+				opts = append(opts, optCopy)
+			}
+			return opts, nil
+		},
 	} {
 		var newOpts []Options
 		for _, opt := range opts {
@@ -148,6 +162,10 @@ func optionsToPrecompile() ([]Options, error) {
 
 // PrecompiledPrograms returns the set of seccomp programs to precompile.
 func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
+	return precompiledPrograms(precompiledseccomp.Parallelism())
+}
+
+func precompiledPrograms(parallelism int) ([]precompiledseccomp.Program, error) {
 	opts, err := optionsToPrecompile()
 	if err != nil {
 		return nil, err
@@ -155,6 +173,7 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 	programs := make([]precompiledseccomp.Program, len(opts))
 	var programsMu sync.Mutex
 	var errGroup errgroup.Group
+	errGroup.SetLimit(parallelism)
 	for i, opt := range opts {
 		i, opt := i, opt
 		errGroup.Go(func() error {

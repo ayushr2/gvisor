@@ -23,6 +23,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 )
 
@@ -33,7 +34,8 @@ func TestAsyncMFLoaderStartupError(t *testing.T) {
 		// A sub-page read limit fails before metadata or mainMF is loaded.
 		pages := stateio.NewIOReader(bytes.NewReader(nil), 1, 1, 1)
 		metadata := io.NopCloser(bytes.NewReader(nil))
-		loader := NewAsyncMFLoader(metadata, pages, nil, nil)
+		loader := NewAsyncMFLoader(metadata, pages, nil, nil, pgalloc.AsyncPagesFileLoadOpts{Throttled: true})
+		defer loader.Unthrottle()
 
 		startErr := loader.WaitMainMFStart()
 		if startErr == nil {
@@ -109,4 +111,31 @@ func TestCheckpointRegistrationDuringNotification(t *testing.T) {
 	if got := <-results; got.gen != gen || got.err != wantErr {
 		t.Fatalf("callback = (%+v, %v), want (%+v, %v)", got.gen, got.err, gen, wantErr)
 	}
+}
+
+// WaitForCheckpoint is a next-generation API, not a completion query for a
+// checkpoint that the caller may have already triggered.
+func TestWaitForNextCheckpoint(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var k Kernel
+		k.CheckpointWait.k = &k
+		k.OnCheckpointAttempt(nil)
+
+		result := make(chan error, 1)
+		go func() {
+			result <- k.WaitForCheckpoint()
+		}()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("WaitForCheckpoint returned for an earlier generation: %v", err)
+		default:
+		}
+
+		wantErr := errors.New("next checkpoint failed")
+		k.OnCheckpointAttempt(wantErr)
+		if got, want := <-result, wantErr; got != want {
+			t.Errorf("WaitForCheckpoint() = %v, want %v", got, want)
+		}
+	})
 }

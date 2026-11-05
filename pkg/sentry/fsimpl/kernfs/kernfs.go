@@ -130,6 +130,11 @@ type Filesystem struct {
 	// defaults to 0 and kernfs does not cache any dentries. This is immutable.
 	MaxCachedDentries uint64
 
+	// NoNegativeDentries preserves lookup errors during creation, including for
+	// names longer than NAME_MAX, as in Linux's fs/proc/generic.c:proc_lookup_de().
+	// Synthetic mountpoint creation is exempt. This is immutable.
+	NoNegativeDentries bool
+
 	// root is the root dentry of this filesystem. Note that root may be nil for
 	// filesystems on a disconnected mount without a root (e.g. pipefs, sockfs,
 	// hostfs). Filesystem holds an extra reference on root to prevent it from
@@ -188,6 +193,11 @@ func (fs *Filesystem) processDeferredDecRefs(ctx context.Context) {
 // VFSFilesystem returns the generic vfs filesystem object.
 func (fs *Filesystem) VFSFilesystem() *vfs.Filesystem {
 	return &fs.vfsfs
+}
+
+// RootDentry returns the root dentry of this filesystem.
+func (fs *Filesystem) RootDentry() *Dentry {
+	return fs.root
 }
 
 // NextIno allocates a new inode number on this filesystem.
@@ -341,6 +351,24 @@ func (d *Dentry) Invalidate(ctx context.Context) {
 	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
 }
 
+// InvalidateChild invalidates the cached child dentry with the given name and
+// all of its descendants, if present.
+func (d *Dentry) InvalidateChild(ctx context.Context, name string) {
+	d.fs.mu.RLock()
+	defer d.fs.processDeferredDecRefs(ctx)
+	defer d.fs.mu.RUnlock()
+	d.dirMu.Lock()
+	child, ok := d.children[name]
+	if !ok {
+		d.dirMu.Unlock()
+		return
+	}
+	delete(d.children, name)
+	d.dirMu.Unlock()
+
+	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
+}
+
 // cacheLocked should be called after d's reference count becomes 0. The ref
 // count check may happen before acquiring d.fs.mu so there might be a race
 // condition where the ref count is increased again by the time the caller
@@ -421,6 +449,10 @@ func (d *Dentry) cacheLocked(ctx context.Context) {
 func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 	// Evict the least recently used dentry because cache size is greater than
 	// max cache size (configured on mount).
+	//
+	// TODO(b/579946399): Don't evict dentries with inotify watches. Watches
+	// don't hold a reference on their target, so this may destroy the watches
+	// of inodes that are created on lookup.
 	fs.cachedDentries.Back().evictLocked(ctx)
 }
 
@@ -698,6 +730,17 @@ func (d *Dentry) Parent() *Dentry {
 	return d.parent.Load()
 }
 
+// IsFilesystemRoot implements vfs.MountVisibilityDentry.IsFilesystemRoot.
+func (d *Dentry) IsFilesystemRoot() bool {
+	return d.fs.root == d
+}
+
+// IsEmptyDir implements vfs.MountVisibilityDentry.IsEmptyDir.
+func (d *Dentry) IsEmptyDir() bool {
+	inode, ok := d.inode.(emptyDirInode)
+	return ok && inode.IsEmptyDir()
+}
+
 // The Inode interface maps filesystem-level operations that operate on paths to
 // equivalent operations on specific filesystem nodes.
 //
@@ -921,4 +964,10 @@ type InodeWithXattrs interface {
 
 	// RemoveXattr removes the given extended attribute.
 	RemoveXattr(ctx context.Context, name string) error
+}
+
+// emptyDirInode is implemented by directory inodes that can never contain
+// entries, analogous to Linux's make_empty_dir_inode()/is_empty_dir_inode().
+type emptyDirInode interface {
+	IsEmptyDir() bool
 }

@@ -113,8 +113,8 @@ func newInode(ctx context.Context, fs *filesystem) *inode {
 	return &inode{
 		pipe:  pipe.NewVFSPipe(false /* isNamed */, pipe.DefaultPipeSize),
 		ino:   fs.Filesystem.NextIno(),
-		uid:   creds.EffectiveKUID,
-		gid:   creds.EffectiveKGID,
+		uid:   creds.FilesystemKUID,
+		gid:   creds.FilesystemKGID,
 		ctime: ktime.NowFromContext(ctx),
 	}
 }
@@ -154,7 +154,7 @@ func (i *inode) Stat(_ context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOpti
 	defer i.attrMu.Unlock()
 	return linux.Statx{
 		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS,
-		Blksize:  hostarch.PageSize,
+		Blksize:  uint32(hostarch.PageSize),
 		Nlink:    1,
 		UID:      uint32(i.uid),
 		GID:      uint32(i.gid),

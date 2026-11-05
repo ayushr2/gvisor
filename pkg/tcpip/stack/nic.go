@@ -17,6 +17,7 @@ package stack
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -47,6 +48,11 @@ type nic struct {
 	kind    string
 	context NICContext
 
+	// minMTU and maxMTU are immutable bounds on MTU changes. Zero means that
+	// the corresponding bound is unrestricted.
+	minMTU uint32
+	maxMTU uint32
+
 	stats sharedStats
 
 	// enableDisableMu is used to synchronize attempts to enable/disable the NIC.
@@ -59,6 +65,12 @@ type nic struct {
 	networkEndpoints          map[tcpip.NetworkProtocolNumber]NetworkEndpoint `state:"wait"`
 	linkAddrResolvers         map[tcpip.NetworkProtocolNumber]*linkResolver
 	duplicateAddressDetectors map[tcpip.NetworkProtocolNumber]DuplicateAddressDetector
+
+	// disabledNetworkProtocols indicates network protocols disabled on
+	// this NIC.
+	//
+	// +checklocks:enableDisableMu
+	disabledNetworkProtocols []tcpip.NetworkProtocolNumber
 
 	// enabled indicates whether the NIC is enabled.
 	enabled atomicbitops.Bool
@@ -197,6 +209,8 @@ func newNIC(stack *Stack, id tcpip.NICID, ep LinkEndpoint, opts NICOptions) *nic
 		deliverLinkPackets:        opts.DeliverLinkPackets,
 		experimentIPOptionEnabled: opts.EnableExperimentIPOption,
 		kind:                      opts.Kind,
+		minMTU:                    opts.MinMTU,
+		maxMTU:                    opts.MaxMTU,
 	}
 	nic.linkResQueue.init(nic)
 
@@ -303,13 +317,62 @@ func (n *nic) enable() tcpip.Error {
 		return nil
 	}
 
-	for _, ep := range n.networkEndpoints {
+	for netProto, ep := range n.networkEndpoints {
+		if n.isNetworkProtocolDisabledRLocked(netProto) {
+			continue
+		}
 		if err := ep.Enable(); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// +checklocksread:n.enableDisableMu
+func (n *nic) isNetworkProtocolDisabledRLocked(protocol tcpip.NetworkProtocolNumber) bool {
+	return slices.Contains(n.disabledNetworkProtocols, protocol)
+}
+
+func (n *nic) setNetworkProtocolEnabled(protocol tcpip.NetworkProtocolNumber, enable bool) tcpip.Error {
+	n.enableDisableMu.Lock()
+	defer n.enableDisableMu.Unlock()
+
+	ep := n.getNetworkEndpoint(protocol)
+	if ep == nil {
+		return &tcpip.ErrUnknownProtocol{}
+	}
+	if n.isNetworkProtocolDisabledRLocked(protocol) != enable {
+		return nil
+	}
+	if enable {
+		n.disabledNetworkProtocols = slices.DeleteFunc(n.disabledNetworkProtocols, func(p tcpip.NetworkProtocolNumber) bool {
+			return p == protocol
+		})
+		if n.Enabled() {
+			return ep.Enable()
+		}
+		return nil
+	}
+	n.disabledNetworkProtocols = append(n.disabledNetworkProtocols, protocol)
+	ep.Disable()
+
+	// Clear the neighbour table (including static entries) as we cannot
+	// guarantee that the current neighbour table will be valid when the
+	// protocol is enabled again.
+	if linkRes, ok := n.linkAddrResolvers[protocol]; ok {
+		linkRes.neigh.clear()
+	}
+	return nil
+}
+
+func (n *nic) networkProtocolEnabled(protocol tcpip.NetworkProtocolNumber) (bool, tcpip.Error) {
+	n.enableDisableMu.RLock()
+	defer n.enableDisableMu.RUnlock()
+	if n.getNetworkEndpoint(protocol) == nil {
+		return false, &tcpip.ErrUnknownProtocol{}
+	}
+	return !n.isNetworkProtocolDisabledRLocked(protocol), nil
 }
 
 // remove detaches NIC from the link endpoint and releases network endpoint

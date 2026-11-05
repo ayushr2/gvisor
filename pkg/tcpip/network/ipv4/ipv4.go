@@ -30,7 +30,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
-	"gvisor.dev/gvisor/pkg/tcpip/network/hash"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/fragmentation"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/ip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/multicast"
@@ -58,9 +57,6 @@ const (
 
 	// DefaultTTL is the default time-to-live value for this endpoint.
 	DefaultTTL = 64
-
-	// buckets is the number of identifier buckets.
-	buckets = 2048
 
 	// The size of a fragment block, in bytes, as per RFC 791 section 3.1,
 	// page 14.
@@ -533,8 +529,9 @@ func (e *endpoint) handleFragments(_ *stack.Route, networkMTU uint32, pkt *stack
 	}
 }
 
-// recalculateChecksum recalculates the checksum of a TCP packet.
-func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
+// recalculateChecksum recalculates the transport checksum from the packet's
+// network header.
+func recalculateChecksum(pkt *stack.PacketBuffer) tcpip.Error {
 	// RXChecksumValidated indicates that checksum verification may be
 	// safely skipped.
 	if pkt.RXChecksumValidated {
@@ -553,7 +550,7 @@ func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
 			return &tcpip.ErrMalformedHeader{}
 		}
 		tcp := header.TCP(transportHeader)
-		xsum := r.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.PayloadLength())
+		xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), netHdr.PayloadLength())
 		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
 		tcp.SetChecksum(0)
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
@@ -562,7 +559,7 @@ func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
 			return &tcpip.ErrMalformedHeader{}
 		}
 		udp := header.UDP(transportHeader)
-		xsum := r.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.PayloadLength())
+		xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), netHdr.PayloadLength())
 		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
 		udp.SetChecksum(0)
 		csum := ^udp.CalculateChecksum(xsum)
@@ -625,10 +622,10 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Er
 			return nil
 		}
 
-		// Similar to the `ip_route_me_harder` in the kernel,
-		// we need to find a new route for the packet.
-		// Implementation is similar to the func forwardUnicastPacket.
-		newRoute, err := stk.FindRoute(0 /* nic id */, netHeader.SourceAddress(), newDstAddr, header.IPv4ProtocolNumber, false /* multicastLoop */)
+		// Find a new route for the rewritten destination, like Linux
+		// ip_route_me_harder. As there, the packet's source address does not
+		// restrict the route and is left unchanged.
+		newRoute, err := stk.FindRoute(0 /* nic id */, tcpip.Address{} /* localAddr */, newDstAddr, header.IPv4ProtocolNumber, false /* multicastLoop */)
 		if err != nil {
 			e.stats.ip.OutgoingPacketErrors.Increment()
 			return err // Drop the packet
@@ -641,7 +638,7 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Er
 		// we must calculate the full checksum; otherwise, NAT should have already
 		// done it.
 		if !r.RequiresTXTransportChecksum() && newRoute.RequiresTXTransportChecksum() {
-			if err := recalculateChecksum(pkt, newRoute); err != nil {
+			if err := recalculateChecksum(pkt); err != nil {
 				e.stats.ip.OutgoingPacketErrors.Increment()
 				return err // Drop the packet
 			}
@@ -1028,6 +1025,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 func (e *endpoint) handleLocalPacket(pkt *stack.PacketBuffer, canSkipRXChecksum bool) {
 	stats := e.stats.ip
 	stats.PacketsReceived.Increment()
+
+	if !e.isEnabled() {
+		stats.DisabledPacketsReceived.Increment()
+		return
+	}
 
 	pkt = pkt.CloneToInbound()
 	defer pkt.DecRef()
@@ -1676,11 +1678,6 @@ type protocol struct {
 	// uint8 portion of it is meaningful.
 	defaultTTL atomicbitops.Uint32
 
-	ids    []atomicbitops.Uint32
-	hashIV uint32
-	// idTS is the unix timestamp in milliseconds 'ids' was last accessed.
-	idTS atomicbitops.Int64
-
 	fragmentation *fragmentation.Fragmentation
 
 	options Options
@@ -2065,27 +2062,6 @@ func packetMustBeFragmented(pkt *stack.PacketBuffer, networkMTU uint32) bool {
 	return pkt.GSOOptions.Type == stack.GSONone && uint32(payload) > networkMTU
 }
 
-// addressToUint32 translates an IPv4 address into its little endian uint32
-// representation.
-//
-// This function does the same thing as binary.LittleEndian.Uint32 but operates
-// on a tcpip.Address (a string) without the need to convert it to a byte slice,
-// which would cause an allocation.
-func addressToUint32(addr tcpip.Address) uint32 {
-	addrBytes := addr.As4()
-	_ = addrBytes[3] // bounds check hint to compiler
-	return uint32(addrBytes[0]) | uint32(addrBytes[1])<<8 | uint32(addrBytes[2])<<16 | uint32(addrBytes[3])<<24
-}
-
-// hashRoute calculates a hash value for the given source/destination pair using
-// the addresses, transport protocol number and a 32-bit number to generate the
-// hash.
-func hashRoute(srcAddr, dstAddr tcpip.Address, protocol tcpip.TransportProtocolNumber, hashIV uint32) uint32 {
-	a := addressToUint32(srcAddr)
-	b := addressToUint32(dstAddr)
-	return hash.Hash3Words(a, b, uint32(protocol), hashIV)
-}
-
 // Options holds options to configure a new protocol.
 //
 // +stateify savable
@@ -2100,20 +2076,9 @@ type Options struct {
 
 // NewProtocolWithOptions returns an IPv4 network protocol.
 func NewProtocolWithOptions(opts Options) stack.NetworkProtocolFactory {
-	ids := make([]atomicbitops.Uint32, buckets)
-
-	// Randomly initialize hashIV and the ids.
-	r := hash.RandN32(1 + buckets)
-	for i := range ids {
-		ids[i] = atomicbitops.FromUint32(r[i])
-	}
-	hashIV := r[buckets]
-
 	return func(s *stack.Stack) stack.NetworkProtocol {
 		p := &protocol{
 			stack:      s,
-			ids:        ids,
-			hashIV:     hashIV,
 			defaultTTL: atomicbitops.FromUint32(DefaultTTL),
 			options:    opts,
 		}

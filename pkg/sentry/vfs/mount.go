@@ -37,6 +37,8 @@ const (
 	nsfsName        = "nsfs"
 	cgroupFsName    = "cgroup"
 	cgroup2FsName   = "cgroup2"
+	procFsName      = "proc"
+	sysFsName       = "sysfs"
 )
 
 // mountLockFlags records which of a Mount's flags a remount may not clear. It
@@ -165,6 +167,9 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 	}
 	if opts.ReadOnly {
 		mnt.setReadOnlyLocked(true)
+	}
+	if opts.lockReadOnly {
+		mnt.lockedFlags.readOnly = true
 	}
 	mnt.sharedEntry.Init(mnt)
 	refs.Register(mnt)
@@ -433,6 +438,28 @@ func (vfs *VirtualFilesystem) mountHasLockedChildren(mnt *Mount, vd VirtualDentr
 	return false
 }
 
+// CheckClonePrivateMount returns a non-nil error if a private mount without
+// submounts cannot be cloned from vd, as Linux's clone_private_mount() checks:
+// vd's mount must be in the caller's mount namespace or be the root of an
+// anonymous mount namespace, creds must hold CAP_SYS_ADMIN in the user
+// namespace owning vd's mount namespace, and no locked mount can be mounted at
+// or below vd.
+func (vfs *VirtualFilesystem) CheckClonePrivateMount(ctx context.Context, creds *auth.Credentials, vd VirtualDentry) error {
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+	mnt := vd.mount
+	if !vfs.validInMountNS(ctx, mnt) && (mnt.umounted || mnt.ns == nil || !mnt.ns.anon || mnt != mnt.ns.root) {
+		return linuxerr.EINVAL
+	}
+	if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, mnt.ns.Owner) {
+		return linuxerr.EPERM
+	}
+	if vfs.mountHasLockedChildren(mnt, vd) {
+		return linuxerr.EINVAL
+	}
+	return nil
+}
+
 // ConnectMountAt connects mnt at the path represented by target.
 //
 // Preconditions: mnt must be disconnected.
@@ -469,7 +496,7 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 // Roughly analogous to Linux fs/namespace.c:do_move_mount().
 func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Credentials, taskMountNs *MountNamespace, source *PathOperation, target *PathOperation) error {
 	// Lookup the source path
-	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{CheckSearchable: true})
+	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{})
 	if err != nil {
 		return err
 	}
@@ -493,7 +520,7 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 	}
 
 	// Lookup the target path
-	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{CheckSearchable: true})
+	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
 	if err != nil {
 		return err
 	}
@@ -861,15 +888,98 @@ func (vfs *VirtualFilesystem) RemountAt(ctx context.Context, creds *auth.Credent
 // This method returns the mounted Mount without a reference, for convenience
 // during VFS setup when there is no chance of racing with unmount.
 func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentials, source string, target *PathOperation, fsTypeName string, opts *MountOptions) (*Mount, error) {
-	mnt, err := vfs.MountDisconnected(ctx, creds, source, fsTypeName, opts)
+	fs, root, err := vfs.NewFilesystem(ctx, creds, source, fsTypeName, opts)
 	if err != nil {
 		return nil, err
 	}
+	checked := *opts
+	if vfs.MountTooRevealing(ctx, fs.FilesystemType().Name(), &checked) {
+		root.DecRef(ctx)
+		fs.DecRef(ctx)
+		return nil, linuxerr.EPERM
+	}
+	mnt := newMount(vfs, fs, root, nil /* mntns */, &checked)
 	defer mnt.DecRef(ctx)
 	if err := vfs.ConnectMountAt(ctx, creds, mnt, target); err != nil {
 		return nil, err
 	}
 	return mnt, nil
+}
+
+// MountVisibilityDentry is an optional extension to DentryImpl used by
+// MountTooRevealing. A Dentry that does not implement it is neither a
+// filesystem root nor an empty directory to MountTooRevealing.
+type MountVisibilityDentry interface {
+	// IsFilesystemRoot returns true if the Dentry is the root of its
+	// filesystem.
+	IsFilesystemRoot() bool
+
+	// IsEmptyDir returns true if the Dentry is a directory that can never
+	// contain entries.
+	IsEmptyDir() bool
+}
+
+// MountTooRevealing returns true if a new proc or sysfs mount of type
+// fsTypeName with options opts would give the mount namespace in ctx more
+// access to its filesystem than the namespace's existing mounts do. This
+// applies only to namespaces that are not owned by the initial user namespace.
+// When the new mount is allowed only because of read-only mounts, opts is set
+// to lock it read-only as well.
+//
+// It is analogous to fs/namespace.c:mount_too_revealing() in Linux.
+func (vfs *VirtualFilesystem) MountTooRevealing(ctx context.Context, fsTypeName string, opts *MountOptions) bool {
+	name := fsTypeName
+	if name != procFsName && name != sysFsName {
+		return false
+	}
+	mntns := MountNamespaceFromContext(ctx)
+	if mntns == nil {
+		return false
+	}
+	if mntns.Owner == mntns.Owner.Root() {
+		mntns.DecRef(ctx)
+		return false
+	}
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+	vfs.delayDecRef(mntns)
+	readOnlyVisible := false
+	for _, m := range mntns.root.submountsLocked() {
+		if m.fs.FilesystemType().Name() != name {
+			continue
+		}
+		if impl, ok := m.root.Impl().(MountVisibilityDentry); !ok || !impl.IsFilesystemRoot() {
+			continue
+		}
+		if m.lockedFlags.readOnly && !opts.ReadOnly {
+			continue
+		}
+		if vfs.mountHidesContent(m) {
+			continue
+		}
+		if !m.lockedFlags.readOnly {
+			return false
+		}
+		readOnlyVisible = true
+	}
+	if readOnlyVisible {
+		opts.lockReadOnly = true
+		return false
+	}
+	return true
+}
+
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) mountHidesContent(mnt *Mount) bool {
+	for child := range mnt.children {
+		if !child.locked {
+			continue
+		}
+		if impl, ok := child.point().Impl().(MountVisibilityDentry); !ok || !impl.IsEmptyDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // UmountAt removes the Mount at the given path.

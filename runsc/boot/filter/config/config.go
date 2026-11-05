@@ -39,6 +39,7 @@ type Options struct {
 	HostNetwork           bool
 	HostNetworkRawSockets bool
 	HostFilesystem        bool
+	ProcSelfFD            uint32
 	ProfileEnable         bool
 	NVProxy               bool
 	NVProxyCaps           nvconf.DriverCaps
@@ -47,6 +48,21 @@ type Options struct {
 	ControllerFD          uint32
 	CgoEnabled            bool
 	PluginNetwork         bool
+	VendorSyscalls        precompiledseccomp.VarSyscallNumbers
+}
+
+// vendorSyscalls is the set of vendor-specific syscalls that the Sentry may
+// use if the host supports them.
+var vendorSyscalls []precompiledseccomp.VarSyscall
+
+// vendorSyscallSetsToPrecompile lists the sets of `vendorSyscalls` (by name)
+// that may be available in practice.
+var vendorSyscallSetsToPrecompile [][]string
+
+// HostVendorSyscalls returns the vendor-specific syscalls that may be used on
+// the current host.
+func HostVendorSyscalls() precompiledseccomp.VarSyscallNumbers {
+	return precompiledseccomp.HostSupportedVariableSyscallNumbers(vendorSyscalls)
 }
 
 // isInstrumentationEnabled returns whether there are any
@@ -76,6 +92,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "RDMAProxy=%t ", opt.RDMAProxy)
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
 	fmt.Fprintf(&sb, "PluginNetwork=%t ", opt.PluginNetwork)
+	fmt.Fprintf(&sb, "VendorSyscalls=%q ", opt.VendorSyscalls.Key())
 	return strings.TrimSpace(sb.String())
 }
 
@@ -123,10 +140,14 @@ func (opt Options) Vars() precompiledseccomp.Values {
 	vars := precompiledseccomp.Values{
 		controllerFDVarName: opt.ControllerFD,
 	}
+	if opt.HostFilesystem {
+		vars[procSelfFDVarName] = opt.ProcSelfFD
+	}
 	vars.SetUint64(selfPIDVarName, uint64(os.Getpid()))
 	for varName, value := range opt.Platform.Variables() {
 		vars[varName] = value
 	}
+	opt.VendorSyscalls.SetVars(vars)
 	return vars
 }
 
@@ -141,6 +162,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	s := allowedSyscalls.Copy()
 	s.Merge(selfPIDFilters(vars.GetUint64(selfPIDVarName)))
 	s.Merge(controlServerFilters(vars[controllerFDVarName]))
+	s.Merge(precompiledseccomp.VarSyscallRules(vendorSyscalls, opt.VendorSyscalls, vars))
 
 	// Set of additional filters used by -race and -msan. Returns empty
 	// when not enabled.
@@ -153,7 +175,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(profileFilters())
 	}
 	if opt.HostFilesystem {
-		s.Merge(hostFilesystemFilters())
+		s.Merge(hostFilesystemFilters(vars))
 	}
 	if opt.NVProxy {
 		s.Merge(nvproxy.Filters(opt.NVProxyCaps))

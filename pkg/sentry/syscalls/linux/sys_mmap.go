@@ -27,9 +27,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
-
 	ppb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Brk implements linux syscall brk(2).
@@ -273,7 +272,7 @@ func Mincore(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	if mapped != uint64(la) {
 		return 0, nil, linuxerr.ENOMEM
 	}
-	resident := bytes.Repeat([]byte{1}, int(mapped/hostarch.PageSize))
+	resident := bytes.Repeat([]byte{1}, int(mapped>>hostarch.PageShift))
 	_, err := t.CopyOutBytes(vec, resident)
 	return 0, nil, err
 }

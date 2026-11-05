@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -417,6 +417,34 @@ func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
 	return new(strconv.Itoa(pid), "", useSystemd)
 }
 
+// NewSelf loads the cgroup of the current process for inspection. Unlike
+// NewFromPid, it preserves the leaf cgroup path on cgroup v2 rather than
+// resolving its parent directory.
+func NewSelf() (Cgroup, error) {
+	parents, err := loadPaths("self")
+	if err != nil {
+		return nil, fmt.Errorf("finding current cgroups: %w", err)
+	}
+	return newSelf(parents, IsOnlyV2(), cgroupRoot())
+}
+
+func newSelf(parents map[string]string, isV2 bool, root string) (Cgroup, error) {
+	if isV2 {
+		p, ok := parents[cgroup2Key]
+		if !ok {
+			return nil, ErrInvalidGroupPath
+		}
+		return &cgroupV2{
+			Mountpoint: root,
+			Path:       p,
+		}, nil
+	}
+	return &cgroupV1{
+		Parents: parents,
+		Own:     make(map[string]bool),
+	}, nil
+}
+
 // LikelySystemdPath returns true if the path looks like a systemd path. This is
 // by no means an exhaustive check, it's just a useful proxy for logging a
 // warning.
@@ -485,6 +513,21 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 	}
 	log.Debugf("New cgroup for pid: %s, %T: %+v", pid, cg, cg)
 	return cg, nil
+}
+
+// OwnsCPULimit returns whether `Install` set `cg`'s CPU limit, i.e. it created
+// the cgroup rather than finding it pre-configured.
+func OwnsCPULimit(cg Cgroup) bool {
+	switch c := cg.(type) {
+	case *cgroupSystemd:
+		return true
+	case *cgroupV2:
+		return slices.Contains(c.Own, c.MakePath(""))
+	case *cgroupV1:
+		return c.Own["cpu"]
+	default:
+		return false
+	}
 }
 
 // InstallSubcontainerCompatDir creates the host-side cgroup directory for a

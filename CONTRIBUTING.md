@@ -2,6 +2,11 @@
 
 Want to contribute? Great! First, read this page.
 
+For questions about development, use the [#gvisor-dev][slack-gvisor-dev] channel
+in the CNCF Slack workspace. Before you can join the channel, get an invitation
+from the self-service page at [slack.cncf.io][cncf-slack-invite] and accept it
+in your email.
+
 ## Contributor License Agreement
 
 Contributions to this project must be accompanied by a Contributor License
@@ -34,23 +39,6 @@ standard before seeking review, respecting maintainers' time, and must be
 **prepared to discuss and justify their contributions** during the review
 process.
 
-#### Label AI-assisted Work
-
-**Transparently label all contributions containing substantial AI-generated
-content.** This should be done in the pull request description, commit message,
-or any standard authorship area, for example, by adding
-
-`Assisted-by: <name of the AI tool used>`
-
-to your commit message.
-
-Such transparency is crucial for the community to understand and build best
-practices around AI tool usage. This policy includes, but is not limited to:
-
--   Code changes in a pull request
--   Issues or security vulnerabilities
--   Comments and feedback on pull requests or issues
-
 ## Editor Setup
 
 ### Visual Studio Code
@@ -66,10 +54,13 @@ clangd compilation database is generated. Afterwards, language server features
 the box" for both Go and C++. VSCode's terminal will open in the dev container,
 where you can run `bazel build`, `bazel test`, and so on to work on gVisor.
 
-For example, you can build and run `runsc` in the dev container as follows:
+For example, you can build and run `runsc` in the dev container as follows. The
+`//:release` target builds `runsc` together with the `gvisor-bin/` directory of
+sidecar binaries, such as the Sentry, that `runsc` runs:
 
 ```
-bazel run //runsc -- --rootless do bash
+bazel build //:release
+bazel-bin/release/runsc --rootless do bash
 ```
 
 Alternatively, it is possible to develop gVisor without a dev container. For the
@@ -80,14 +71,9 @@ run, and test gVisor in a container, which is handled automatically using
 `make`. For example, to build and run `runsc`:
 
 ```
-make copy TARGETS=//runsc DESTINATION=./runsc-dev
-./runsc-dev --rootless do bash
-```
-
-For non-interactive commands, `make run` can be used as a shorthand as follows:
-
-```
-make run TARGETS=//runsc ARGS="--rootless do echo hello world"
+mkdir -p runsc-dev
+make copy TARGETS=//:release DESTINATION=./runsc-dev
+./runsc-dev/runsc --rootless do bash
 ```
 
 In addition, for language server support in C++ files (e.g. the syscall tests):
@@ -176,7 +162,8 @@ Rules:
     *   `@com_github_opencontainers_runtime_spec//specs_go:go_default_library`
         (Go import `github.com/opencontainers/runtime-spec/specs_go`).
 
-*   For performance reasons, `runsc boot` may not run the `netpoller` goroutine.
+*   For performance reasons, the Sentry (`gvisor_sentry boot`) may not run the
+    `netpoller` goroutine.
 
 ## Code reviews
 
@@ -246,6 +233,8 @@ one above, the
 [gcla]: https://cla.developers.google.com/about/google-individual
 [gccla]: https://cla.developers.google.com/about/google-corporate
 [github]: https://github.com/google/gvisor/compare
+[cncf-slack-invite]: https://slack.cncf.io/
+[slack-gvisor-dev]: https://cloud-native.slack.com/archives/C0CCZ4S4V62
 [gvisor-dev-list]: https://groups.google.com/forum/#!forum/gvisor-dev
 [go]: https://go.dev/doc/install
 [bazelisk]: https://github.com/bazelbuild/bazelisk

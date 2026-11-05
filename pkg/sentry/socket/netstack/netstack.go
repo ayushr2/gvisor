@@ -36,7 +36,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
@@ -458,7 +457,7 @@ type sock struct {
 	// valid when timestampValid is true.
 	//
 	// +checklocks:readMu
-	timestamp time.Time `state:".(int64)"`
+	timestamp time.Time
 
 	// TODO(b/153685824): Move this to SocketOptions.
 	// sockOptInq corresponds to TCP_INQ.
@@ -1277,6 +1276,7 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 			RTTVar:      uint32(v.RTTVar / time.Microsecond),
 			SndSsthresh: v.SndSsthresh,
 			SndCwnd:     v.SndCwnd,
+			SndMss:      v.SndMss,
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:
@@ -1552,12 +1552,12 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 		return a.(*linux.SockAddrInet6), nil
 
 	case linux.IP6T_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)
@@ -1790,12 +1790,12 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 		return a.(*linux.SockAddrInet), nil
 
 	case linux.IPT_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)

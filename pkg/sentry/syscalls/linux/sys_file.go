@@ -166,7 +166,7 @@ func copyInOpenHow(t *kernel.Task, addr hostarch.Addr, size uint) (linux.OpenHow
 	if size < linux.OPEN_HOW_SIZE_VER0 {
 		return linux.OpenHow{}, linuxerr.EINVAL
 	}
-	if size > hostarch.PageSize {
+	if size > uint(hostarch.PageSize) {
 		return linux.OpenHow{}, linuxerr.E2BIG
 	}
 
@@ -286,13 +286,18 @@ func accessAt(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, mode uint32, 
 		// uid/gid. We do this by temporarily clearing all FS-related
 		// capabilities and switching the fsuid/fsgid around to the
 		// real ones." -fs/open.c:faccessat
+		//
+		// Like Linux's access_override_creds(), only the filesystem IDs
+		// change, and SECBIT_NO_SETUID_FIXUP keeps the effective set.
 		creds = creds.Fork()
-		creds.EffectiveKUID = creds.RealKUID
-		creds.EffectiveKGID = creds.RealKGID
-		if creds.EffectiveKUID.In(creds.UserNamespace) == auth.RootUID {
-			creds.EffectiveCaps = creds.PermittedCaps
-		} else {
-			creds.EffectiveCaps = 0
+		creds.FilesystemKUID = creds.RealKUID
+		creds.FilesystemKGID = creds.RealKGID
+		if !creds.NoSetUIDFixup {
+			if creds.RealKUID.In(creds.UserNamespace) == auth.RootUID {
+				creds.EffectiveCaps = creds.PermittedCaps
+			} else {
+				creds.EffectiveCaps = 0
+			}
 		}
 	}
 

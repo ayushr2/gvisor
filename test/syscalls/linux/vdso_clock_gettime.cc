@@ -13,21 +13,19 @@
 // limitations under the License.
 
 #include <stdint.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
-#include <syscall.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <map>
 #include <string>
-#include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
 
 namespace gvisor {
@@ -56,18 +54,23 @@ TEST_P(MonotonicVDSOClockTest, IsCorrect) {
 
   // Check that when we alternate readings from the clock_gettime syscall and
   // the VDSO's implementation, we observe the combined sequence as being
-  // monotonic.
+  // monotonic, including across a checkpoint and restore halfway through.
   struct timespec tvdso, tsys;
   absl::Time vdso_time, sys_time;
-  ASSERT_THAT(syscall(__NR_clock_gettime, GetParam(), &tsys),
-              SyscallSucceeds());
+  ASSERT_THAT(syscall(SYS_clock_gettime, GetParam(), &tsys), SyscallSucceeds());
   sys_time = absl::TimeFromTimespec(tsys);
-  auto end = absl::Now() + absl::Seconds(10);
+  auto save = absl::Now() + absl::Seconds(5);
+  auto end = absl::InfiniteFuture();
   while (absl::Now() < end) {
+    if (absl::Now() >= save) {
+      MaybeSave();
+      save = absl::InfiniteFuture();
+      end = absl::Now() + absl::Seconds(5);
+    }
     ASSERT_THAT(clock_gettime(GetParam(), &tvdso), SyscallSucceeds());
     vdso_time = absl::TimeFromTimespec(tvdso);
     EXPECT_LE(sys_time, vdso_time);
-    ASSERT_THAT(syscall(__NR_clock_gettime, GetParam(), &tsys),
+    ASSERT_THAT(syscall(SYS_clock_gettime, GetParam(), &tsys),
                 SyscallSucceeds());
     sys_time = absl::TimeFromTimespec(tsys);
     EXPECT_LE(vdso_time, sys_time);

@@ -626,6 +626,10 @@ func goString(cstring []byte) string {
 	return string(cstring)
 }
 
+// SizeOfXTCommentInfo is sizeof(struct xt_comment_info) in
+// include/uapi/linux/netfilter/xt_comment.h.
+const SizeOfXTCommentInfo = 256
+
 // XTTCP holds data for matching TCP packets. It corresponds to struct xt_tcp
 // in include/uapi/linux/netfilter/xt_tcpudp.h.
 //
@@ -1081,6 +1085,9 @@ type XTAddrtypeInfoV1 struct {
 	Dest   uint16
 	Flags  uint32
 }
+
+// SizeOfXTAddrtypeInfoV1 is the size of struct xt_addrtype_info_v1.
+const SizeOfXTAddrtypeInfoV1 = 8
 
 // XTAddrtypeInfo corresponds to struct xt_addrtype_info in
 // include/uapi/linux/netfilter/xt_addrtype.h.

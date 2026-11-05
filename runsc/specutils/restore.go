@@ -151,11 +151,12 @@ var allowedRestoreFlagAnnotations = []string{
 	annotationFlagPrefix + "log-packets",
 }
 
+const annotationMountPrefix = "dev.gvisor.spec.mount."
+
 func shouldValidateAnnotation(key string) bool {
 	const (
 		gvisorPrefix   = "dev.gvisor."
 		internalPrefix = "dev.gvisor.internal."
-		mntPrefix      = "dev.gvisor.spec.mount."
 	)
 	// Only validate gVisor annotations.
 	if !strings.HasPrefix(key, gvisorPrefix) {
@@ -172,7 +173,7 @@ func shouldValidateAnnotation(key string) bool {
 		return false
 	}
 	// The source of a mount can change during restore.
-	if strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source") {
+	if strings.HasPrefix(key, annotationMountPrefix) && strings.HasSuffix(key, ".source") {
 		return false
 	}
 	// Flag annotations controlling debug logging can change. They don't impact
@@ -187,12 +188,49 @@ func shouldValidateAnnotation(key string) bool {
 	return true
 }
 
+// isMountOptionsAnnotation reports whether key is a
+// "dev.gvisor.spec.mount.<name>.options" annotation.
+func isMountOptionsAnnotation(key string) bool {
+	rest, ok := strings.CutPrefix(key, annotationMountPrefix)
+	if !ok {
+		return false
+	}
+	name, field, ok := strings.Cut(rest, ".")
+	return ok && name != "" && field == "options"
+}
+
+// stripMountOptionsSize removes "size=<value>" tokens from a comma-separated
+// mount options string. The container runtime shim may populate "size=" from
+// the host tmpfs backing a pod volume (e.g. /dev/shm sized from node
+// allocatable memory by kubelet), which can vary across checkpoint and restore
+// hosts while the restored sandbox tmpfs retains its checkpointed size limit.
+func stripMountOptionsSize(opts string) string {
+	if opts == "" {
+		return ""
+	}
+	var kept []string
+	for _, opt := range strings.Split(opts, ",") {
+		if opt == "" || strings.HasPrefix(opt, "size=") {
+			continue
+		}
+		kept = append(kept, opt)
+	}
+	return strings.Join(kept, ",")
+}
+
 func extractAnnotationsToValidate(o map[string]string) map[string]string {
 	n := make(map[string]string)
 	for key, val := range o {
-		if shouldValidateAnnotation(key) {
-			n[key] = val
+		if !shouldValidateAnnotation(key) {
+			continue
 		}
+		if isMountOptionsAnnotation(key) {
+			val = stripMountOptionsSize(val)
+			if val == "" {
+				continue
+			}
+		}
+		n[key] = val
 	}
 	return n
 }
@@ -202,6 +240,16 @@ func validateAnnotations(cName string, before, after map[string]string) error {
 	newM := extractAnnotationsToValidate(after)
 	if !reflect.DeepEqual(oldM, newM) {
 		return validateError("Annotations", cName, oldM, newM)
+	}
+	for key, oldVal := range before {
+		if isMountOptionsAnnotation(key) && oldVal != after[key] {
+			log.Warningf("Annotation %q changed during restore for container %q: checkpoint %q, restore %q; checkpointed tmpfs size limit is retained", key, cName, oldVal, after[key])
+		}
+	}
+	for key, newVal := range after {
+		if _, ok := before[key]; !ok && isMountOptionsAnnotation(key) && newVal != "" {
+			log.Warningf("Annotation %q changed during restore for container %q: checkpoint %q, restore %q; checkpointed tmpfs size limit is retained", key, cName, "", newVal)
+		}
 	}
 	return nil
 }
@@ -460,13 +508,17 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 	}
 	oldLinux.Namespaces, newLinux.Namespaces = nil, nil
 
-	// Hostname, Domainname, Environment variables and CgroupsPath are
-	// allowed to change during restore. Hooks contain callbacks for
+	// Hostname, Domainname, Environment variables, OOMScoreAdj and
+	// CgroupsPath are allowed to change during restore. OOMScoreAdj only
+	// affects host OOM-kill ordering of the sandbox and gofer processes, and
+	// may be derived from the host (e.g. Kubernetes computes it from node
+	// memory capacity for Burstable pods). Hooks contain callbacks for
 	// lifecycle of the container such as prestart and teardown, and can
 	// change. Do not validate these fields.
 	oldSpec.Hostname, newSpec.Hostname = "", ""
 	oldSpec.Domainname, newSpec.Domainname = "", ""
 	oldProcess.Env, newProcess.Env = nil, nil
+	oldProcess.OOMScoreAdj, newProcess.OOMScoreAdj = nil, nil
 	oldLinux.CgroupsPath, newLinux.CgroupsPath = "", ""
 	oldSpec.Hooks, newSpec.Hooks = nil, nil
 

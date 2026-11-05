@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -33,23 +34,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
-	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/pkg/state/pretty"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/test/runner/gtest"
 	"gvisor.dev/gvisor/test/trace/config"
 	"gvisor.dev/gvisor/test/uds"
-
-	"github.com/creack/pty"
 )
 
 var (
@@ -60,6 +57,7 @@ var (
 	platform           = flag.String("platform", "ptrace", "platform to run on")
 	platformSupport    = flag.String("platform-support", "", "String passed to the test as GVISOR_PLATFORM_SUPPORT environment variable. Used to determine which syscall tests are expected to work with the current platform.")
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
+	limitPorts         = flag.Bool("limit-ephemeral-ports", false, "constrain the private network namespace's ephemeral port range for exhaustion tests")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
 	fusefs             = flag.Bool("fusefs", false, "mounts a fusefs for /tmp")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
@@ -78,7 +76,6 @@ var (
 	waitForPid       = flag.Duration("delay-for-debugger", 0, "Print out the sandbox PID and wait for the specified duration to start the test. This is useful for attaching a debugger to the runsc-sandbox process.")
 	save             = flag.Bool("save", false, "enables save restore")
 	saveResume       = flag.Bool("save-resume", false, "enables save resume")
-	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
 	inSandboxCgroup  = flag.String("in-sandbox-cgroup", "v1", "cgroup setup to use inside the sandbox (v1 or v2)")
@@ -114,6 +111,16 @@ func getSetupContainerPath() string {
 	return setupContainer
 }
 
+// wrapInSetupContainer configures the already-owned namespaces before exec.
+func wrapInSetupContainer(cmd *exec.Cmd) {
+	cmd.Path = getSetupContainerPath()
+	args := []string{cmd.Path}
+	if *limitPorts {
+		args = append(args, "--limit-ephemeral-ports")
+	}
+	cmd.Args = append(args, cmd.Args...)
+}
+
 func removeShardAndXMLEnvVars(env []string, tc *gtest.TestCase) []string {
 	// Remove shard env variables so that the gunit binary does not try to
 	// interpret them.
@@ -128,7 +135,7 @@ func removeShardAndXMLEnvVars(env []string, tc *gtest.TestCase) []string {
 		// Provide a dynamically generated, unique output file path for each test case execution
 		// so their individual C++ metadata and results are preserved. They will be collated later.
 		if origXML, ok := unix.Getenv("XML_OUTPUT_FILE"); ok && len(origXML) > 0 {
-			safeName := strings.ReplaceAll(tc.Name, "/", "_")
+			safeName := url.PathEscape(tc.FullName())
 			env = append(env, fmt.Sprintf("XML_OUTPUT_FILE=%s.%s%s", origXML, safeName, uniqueXMLSuffix))
 		}
 	}
@@ -246,9 +253,7 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 	}
 
 	if *container || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
-		// setup_container takes in its target argv as positional arguments.
-		cmd.Path = getSetupContainerPath()
-		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
+		wrapInSetupContainer(cmd)
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS | unix.CLONE_NEWNS
 		// Set current user/group as root inside the namespace.
 		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
@@ -294,37 +299,41 @@ func printOne(dir string, file string, html bool, postfix string) {
 	if err != nil {
 		return
 	}
-	r, m, err := statefile.NewReader(f, nil)
+	m, err := statefile.MetadataUnsafe(f)
+	f.Close()
 	if err != nil {
 		return
 	}
-	defer r.Close()
-	w, err := os.Create(dir + postfix)
+	outPath := dir + postfix
+	w, err := os.Create(outPath)
 	if err != nil {
 		return
 	}
-	defer w.Close()
-
-	cu := cleanup.Make(func() {
-		os.Remove(dir + postfix)
-	})
-	defer cu.Clean()
-	if html {
-		// Print just the HTML stream.
-		if err := pretty.PrintHTML(w, r); err != nil {
-			return
-		}
-	} else {
+	if !html {
 		// Print the metadata first.
 		if _, err := fmt.Fprintf(w, "%v\n", m); err != nil {
-			return
-		}
-		// Then print the rest of the text.
-		if err := pretty.PrintText(w, r); err != nil {
+			w.Close()
+			os.Remove(outPath)
 			return
 		}
 	}
-	cu.Release()
+	args := []string{"statefile"}
+	if html {
+		args = append(args, "-html")
+	}
+	args = append(args, "--", file)
+	var stderr bytes.Buffer
+	cmd := exec.Command(specutils.ExePath, args...)
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	closeErr := w.Close()
+	if err != nil || closeErr != nil {
+		if err != nil {
+			log.Warningf("Failed to print statefile %s: %v (%s)", file, err, bytes.TrimSpace(stderr.Bytes()))
+		}
+		os.Remove(outPath)
+	}
 }
 
 func prepareSave(args []string, undeclaredOutputsDir string, index int) ([]string, string, error) {
@@ -354,7 +363,8 @@ func deleteSandbox(args []string, id string) error {
 //
 // Returns an error if the sandboxed application exits non-zero.
 func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
-	var hostTTYFile *os.File
+	var extraFiles []*os.File
+	var passFDArgs []string
 
 	if *addHostTTY {
 		ptmx, pts, err := pty.Open()
@@ -363,8 +373,36 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		}
 		defer ptmx.Close()
 		defer pts.Close()
-		hostTTYFile = pts
+		extraFiles = append(extraFiles, pts)
+		passFDArgs = append(passFDArgs, fmt.Sprintf("--pass-fd=%d:%d", hostPTYHostFD, hostPTYGuestFD))
 		spec.Process.Env = append(spec.Process.Env, fmt.Sprintf("TEST_HOST_PTY_FD=%d", hostPTYGuestFD))
+	}
+
+	if *overlay {
+		for _, kv := range spec.Process.Env {
+			xmlPath, ok := strings.CutPrefix(kv, "XML_OUTPUT_FILE=")
+			if !ok || xmlPath == "" {
+				continue
+			}
+			// Opening the report on the host keeps its writes out of the
+			// overlay. Keep it open across every checkpoint/restore, and let
+			// GTest reopen it through procfs when writing its final report.
+			xmlFile, err := os.Create(xmlPath)
+			if err != nil {
+				return fmt.Errorf("creating XML report: %w", err)
+			}
+			defer xmlFile.Close()
+			// Use the first guest descriptor after stdio, before tests allocate
+			// their own descriptors (including close_range test ranges).
+			const xmlGuestFD = 3
+			passFDArgs = append(passFDArgs, fmt.Sprintf("--pass-fd=%d:%d", 3+len(extraFiles), xmlGuestFD))
+			extraFiles = append(extraFiles, xmlFile)
+			spec.Process.Env = filterEnv(spec.Process.Env, []string{"XML_OUTPUT_FILE", "GTEST_OUTPUT", "GUNIT_OUTPUT"})
+			spec.Process.Env = append(spec.Process.Env,
+				fmt.Sprintf("XML_OUTPUT_FILE=/proc/self/fd/%d", xmlGuestFD),
+				fmt.Sprintf("GTEST_OUTPUT=xml:/proc/self/fd/%d", xmlGuestFD))
+			break
+		}
 	}
 
 	bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
@@ -487,9 +525,6 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 
 		// Create the state file.
 		if *save || *saveResume {
-			if *netstackSR {
-				args = append(args, "--save-restore-netstack=true")
-			}
 			saveArgs = args
 			args, currentSaveDir, err = prepareSave(args, undeclaredOutputsDir, 0)
 			if err != nil {
@@ -526,17 +561,17 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	var cmdArgs []string
 	if *waitForPid != 0 {
 		createArgs := append(args, "create")
-		if hostTTYFile != nil {
-			createArgs = append(createArgs, fmt.Sprintf("--pass-fd=%d:%d", hostPTYHostFD, hostPTYGuestFD))
-		}
+		createArgs = append(createArgs, passFDArgs...)
 		createArgs = append(createArgs, "-pid-file", filepath.Join(testLogDir, "pid"), "--bundle", bundleDir, id)
 		defer os.Remove(filepath.Join(testLogDir, "pid"))
 		log.Infof("Executing: %v", append([]string{specutils.ExePath}, createArgs...))
 		createCmd := exec.Command(specutils.ExePath, createArgs...)
-		if hostTTYFile != nil {
-			createCmd.ExtraFiles = append(createCmd.ExtraFiles, hostTTYFile)
-		}
+		createCmd.ExtraFiles = extraFiles
 		createCmd.SysProcAttr = sysProcAttr
+		if *limitPorts {
+			createCmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+			wrapInSetupContainer(createCmd)
+		}
 		createCmd.Stdout = os.Stdout
 		createCmd.Stderr = os.Stderr
 		if err := createCmd.Run(); err != nil {
@@ -570,21 +605,18 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		cmdArgs = append(args, "start", id)
 	} else {
 		cmdArgs = append(args, "run")
-		if hostTTYFile != nil {
-			cmdArgs = append(cmdArgs, fmt.Sprintf("--pass-fd=%d:%d", hostPTYHostFD, hostPTYGuestFD))
-		}
+		cmdArgs = append(cmdArgs, passFDArgs...)
 		cmdArgs = append(cmdArgs, "--bundle", bundleDir, id)
 	}
 	log.Infof("Executing: %v", append([]string{specutils.ExePath}, cmdArgs...))
 	cmd := exec.Command(specutils.ExePath, cmdArgs...)
-	if hostTTYFile != nil && *waitForPid == 0 {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, hostTTYFile)
+	if *waitForPid == 0 {
+		cmd.ExtraFiles = extraFiles
 	}
 	cmd.SysProcAttr = sysProcAttr
 	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
-		cmd.Path = getSetupContainerPath()
-		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
+		wrapInSetupContainer(cmd)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -667,14 +699,16 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 				os.RemoveAll(currentRestoreDir)
 				return fmt.Errorf("prepareSave error: %v", err)
 			}
-			restoreArgs = append(restoreArgs, "restore", "--image-path", currentRestoreDir, "--bundle", bundleDir, id)
+			restoreArgs = append(restoreArgs, "restore")
+			restoreArgs = append(restoreArgs, passFDArgs...)
+			restoreArgs = append(restoreArgs, "--image-path", currentRestoreDir, "--bundle", bundleDir, id)
 			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
 			restoreCmd := exec.Command(specutils.ExePath, restoreArgs...)
+			restoreCmd.ExtraFiles = extraFiles
 			restoreCmd.SysProcAttr = sysProcAttr
 			if *container || *network == "host" || (restoreCmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
 				restoreCmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
-				restoreCmd.Path = getSetupContainerPath()
-				restoreCmd.Args = append([]string{restoreCmd.Path}, restoreCmd.Args...)
+				wrapInSetupContainer(restoreCmd)
 			}
 			restoreCmd.Stdout = os.Stdout
 			restoreCmd.Stderr = os.Stderr
@@ -779,6 +813,7 @@ func isWarning(line string) bool {
 	case strings.Contains(line, "is not permitted, dropping it."):
 	case strings.Contains(line, "sndPrepopulatedMsg failed"):
 	case strings.Contains(line, "TSC snapshot unavailable"):
+	case strings.Contains(line, "No TSC snapshot is available, unable to save TSC"):
 	case strings.Contains(line, "copy up failed to copy up contents"):
 	case strings.Contains(line, "populate failed for"):
 	case strings.Contains(line, "ASAN is enabled: syscall filters less restrictive"):
@@ -965,6 +1000,16 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 	// Mark the root as writeable, as some tests attempt to
 	// write to the rootfs, and expect EACCES, not EROFS.
 	spec.Root.Readonly = false
+	if *limitPorts {
+		// Join the namespace prepared by setup_container instead of creating
+		// another empty namespace when the sandbox starts.
+		spec.Linux = &specs.Linux{
+			Namespaces: []specs.LinuxNamespace{{
+				Type: specs.NetworkNamespace,
+				Path: "/proc/self/ns/net",
+			}},
+		}
+	}
 
 	// Test spec comes with pre-defined mounts that we don't want. Reset it.
 	spec.Mounts = nil

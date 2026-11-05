@@ -161,7 +161,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // /dev/fuse DeviceFD.
 func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, kernelTask *kernel.Task, fuseFD *DeviceFD, devMinor uint32, fsopts *filesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	fuseFD.mu.Lock()
-	connected := fuseFD.connected()
+	needsInit := fuseFD.conn == nil
 	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
@@ -172,7 +172,7 @@ func (fsType FilesystemType) getFilesystemDeviceFD(ctx context.Context, vfsObj *
 
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
-	if !connected {
+	if needsInit {
 		if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
 			log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
 			return nil, nil, err
@@ -212,6 +212,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 
 	hostConn := newHostConnection(conn, int32(dupFD))
 	conn.fuseConn = hostConn
+	conn.hostTransport = true
 
 	fs := &filesystem{
 		devMinor: devMinor,
@@ -345,7 +346,7 @@ func parseOptions(ctx context.Context, creds *auth.Credentials, data string) (*f
 // newFUSEFilesystem creates a new FUSE filesystem.
 // +checklocks:fuseFD.mu
 func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
-	if !fuseFD.connected() {
+	if fuseFD.conn == nil {
 		conn, err := newFUSEConnection(ctx, fuseFD, opts)
 		if err != nil {
 			log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
@@ -398,7 +399,7 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (ker
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
 
-	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
+	creds := auth.Credentials{FilesystemKUID: auth.KUID(attr.UID), FilesystemKGID: auth.KGID(attr.GID)}
 	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
 	i.updateAttrs(attr, int64(out.AttrValid), int64(out.AttrValidNSec))
 	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))

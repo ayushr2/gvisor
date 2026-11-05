@@ -43,6 +43,10 @@ const rootMode = linux.FileMode(0755)
 // absent. See fs/devpts/inode.c:DEVPTS_DEFAULT_MODE.
 const defaultReplicaMode = linux.FileMode(0600)
 
+// defaultPtmxMode is the mode of ptmx when the ptmxmode mount option is absent.
+// See fs/devpts/inode.c:DEVPTS_DEFAULT_PTMX_MODE.
+const defaultPtmxMode = linux.FileMode(0000)
+
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
@@ -80,9 +84,9 @@ func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Vir
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsOpts := fileSystemOpts{
 		mode:     defaultReplicaMode,
-		ptmxMode: 0666,
-		uid:      creds.EffectiveKUID,
-		gid:      creds.EffectiveKGID,
+		ptmxMode: defaultPtmxMode,
+		uid:      creds.FilesystemKUID,
+		gid:      creds.FilesystemKGID,
 	}
 	if modeStr, ok := mopts["mode"]; ok {
 		delete(mopts, "mode")
@@ -306,7 +310,7 @@ func (i *rootInode) allocateTerminal(ctx context.Context, creds *auth.Credential
 	}
 	// The uid and gid options name the owner of a replica. Without them it is
 	// owned by whoever created it. See fs/devpts/inode.c:devpts_pty_new().
-	uid, gid := creds.EffectiveKUID, creds.EffectiveKGID
+	uid, gid := creds.FilesystemKUID, creds.FilesystemKGID
 	if i.opts.setuid {
 		uid = i.opts.uid
 	}

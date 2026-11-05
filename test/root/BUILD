@@ -50,6 +50,7 @@ go_test(
         "//runsc/config",
         "//runsc/container",
         "//runsc/flag",
+        "//runsc/sandbox",
         "//runsc/specutils",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_docker_docker//api/types/container:go_default_library",
@@ -63,6 +64,7 @@ go_test(
     name = "crictl_test",
     size = "large",
     srcs = [
+        "crictl_emptydir_test.go",
         "crictl_main_test.go",
         "crictl_sandbox_test.go",
         "crictl_test.go",
@@ -87,6 +89,7 @@ go_test(
         "//runsc/flag",
         "//runsc/specutils",
         "@com_github_moby_sys_capability//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -102,6 +105,7 @@ go_test(
     deps = [
         "//pkg/cleanup",
         "//pkg/test/dockerutil",
+        "//pkg/test/testutil",
         "//runsc/config",
         "//runsc/flag",
         "//runsc/specutils",

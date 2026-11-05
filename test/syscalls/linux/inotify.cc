@@ -2455,6 +2455,55 @@ TEST(Inotify, OneShotFileWatchRemovedByUnlink) {
               SyscallFailsWithErrno(EINVAL));
 }
 
+// IN_DELETE_SELF is sent when the unlinked file's last reference is dropped,
+// after the filesystem has already removed the file. Removing the one-shot
+// watch from there must not deadlock either.
+TEST(Inotify, OneShotFileDeleteSelfWatchRemovedByUnlink) {
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), file.path(), IN_DELETE_SELF | IN_ONESHOT));
+
+  file.reset();
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_DELETE_SELF, wd),
+                          Event(IN_IGNORED, wd),
+                      }));
+  EXPECT_THAT(inotify_rm_watch(inotify_fd.get(), wd),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(Inotify, OneShotFileDeleteSelfWatchRemovedByClose) {
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), file.path(), IN_DELETE_SELF | IN_ONESHOT));
+
+  // The open fd keeps the file alive across the unlink; closing it drops the
+  // last reference and sends IN_DELETE_SELF.
+  file.reset();
+  fd.reset();
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_DELETE_SELF, wd),
+                          Event(IN_IGNORED, wd),
+                      }));
+  EXPECT_THAT(inotify_rm_watch(inotify_fd.get(), wd),
+              SyscallFailsWithErrno(EINVAL));
+}
+
 // This test helps verify that the lock order of filesystem and inotify locks
 // is respected when inotify instances and watch targets are concurrently being
 // destroyed.
@@ -2797,6 +2846,30 @@ TEST(Inotify, KernfsBasic) {
   const std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
   ASSERT_THAT(events, Are({Event(IN_OPEN, wd), Event(IN_ACCESS, wd)}));
+}
+
+// Watches on dynamically created procfs files must survive save/restore.
+TEST(Inotify, KernfsDynamicFileAcrossSave) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const std::string procFile = "/proc/self/comm";
+
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), procFile, IN_ALL_EVENTS));
+  MaybeSave();
+
+  const FileDescriptor file_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(procFile, O_RDONLY));
+  char buf;
+  EXPECT_THAT(read(file_fd.get(), &buf, 1), SyscallSucceeds());
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+  EXPECT_THAT(events, Are({Event(IN_OPEN, wd), Event(IN_ACCESS, wd)}));
+
+  // Adding a watch on the same file again must return the same descriptor.
+  EXPECT_THAT(InotifyAddWatch(fd.get(), procFile, IN_ALL_EVENTS),
+              IsPosixErrorOkAndHolds(wd));
 }
 
 }  // namespace

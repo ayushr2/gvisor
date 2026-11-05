@@ -18,12 +18,9 @@ go_library(
         "//runsc/cli",
         "//runsc/cmd",
         "//runsc/cmd/alias",
-        "//runsc/cmd/nvproxy",
         "//runsc/cmd/profile",
-        "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/trace",
         "//runsc/cmd/util",
-        "//runsc/gvisorbinaries/embed",
         "@com_github_google_subcommands//:go_default_library",
     ],
 )
@@ -34,6 +31,7 @@ go_test(
     embed = [":maincli"],
     deps = [
         "//runsc/cmd",
+        "//runsc/cmd/sentry/sentrycmd",
         "//runsc/flag",
         "@com_github_google_subcommands//:go_default_library",
     ],

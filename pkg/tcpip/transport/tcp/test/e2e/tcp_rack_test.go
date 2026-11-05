@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -92,66 +93,100 @@ func TestRACKUpdate(t *testing.T) {
 
 // TestRACKDetectReorder tests that RACK detects packet reordering.
 func TestRACKDetectReorder(t *testing.T) {
-	t.Skipf("Skipping this test as reorder detection does not consider DSACK.")
-
-	var n int
-	const ackNumToVerify = 2
-	probeDone := make(chan struct{})
+	clock := faketime.NewManualClock()
+	states := make(chan tcp.TCPSenderState, 3)
 	probe := func(state *tcp.TCPEndpointState) {
-		gotSeq := state.Sender.RACKState.FACK
-		wantSeq := state.Sender.SndNxt
-		// FACK should be updated to the highest ending sequence number of the
-		// segment acknowledged most recently.
-		if !gotSeq.LessThanEq(wantSeq) || gotSeq.LessThan(wantSeq) {
-			t.Fatalf("RACK FACK failed to update, got: %v, but want: %v", gotSeq, wantSeq)
+		select {
+		case states <- state.Sender:
+		default:
 		}
-
-		n++
-		if n < ackNumToVerify {
-			if state.Sender.RACKState.Reord {
-				t.Fatalf("RACK reorder detected when there is no reordering")
-			}
-			return
+	}
+	nextState := func() tcp.TCPSenderState {
+		t.Helper()
+		select {
+		case state := <-states:
+			return state
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for ACK processing")
+			return tcp.TCPSenderState{}
 		}
-
-		if state.Sender.RACKState.Reord == false {
-			t.Fatalf("RACK reorder detection failed")
-		}
-		close(probeDone)
 	}
 
-	c := context.NewWithProbe(t, uint32(mtu), probe)
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      mtu,
+		Clock:    clock,
+		Probe:    probe,
+	})
 	defer c.Cleanup()
 
 	e2e.SetStackSACKPermitted(t, c, true)
 	e2e.CreateConnectedWithSACKAndTS(c)
-	data := make([]byte, ackNumToVerify*maxPayload)
+	data := make([]byte, 3*maxPayload)
 	for i := range data {
 		data[i] = byte(i)
 	}
 
-	// Write the data.
+	// Establish a positive RTT before testing reordering: RACK caps its
+	// reordering window by SRTT. The manual-clock handshake takes no time.
 	var r bytes.Reader
-	r.Reset(data)
+	r.Reset(data[:maxPayload])
 	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
 		t.Fatalf("Write failed: %s", err)
 	}
-
-	bytesRead := 0
-	for i := 0; i < ackNumToVerify; i++ {
-		c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, e2e.TSOptionSize)
-		bytesRead += maxPayload
+	c.ReceiveAndCheckPacketWithOptions(data, 0, maxPayload, e2e.TSOptionSize)
+	const rtt = 100 * time.Millisecond
+	clock.Advance(rtt)
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	c.SendAck(seq, maxPayload)
+	state := nextState()
+	if got := state.RTTState.SRTT; got <= 0 {
+		t.Fatalf("SRTT = %s, want a positive RTT estimate", got)
+	}
+	if got, want := state.RACKState.RTT, rtt; got != want {
+		t.Fatalf("RACK RTT = %s, want %s", got, want)
 	}
 
-	start := c.IRS.Add(maxPayload + 1)
+	// Send two packets, then selectively acknowledge only the second.
+	r.Reset(data[maxPayload:])
+	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+	for offset := maxPayload; offset < len(data); offset += maxPayload {
+		c.ReceiveAndCheckPacketWithOptions(data, offset, maxPayload, e2e.TSOptionSize)
+	}
+	clock.Advance(rtt)
+	start := c.IRS.Add(2*maxPayload + 1)
 	end := start.Add(maxPayload)
-	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	c.SendAckWithSACK(seq, 0, []header.SACKBlock{{start, end}})
-	c.SendAck(seq, bytesRead)
+	c.SendAckWithSACK(seq, maxPayload, []header.SACKBlock{{start, end}})
+	state = nextState()
+	if got, want := state.RACKState.FACK, end; got != want {
+		t.Fatalf("FACK after SACK = %v, want %v", got, want)
+	}
+	if state.RACKState.Reord {
+		t.Fatal("RACK detected reordering before the missing packet was acknowledged")
+	}
+	if got := state.RACKState.ReoWnd; got <= 0 {
+		t.Fatalf("reordering window = %s, want a positive window", got)
+	}
 
-	// Wait for the probe function to finish processing the ACK before the
-	// test completes.
-	<-probeDone
+	// ACK the missing packet within the reordering window, before it is
+	// retransmitted. Step 3 detects this as reordering without a DSACK:
+	// https://www.rfc-editor.org/rfc/rfc8985.html#section-6.2
+	c.SendAck(seq, len(data))
+	state = nextState()
+	if got, want := state.RACKState.FACK, end; got != want {
+		t.Fatalf("FACK after cumulative ACK = %v, want %v", got, want)
+	}
+	if !state.RACKState.Reord {
+		t.Fatal("RACK did not detect reordering of the never-retransmitted packet")
+	}
+	if state.RACKState.DSACKSeen {
+		t.Fatal("RACK reported a DSACK when none was sent")
+	}
+	if got, want := c.Stack().Stats().TCP.Retransmits.Value(), uint64(0); got != want {
+		t.Fatalf("retransmitted packets = %d, want %d", got, want)
+	}
 }
 
 const (
@@ -255,51 +290,70 @@ func TestRACKTLPRecovery(t *testing.T) {
 // case of a tail loss. This simulates a situation where either the TLP or its
 // ACK is lost. The sender should retransmit when RTO fires.
 func TestRACKTLPFallbackRTO(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
+	for _, algorithm := range []string{"reno", "cubic"} {
+		t.Run(algorithm, func(t *testing.T) {
+			c := context.New(t, uint32(mtu))
+			defer c.Cleanup()
 
-	// Send 8 packets.
-	numPackets := 8
-	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
-
-	// Packets [6-8] are lost. Send cumulative ACK for [1-5].
-	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	bytesRead := 5 * maxPayload
-	c.SendAck(seq, bytesRead)
-
-	// PTO should fire and send #8 packet as a TLP.
-	c.ReceiveAndCheckPacketWithOptions(data, 7*maxPayload, maxPayload, e2e.TSOptionSize)
-
-	// Either the TLP or the ACK the receiver sent with SACK blocks was lost.
-
-	// Confirm that RTO fires and retransmits packet #6.
-	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, e2e.TSOptionSize)
-
-	metricPollFn := func() error {
-		tcpStats := c.Stack().Stats().TCP
-		stats := []struct {
-			stat *tcpip.StatCounter
-			name string
-			want uint64
-		}{
-			// No fast retransmits happened.
-			{tcpStats.FastRetransmit, "stats.TCP.FastRetransmit", 0},
-			// No SACK recovery happened.
-			{tcpStats.SACKRecovery, "stats.TCP.SACKRecovery", 0},
-			// TLP was unsuccessful.
-			{tcpStats.TLPRecovery, "stats.TCP.TLPRecovery", 0},
-			// RTO should have fired.
-			{tcpStats.Timeouts, "stats.TCP.Timeouts", 1},
-		}
-		for _, s := range stats {
-			if got, want := s.stat.Value(), s.want; got != want {
-				return fmt.Errorf("got %s.Value() = %d, want = %d", s.name, got, want)
+			cc := tcpip.CongestionControlOption(algorithm)
+			if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &cc); err != nil {
+				t.Fatalf("SetTransportProtocolOption(%s): %s", algorithm, err)
 			}
-		}
-		return nil
-	}
-	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
-		t.Error(err)
+
+			// Send 8 packets.
+			numPackets := 8
+			data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
+
+			// Packets [6-8] are lost. Send cumulative ACK for [1-5].
+			seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+			bytesRead := 5 * maxPayload
+			c.SendAck(seq, bytesRead)
+
+			// PTO should fire and send #8 packet as a TLP.
+			c.ReceiveAndCheckPacketWithOptions(data, 7*maxPayload, maxPayload, e2e.TSOptionSize)
+
+			// Either the TLP or the ACK the receiver sent with SACK blocks was lost.
+
+			// Confirm that RTO fires and retransmits packet #6.
+			c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, e2e.TSOptionSize)
+
+			metricPollFn := func() error {
+				tcpStats := c.Stack().Stats().TCP
+				stats := []struct {
+					stat *tcpip.StatCounter
+					name string
+					want uint64
+				}{
+					// No fast retransmits happened.
+					{tcpStats.FastRetransmit, "stats.TCP.FastRetransmit", 0},
+					// No SACK recovery happened.
+					{tcpStats.SACKRecovery, "stats.TCP.SACKRecovery", 0},
+					// TLP was unsuccessful.
+					{tcpStats.TLPRecovery, "stats.TCP.TLPRecovery", 0},
+					// RTO should have fired.
+					{tcpStats.Timeouts, "stats.TCP.Timeouts", 1},
+				}
+				for _, s := range stats {
+					if got, want := s.stat.Value(), s.want; got != want {
+						return fmt.Errorf("got %s.Value() = %d, want = %d", s.name, got, want)
+					}
+				}
+				return nil
+			}
+			if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+				t.Error(err)
+			}
+
+			// ACK the retransmission and drain the rest of the original flight.
+			// Reaching the RTO alone would not detect a sender stuck in recovery.
+			bytesRead += maxPayload
+			c.SendAck(seq, bytesRead)
+			for bytesRead < len(data) {
+				c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, e2e.TSOptionSize)
+				bytesRead += maxPayload
+			}
+			c.SendAck(seq, bytesRead)
+		})
 	}
 }
 

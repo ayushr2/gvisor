@@ -142,6 +142,7 @@ go_test(
         "//pkg/buffer",
         "//pkg/refs",
         "//pkg/tcpip",
+        "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//pkg/tcpip/transport/tcp",
@@ -176,6 +177,7 @@ go_test(
         "//pkg/refs",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//pkg/tcpip/transport/tcp",
@@ -192,7 +194,6 @@ go_test(
     # so exclude them from gotsan runs.
     tags = ["nogotsan"],
     deps = [
-        ":e2e",
         "//pkg/refs",
         "//pkg/tcpip",
         "//pkg/tcpip/header",

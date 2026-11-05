@@ -191,7 +191,7 @@ type InodeAttrs struct {
 
 // Init initializes this InodeAttrs.
 func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, mode linux.FileMode) {
-	a.InitWithIDs(ctx, creds.EffectiveKUID, creds.EffectiveKGID, devMajor, devMinor, ino, mode)
+	a.InitWithIDs(ctx, creds.FilesystemKUID, creds.FilesystemKGID, devMajor, devMinor, ino, mode)
 }
 
 // InitWithIDs initializes this InodeAttrs.
@@ -211,7 +211,7 @@ func (a *InodeAttrs) InitWithIDs(ctx context.Context, uid auth.KUID, gid auth.KG
 	a.uid.Store(uint32(uid))
 	a.gid.Store(uint32(gid))
 	a.nlink.Store(nlink)
-	a.blockSize.Store(hostarch.PageSize)
+	a.blockSize.Store(uint32(hostarch.PageSize))
 	now := ktime.NowFromContext(ctx).Nanoseconds()
 	a.atime.Store(now)
 	a.mtime.Store(now)
@@ -460,7 +460,6 @@ func (o *OrderedChildren) orderedChildren() *OrderedChildren {
 // Init initializes an OrderedChildren.
 func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 	o.writable = opts.Writable
-	o.set = make(map[string]*slot)
 }
 
 // Destroy clears the children stored in o. It should be called by structs
@@ -490,14 +489,29 @@ func (o *OrderedChildren) Destroy(ctx context.Context) {
 //
 // Postcondition: Caller's references on inodes are transferred to o.
 func (o *OrderedChildren) Populate(children map[string]Inode) uint32 {
+	if len(children) == 0 {
+		return 0
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.set == nil {
+		o.set = make(map[string]*slot, len(children))
+	}
 	var links uint32
 	for name, child := range children {
 		if child.Mode().IsDir() {
 			links++
 		}
-		if err := o.insert(name, child, true); err != nil {
+		if _, ok := o.set[name]; ok {
 			panic(fmt.Sprintf("Collision when attempting to insert child %q (%+v)", name, child))
 		}
+		s := &slot{
+			name:   name,
+			inode:  child,
+			static: true,
+		}
+		o.order.PushBack(s)
+		o.set[name] = s
 	}
 	return links
 }
@@ -565,6 +579,9 @@ func (o *OrderedChildren) Inserter(name string, makeChild func() Inode) (Inode, 
 		inode:  child,
 		static: false,
 	}
+	if o.set == nil {
+		o.set = make(map[string]*slot)
+	}
 	o.order.PushBack(s)
 	o.set[name] = s
 	return child, nil
@@ -586,6 +603,9 @@ func (o *OrderedChildren) insert(name string, child Inode, static bool) error {
 		inode:  child,
 		static: static,
 	}
+	if o.set == nil {
+		o.set = make(map[string]*slot)
+	}
 	o.order.PushBack(s)
 	o.set[name] = s
 	return nil
@@ -600,6 +620,24 @@ func (o *OrderedChildren) removeLocked(name string) {
 		delete(o.set, name)
 		o.order.Remove(s)
 	}
+}
+
+// RemoveStatic removes a child entry (including static entries) from o and
+// drops the reference owned by o if the entry was static.
+func (o *OrderedChildren) RemoveStatic(ctx context.Context, name string) error {
+	o.mu.Lock()
+	s, ok := o.set[name]
+	if !ok {
+		o.mu.Unlock()
+		return linuxerr.ENOENT
+	}
+	delete(o.set, name)
+	o.order.Remove(s)
+	o.mu.Unlock()
+	if s.static {
+		s.inode.DecRef(ctx)
+	}
+	return nil
 }
 
 // Precondition: caller must hold o.mu for reading or writing.
@@ -686,6 +724,9 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 	s := &slot{
 		name:  newname,
 		inode: child,
+	}
+	if dst.set == nil {
+		dst.set = make(map[string]*slot)
 	}
 	dst.order.PushBack(s)
 	dst.set[newname] = s

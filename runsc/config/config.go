@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -104,6 +105,10 @@ type Config struct {
 	// DO NOT call it directly, use GetOverlay2() instead.
 	Overlay2 Overlay2 `flag:"overlay2"`
 
+	// TarTimestampResolution is the resolution of modification times in tar
+	// archives of overlay upper layers and filesystem checkpoints.
+	TarTimestampResolution TarTimestampResolution `flag:"tar-timestamp-resolution"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
@@ -117,6 +122,10 @@ type Config struct {
 	// CharacterDevicePolicy controls how character device files on gofer
 	// mounts (the rootfs and bind mounts) are handled.
 	CharacterDevicePolicy CharacterDevicePolicy `flag:"character-device-policy"`
+
+	// InodeNumbers controls how inode numbers of files on gofer mounts are
+	// assigned.
+	InodeNumbers InodeNumbers `flag:"inode-numbers"`
 
 	// HostSettings controls how host settings are handled.
 	HostSettings HostSettingsPolicy `flag:"host-settings"`
@@ -183,9 +192,11 @@ type Config struct {
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
-	// PlatformDevicePath is the path to the device file used by the platform.
-	// e.g. "/dev/kvm" for the KVM platform.
-	// If unset, a sane platform-specific default will be used.
+	// PlatformDevicePath is the raw value of --platform_device_path: either a
+	// single device file path, which applies to any platform, or
+	// comma-separated platform=path pairs, which apply only to the named
+	// platforms. Use PlatformDeviceFor to read it. If unset, a sane
+	// platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
 
 	// MetricServer, if set, indicates that metrics should be exported on this address.
@@ -203,13 +214,21 @@ type Config struct {
 	// must match `runsc`'s build label.
 	SidecarReleaseEnforcementPolicy SidecarReleasePolicy `flag:"sidecar-release-enforcement-policy"`
 
-	// SidecarUsagePolicy controls when to use sidecar binaries vs embedded
-	// fallbacks.
-	SidecarUsagePolicy SidecarUsagePolicy `flag:"sidecar-usage-policy"`
+	// SandboxCreationCPUPolicy is the CPU limit of the sandbox cgroup while a
+	// new sandbox is created and started.
+	SandboxCreationCPUPolicy SandboxCPUPolicy `flag:"sandbox-creation-cpu-policy"`
+
+	// SandboxLifecycleCPUPolicy is the CPU limit of the sandbox cgroup during
+	// checkpoint, restore, and teardown.
+	SandboxLifecycleCPUPolicy SandboxCPUPolicy `flag:"sandbox-lifecycle-cpu-policy"`
 
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
 	FinalMetricsLog string `flag:"final-metrics-log"`
+
+	// BootTimesLog is the file to which the startup timeline of the sandbox
+	// (see timing.Timer.Export) is written, as JSON, when the sandbox starts.
+	BootTimesLog string `flag:"boot-times-log"`
 
 	// ProfilingMetrics is a comma separated list of metric names which are
 	// going to be written to the ProfilingMetricsLog file from within the
@@ -426,6 +445,11 @@ type Config struct {
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}
 
+	// cliStateEngine records the --state-engine policy explicitly passed on the
+	// command line when this Config was constructed via NewFromFlags, before any
+	// OCI annotation or bundle overrides run.
+	cliStateEngine *StateEnginePolicy
+
 	// ReproduceNAT, when true, tells runsc to scrape the host network
 	// namespace's NAT iptables and reproduce it inside the sandbox.
 	ReproduceNAT bool `flag:"reproduce-nat"`
@@ -480,6 +504,9 @@ type Config struct {
 	// AllowConnectedOnSave allows network connections to stay established on save.
 	AllowConnectedOnSave bool `flag:"allow-connected-on-save"`
 
+	// StateEngine selects the state serialization engine used when saving checkpoints.
+	StateEngine StateEnginePolicy `flag:"state-engine"`
+
 	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
 	// should be allowed.
 	AllowRootfsTarAnnotation bool `flag:"allow-rootfs-tar-annotation"`
@@ -507,11 +534,65 @@ func (c *Config) UseNetworkProxy() bool {
 	return c.NetworkProxyPath != ""
 }
 
+// platformDevicePaths is the parsed value of --platform_device_path.
+type platformDevicePaths struct {
+	// any is the device file path for every platform. The single-path form
+	// sets it.
+	any string
+	// byPlatform maps a platform name to its device file path. The
+	// platform=path form sets it.
+	byPlatform map[string]string
+}
+
+// parsePlatformDevicePaths parses v, a --platform_device_path value. A value
+// without "=" is a single path. Otherwise it is comma-separated platform=path
+// pairs.
+func parsePlatformDevicePaths(v string) (platformDevicePaths, error) {
+	if !strings.Contains(v, "=") {
+		return platformDevicePaths{any: v}, nil
+	}
+	paths := platformDevicePaths{byPlatform: make(map[string]string)}
+	for _, pair := range strings.Split(v, ",") {
+		name, path, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || path == "" {
+			return platformDevicePaths{}, fmt.Errorf("expected format is --platform_device_path={path} or --platform_device_path={platform}={path}[,{platform}={path}...], got %q", v)
+		}
+		if _, dup := paths.byPlatform[name]; dup {
+			return platformDevicePaths{}, fmt.Errorf("--platform_device_path=%q names platform %q more than once", v, name)
+		}
+		paths.byPlatform[name] = path
+	}
+	return paths, nil
+}
+
+// PlatformDeviceFor returns the device file path that --platform_device_path
+// assigns to platform, or "" if it assigns none, in which case the platform
+// uses its default. Validate rejects malformed values, which this treats as
+// unset.
+func (c *Config) PlatformDeviceFor(platform string) string {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return ""
+	}
+	if path, ok := paths.byPlatform[platform]; ok {
+		return path
+	}
+	return paths.any
+}
+
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
+		return err
+	}
+	if c.Platform == PlatformAuto && paths.any != "" {
+		// A single path cannot apply to every platform that auto may choose.
+		return fmt.Errorf("--platform=%s accepts only --platform_device_path={platform}={path}[,{platform}={path}...], got %q", PlatformAuto, c.PlatformDevicePath)
+	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
@@ -1159,6 +1240,104 @@ func (p CharacterDevicePolicy) AllowsPassthrough() bool {
 	return p != CharDevEmulatedOnly
 }
 
+// InodeNumbers tells how inode numbers of files on gofer mounts (the rootfs
+// and bind mounts) are assigned.
+type InodeNumbers int
+
+const (
+	// InodeNumbersPassthrough reports host inode numbers as is. Host device
+	// numbers are mapped to sandbox-private device numbers, so files on
+	// different host devices under one mount report different device numbers,
+	// as with Linux overlayfs.
+	InodeNumbersPassthrough InodeNumbers = iota
+
+	// InodeNumbersVirtual assigns sandbox-private sequential inode numbers
+	// and a single device number per mount. This requires the sandbox to
+	// remember the host identity of every file it has ever seen, and to
+	// stat(2) every entry returned by getdents(2).
+	InodeNumbersVirtual
+)
+
+func inodeNumbersPtr(v InodeNumbers) *InodeNumbers {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (n *InodeNumbers) Set(v string) error {
+	switch v {
+	case "passthrough":
+		*n = InodeNumbersPassthrough
+	case "virtual":
+		*n = InodeNumbersVirtual
+	default:
+		return fmt.Errorf("invalid inode numbers mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (n *InodeNumbers) Get() any {
+	return *n
+}
+
+// String implements flag.Value.
+func (n InodeNumbers) String() string {
+	switch n {
+	case InodeNumbersPassthrough:
+		return "passthrough"
+	case InodeNumbersVirtual:
+		return "virtual"
+	default:
+		panic(fmt.Sprintf("Invalid inode numbers mode %d", n))
+	}
+}
+
+// TarTimestampResolution is the resolution of modification times in tar
+// archives of sandbox filesystems.
+type TarTimestampResolution int
+
+const (
+	// TarTimestampSeconds rounds modification times to whole seconds.
+	TarTimestampSeconds TarTimestampResolution = iota
+
+	// TarTimestampNanoseconds keeps nanosecond modification times. Each tar
+	// entry gets a PAX extended header, which adds about 1 KiB per entry.
+	TarTimestampNanoseconds
+)
+
+func tarTimestampResolutionPtr(v TarTimestampResolution) *TarTimestampResolution {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (r *TarTimestampResolution) Set(v string) error {
+	switch v {
+	case "seconds":
+		*r = TarTimestampSeconds
+	case "nanoseconds":
+		*r = TarTimestampNanoseconds
+	default:
+		return fmt.Errorf("invalid tar timestamp resolution %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (r *TarTimestampResolution) Get() any {
+	return *r
+}
+
+// String implements flag.Value.
+func (r TarTimestampResolution) String() string {
+	switch r {
+	case TarTimestampSeconds:
+		return "seconds"
+	case TarTimestampNanoseconds:
+		return "nanoseconds"
+	}
+	panic(fmt.Sprintf("Invalid tar timestamp resolution %d", r))
+}
+
 // OverlayMedium describes how overlay medium is configured.
 type OverlayMedium string
 
@@ -1241,12 +1420,10 @@ func setOverlay2Err(v string) error {
 const overlay2SizeEq = "size="
 
 // Set implements flag.Value. Set(String()) should be idempotent.
+// On error, the receiver is unchanged.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
-		o.rootMount = false
-		o.subMounts = false
-		o.medium = NoOverlay
-		o.size = ""
+		*o = Overlay2{}
 		return nil
 	}
 	parts := strings.Split(v, ",")
@@ -1259,34 +1436,34 @@ func (o *Overlay2) Set(v string) error {
 		return setOverlay2Err(v)
 	}
 
+	var next Overlay2
 	switch mount := vs[0]; mount {
 	case "root":
-		o.rootMount = true
+		next.rootMount = true
 	case "all":
-		o.rootMount = true
-		o.subMounts = true
+		next.rootMount = true
+		next.subMounts = true
 	default:
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	err := o.medium.Set(vs[1])
+	err := next.medium.Set(vs[1])
 	if err != nil {
 		return err
 	}
 
-	if len(parts) == 1 {
-		o.size = ""
-	} else if len(parts) == 2 {
+	if len(parts) == 2 {
 		sizeArg := parts[1]
 		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
 		if !cut {
 			return setOverlay2Err(v)
 		}
-		o.size = size
-	} else {
+		next.size = size
+	} else if len(parts) > 2 {
 		return setOverlay2Err(v)
 	}
 
+	*o = next
 	return nil
 }
 
@@ -1482,56 +1659,6 @@ func (p SidecarReleasePolicy) Applies() bool {
 	return p == SidecarReleaseAlways || (p == SidecarReleaseIfReleaseBuild && IsReleaseVersion(version.Version()))
 }
 
-// SidecarUsagePolicy controls when to use sidecar binaries vs embedded fallbacks.
-type SidecarUsagePolicy string
-
-// SidecarUsagePolicy values.
-const (
-	SidecarUsageDefault        SidecarUsagePolicy = "DEFAULT"
-	SidecarUsageStrict         SidecarUsagePolicy = "STRICT"
-	SidecarUsageLegacyEmbedded SidecarUsagePolicy = "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK"
-)
-
-// Set implements flag.Value. Set(String()) should be idempotent.
-func (p *SidecarUsagePolicy) Set(v string) error {
-	sp := SidecarUsagePolicy(strings.ToUpper(v))
-	switch sp {
-	case SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded:
-		*p = sp
-		return nil
-	}
-	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarUsageDefault, SidecarUsageStrict, SidecarUsageLegacyEmbedded)
-}
-
-// Ptr returns a pointer to `p`.
-// Useful in flag declaration line.
-func (p SidecarUsagePolicy) Ptr() *SidecarUsagePolicy {
-	return &p
-}
-
-// Get implements flag.Get.
-func (p *SidecarUsagePolicy) Get() any {
-	return *p
-}
-
-// String implements flag.String.
-func (p SidecarUsagePolicy) String() string {
-	return string(p)
-}
-
-// AllowEmbeddedFallback returns whether embedded fallback binaries can be used
-// if the on-disk sidecar binaries are not found.
-func (p SidecarUsagePolicy) AllowEmbeddedFallback() bool {
-	switch p {
-	case SidecarUsageDefault, SidecarUsageStrict:
-		return false
-	case SidecarUsageLegacyEmbedded:
-		return true
-	default:
-		panic(fmt.Sprintf("invalid sidecar usage policy: %q", p))
-	}
-}
-
 // releaseVersionRE matches the version strings of production release builds:
 // a `release-` or `g<lowercase>-` prefix, then the release date.
 var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$`)
@@ -1539,6 +1666,131 @@ var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$
 // IsReleaseVersion returns whether ver is a tagged-release version string.
 func IsReleaseVersion(ver string) bool {
 	return releaseVersionRE.MatchString(ver)
+}
+
+// SandboxCPUPolicy is the CPU limit of the sandbox cgroup while the
+// application is not running. It never goes below the OCI spec limit.
+// The zero value keeps the OCI spec limit.
+type SandboxCPUPolicy struct {
+	// uncapped removes the limit.
+	uncapped bool
+
+	// milliCPUs, if non-zero, is the limit in milliCPUs.
+	milliCPUs int64
+
+	// implicit is set on flag defaults, i.e. when the policy was not
+	// specified on the command-line.
+	implicit bool
+
+	// factor, if non-zero, multiplies the OCI spec limit.
+	// It is always above or equal to 1, since the limit should
+	// never go below the OCI spec one.
+	factor float64
+}
+
+// Default sandbox CPU policies.
+var (
+	DefaultSandboxCreationCPUPolicy  = SandboxCPUPolicy{uncapped: true, implicit: true}
+	DefaultSandboxLifecycleCPUPolicy = SandboxCPUPolicy{factor: 4, milliCPUs: 1000, implicit: true}
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+// `max(...)` keeps the largest of its values, so it reduces to at most one
+// milliCPU count and one factor.
+func (p *SandboxCPUPolicy) Set(v string) error {
+	terms := []string{v}
+	if inner, ok := strings.CutPrefix(v, "max("); ok {
+		inner, ok = strings.CutSuffix(inner, ")")
+		if !ok || inner == "" {
+			return fmt.Errorf("invalid sandbox CPU policy %q: max(...) must list one or more comma-separated values", v)
+		}
+		terms = strings.Split(inner, ",")
+	}
+	var policy SandboxCPUPolicy
+	for _, term := range terms {
+		switch term = strings.TrimSpace(term); {
+		case term == "uncapped":
+			policy.uncapped = true
+		case strings.HasSuffix(term, "m"):
+			milliCPUs, err := strconv.ParseInt(strings.TrimSuffix(term, "m"), 10, 64)
+			if err != nil || milliCPUs <= 0 {
+				return fmt.Errorf("invalid sandbox CPU policy %q: CPU count %q must be a positive integer of milliCPUs (e.g. \"2500m\")", v, term)
+			}
+			policy.milliCPUs = max(policy.milliCPUs, milliCPUs)
+		case strings.HasSuffix(term, "x"):
+			factor, err := strconv.ParseFloat(strings.TrimSuffix(term, "x"), 64)
+			if err != nil || !(factor > 0) || math.IsInf(factor, 1) {
+				return fmt.Errorf("invalid sandbox CPU policy %q: factor %q must be a positive number", v, term)
+			}
+			if factor > 1 {
+				policy.factor = max(policy.factor, factor)
+			}
+		default:
+			return fmt.Errorf("invalid sandbox CPU policy %q: must be \"uncapped\", \"<N>m\" (milliCPUs), \"<X>x\" (multiplier of OCI spec CPU cap), or \"max(<value>,...)\"", v)
+		}
+	}
+	if policy.uncapped {
+		policy = SandboxCPUPolicy{uncapped: true}
+	}
+	*p = policy
+	return nil
+}
+
+// Get implements flag.Value.
+func (p *SandboxCPUPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.Value.
+func (p SandboxCPUPolicy) String() string {
+	milliCPUs := strconv.FormatInt(p.milliCPUs, 10) + "m"
+	factor := strconv.FormatFloat(p.factor, 'g', -1, 64) + "x"
+	switch {
+	case p.uncapped:
+		return "uncapped"
+	case p.milliCPUs != 0 && p.factor != 0:
+		return "max(" + factor + "," + milliCPUs + ")"
+	case p.milliCPUs != 0:
+		return milliCPUs
+	case p.factor != 0:
+		return factor
+	default:
+		return "1x"
+	}
+}
+
+// Implicit returns whether the policy is a flag default rather than chosen.
+func (p SandboxCPUPolicy) Implicit() bool {
+	return p.implicit
+}
+
+// Enabled returns whether the policy's limit may differ from the OCI spec
+// limit.
+func (p SandboxCPUPolicy) Enabled() bool {
+	return p.uncapped || p.milliCPUs != 0 || p.factor != 0
+}
+
+// Kernel bounds of a CFS quota, in microseconds.
+const (
+	minCPUQuota = 1000
+	maxCPUQuota = 1<<44 - 1
+)
+
+// Quota returns the policy's CFS quota for an application CFS quota of
+// `quota` per `period`, both in microseconds. It is never below `quota`.
+// -1 means unlimited.
+func (p SandboxCPUPolicy) Quota(quota int64, period uint64) int64 {
+	if p.uncapped {
+		return -1
+	}
+	policyQuota := float64(quota)
+	if p.factor != 0 {
+		policyQuota = max(policyQuota, float64(quota)*p.factor)
+	}
+	if p.milliCPUs != 0 {
+		policyQuota = max(policyQuota, float64(p.milliCPUs)*float64(period)/1000)
+	}
+	return int64(math.Round(min(max(policyQuota, minCPUQuota), maxCPUQuota)))
 }
 
 // RestoreSpecValidationPolicy dictates how spec validation should be handled.
@@ -1686,8 +1938,6 @@ const (
 	xdpModeStrTunnel   = "tunnel"
 )
 
-var xdpConfig XDP
-
 // Get implements flag.Getter.
 func (xd *XDP) Get() any {
 	return *xd
@@ -1733,4 +1983,51 @@ func (xd *XDP) Set(input string) error {
 		return fmt.Errorf("invalid --xdp value: %q", input)
 	}
 	return nil
+}
+
+// StateEnginePolicy selects the state serialization engine used for saving checkpoints.
+type StateEnginePolicy int
+
+// StateEnginePolicy values.
+const (
+	// StateEngineGraph uses the reflection-free graph serialization engine.
+	StateEngineGraph StateEnginePolicy = iota
+
+	// StateEngineWire uses the legacy wire serialization engine.
+	StateEngineWire
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *StateEnginePolicy) Set(v string) error {
+	switch v {
+	case "graph":
+		*p = StateEngineGraph
+	case "wire":
+		*p = StateEngineWire
+	default:
+		return fmt.Errorf("invalid state engine policy %q (must be one of: graph, wire)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+func (p StateEnginePolicy) Ptr() *StateEnginePolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *StateEnginePolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p StateEnginePolicy) String() string {
+	switch p {
+	case StateEngineGraph:
+		return "graph"
+	case StateEngineWire:
+		return "wire"
+	default:
+		panic(fmt.Sprintf("invalid state engine policy %d", p))
+	}
 }
