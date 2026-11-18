@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "bzl_library")
+load("//tools:defs.bzl", "bzl_library", "string_flag")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -29,6 +29,26 @@ bzl_library(
     srcs = ["go.bzl"],
     visibility = ["//visibility:private"],
     deps = [":defs_bzl"],
+)
+
+# Keep Go's pure/cgo mode in its build settings, not the target platform:
+# Bazel 9 also uses target constraints to select a test execution platform.
+platform(
+    name = "linux_amd64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
 )
 
 config_setting(
@@ -65,10 +85,21 @@ genrule(
     visibility = ["//:sandbox"],
 )
 
+# A build setting lets individual test targets select their page size without
+# changing unrelated --define values in the same invocation.
+string_flag(
+    name = "page_size",
+    build_setting_default = "4k",
+    values = [
+        "4k",
+        "64k",
+    ],
+)
+
 # Page size configurations for ARM64
 config_setting(
     name = "pagesize_64k",
-    define_values = {"pagesize": "64k"},
+    flag_values = {":page_size": "64k"},
 )
 
 # Combined config: ARM64 with 64K page size
@@ -77,5 +108,5 @@ config_setting(
     constraint_values = [
         "@platforms//cpu:aarch64",
     ],
-    define_values = {"pagesize": "64k"},
+    flag_values = {":page_size": "64k"},
 )

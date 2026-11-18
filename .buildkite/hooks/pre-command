@@ -18,6 +18,9 @@ fi
 BAZEL_VERSION="$(cat images/default/bazelversion)"
 export BAZEL_REMOTE_CACHE="--remote_cache=https://storage.googleapis.com/gvisor-buildkite-bazel-cache/${BAZEL_VERSION}/$(date +%Y-%m-%d) --google_default_credentials"
 
+# Restore pipeline.yaml in case it was modified by a prior step.
+git checkout -- .buildkite/pipeline.yaml 2>/dev/null || true
+
 if POSIXLY_CORRECT=true df --local --output=pcent,ipcent,target | grep -vE '/snap/' | grep -qE '9[4-9]%|100%'; then
   sudo df -h --local | sed -r 's/^/[df] /' >&2
   kill_agent "Disk usage has reached critical level"
@@ -138,6 +141,14 @@ sudo rm -rf /tmp/profile
 # Allow to read dmesg for all users. It is required for the syslog test.
 sudo sysctl -w kernel.dmesg_restrict=0
 
+# Ubuntu 23.10+ uses AppArmor to restrict unprivileged user namespaces, which
+# breaks the rootless gofer used by the syscall tests ("cannot create gofer
+# process: gofer: fork/exec /proc/self/exe: operation not permitted").
+if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == "1" ]]; then
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 ||
+    echo "WARNING: failed to lift the AppArmor user namespace restriction; rootless runsc tests will fail." >&2
+fi
+
 # Download credentials, if a release agent.
 case "${BUILDKITE_AGENT_META_DATA_QUEUE}" in
   release|release-*)
@@ -157,8 +168,8 @@ pipeline_add_env() {
 }
 
 # Try to skip unaffected tests on pre-submits.
-# BUILDKITE_PIPELINE_ID is set only on the pipeline upload step.
-if [[ -n "${BUILDKITE_PIPELINE_ID}" ]]; then
+# Only modify pipeline.yaml when running the pipeline upload step.
+if [[ "${BUILDKITE_COMMAND:-}" =~ "pipeline upload" ]]; then
   if [[ "${BUILDKITE_BRANCH}" =~ ^test/ ]]; then  # For non-continuous tests only.
     # Skip load-all-test-images tests if the change doesn't affect images.
     if ./tools/builkite-check-paths.sh images/ tools/images.mk Makefile; then

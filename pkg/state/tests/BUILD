@@ -29,6 +29,7 @@ go_test(
     srcs = [
         "array_test.go",
         "bench_test.go",
+        "binary_test.go",
         "bool_test.go",
         "float_test.go",
         "integer_test.go",
@@ -38,6 +39,6 @@ go_test(
         "string_test.go",
         "struct_test.go",
     ],
-    library = ":tests",
+    embed = [":tests"],
     deps = ["//pkg/state"],
 )

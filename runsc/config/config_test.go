@@ -37,6 +37,9 @@ func TestDefault(t *testing.T) {
 	if c.GoferNetworkNamespace != GoferNetworkNamespaceNull {
 		t.Errorf("GoferNetworkNamespace=%q, want null", c.GoferNetworkNamespace)
 	}
+	if c.UseNetworkProxy() {
+		t.Errorf("UseNetworkProxy()=true, want false")
+	}
 
 	// All defaults doesn't require setting flags.
 	flags := c.ToFlags()
@@ -82,6 +85,20 @@ func TestFromFlags(t *testing.T) {
 	}
 	if want := GoferNetworkNamespaceHost; c.GoferNetworkNamespace != want {
 		t.Errorf("GoferNetworkNamespace=%v, want: %v", c.GoferNetworkNamespace, want)
+	}
+
+	if err := testFlags.Lookup("network").Value.Set("sandbox"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	if err := testFlags.Lookup("network-proxy-path").Value.Set("/run/netproxy.sock"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
+		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
 	}
 }
 
@@ -250,14 +267,19 @@ func TestInvalidFlags(t *testing.T) {
 			error: "expected format is --overlay2",
 		},
 		{
-			name:  "sidecar-usage-policy",
-			value: "invalid",
-			error: "invalid value \"invalid\"; must be DEFAULT, STRICT, or LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
-		},
-		{
 			name:  "sidecar-release-enforcement-policy",
 			value: "invalid",
 			error: "invalid value \"invalid\"; must be NEVER, ALWAYS, or IF_RELEASE_BUILD",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "invalid",
+			error: "invalid value \"invalid\"; must be DEFAULT or STRICT",
+		},
+		{
+			name:  "sidecar-usage-policy",
+			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
+			error: "the embedded sidecar fallback has been removed",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -354,10 +376,65 @@ func TestValidationFail(t *testing.T) {
 			},
 			error: "overlay flag has been replaced with overlay2 flag",
 		},
+		{
+			name: "network-proxy-path+network:none",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"network":            "none",
+			},
+			error: "network-proxy-path flag is only supported with sandbox networking",
+		},
+		{
+			name: "network-proxy-path+network:host",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"network":            "host",
+			},
+			error: "network-proxy-path flag is only supported with sandbox networking",
+		},
+		{
+			name: "network-proxy-path:relative",
+			flags: map[string]string{
+				"network-proxy-path": "relative/netproxy.sock",
+			},
+			error: "network-proxy-path must be an absolute path",
+		},
+		{
+			name: "network-proxy-path:abstract",
+			flags: map[string]string{
+				"network-proxy-path": "@netproxy",
+			},
+			error: "network-proxy-path must be an absolute path",
+		},
+		{
+			name: "network-proxy-path+xdp",
+			flags: map[string]string{
+				"network-proxy-path": "/run/netproxy.sock",
+				"EXPERIMENTAL-xdp":   "ns",
+			},
+			error: "network-proxy-path flag is incompatible with XDP",
+		},
+		{
+			name: "platform_device_path:malformed-pair",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,/dev/other",
+			},
+			error: "expected format is --platform_device_path",
+		},
+		{
+			name: "platform_device_path:duplicate-platform",
+			flags: map[string]string{
+				"platform_device_path": "kvm=/dev/kvm,kvm=/dev/kvm2",
+			},
+			error: "names platform \"kvm\" more than once",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 			RegisterFlags(testFlags)
+			t.Cleanup(func() {
+				_ = testFlags.Lookup("EXPERIMENTAL-xdp").Value.Set("off")
+			})
 			for name, val := range tc.flags {
 				if err := testFlags.Lookup(name).Value.Set(val); err != nil {
 					t.Errorf("%s=%q: %v", name, val, err)
@@ -365,6 +442,37 @@ func TestValidationFail(t *testing.T) {
 			}
 			if _, err := NewFromFlags(testFlags); err == nil || !strings.Contains(err.Error(), tc.error) {
 				t.Errorf("NewFromFlags() wrong error reported: %v", err)
+			}
+		})
+	}
+}
+
+func TestPlatformDeviceFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flag     string
+		platform string
+		want     string
+	}{
+		{name: "unset", flag: "", platform: "kvm", want: ""},
+		{name: "single path applies to any platform", flag: "/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+		{name: "single path applies to platform without device", flag: "/dev/kvm2", platform: "systrap", want: "/dev/kvm2"},
+		{name: "pair matches", flag: "kvm=/dev/kvm2,other=/dev/other2", platform: "other", want: "/dev/other2"},
+		{name: "pair for other platform is ignored", flag: "kvm=/dev/kvm2", platform: "other", want: ""},
+		{name: "unknown platform name is tolerated", flag: "nosuch=/dev/nosuch,kvm=/dev/kvm2", platform: "kvm", want: "/dev/kvm2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+			RegisterFlags(testFlags)
+			if err := testFlags.Lookup("platform_device_path").Value.Set(tc.flag); err != nil {
+				t.Fatalf("platform_device_path=%q: %v", tc.flag, err)
+			}
+			c, err := NewFromFlags(testFlags)
+			if err != nil {
+				t.Fatalf("NewFromFlags() failed: %v", err)
+			}
+			if got := c.PlatformDeviceFor(tc.platform); got != tc.want {
+				t.Errorf("PlatformDeviceFor(%q) with --platform_device_path=%q = %q, want %q", tc.platform, tc.flag, got, tc.want)
 			}
 		})
 	}
@@ -522,6 +630,11 @@ func TestOverrideAllowlist(t *testing.T) {
 		{
 			flag:  "profile",
 			value: "123",
+			error: "flag override disabled",
+		},
+		{
+			flag:  "network-proxy-path",
+			value: "/run/netproxy.sock",
 			error: "flag override disabled",
 		},
 		{
@@ -963,6 +1076,32 @@ func TestParseSerializeOverlay2(t *testing.T) {
 		}
 		if o.String() != "root:memory,size=1g" {
 			t.Fatalf("String mismatch, expecting ll:memory,size=1g, got %q", o.String())
+		}
+	})
+	t.Run("Repeated Set", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("all:memory,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Set("root:self"); err != nil {
+			t.Fatal(err)
+		}
+		want := Overlay2{rootMount: true, medium: SelfOverlay}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
+		}
+	})
+	t.Run("Invalid Set preserves value", func(t *testing.T) {
+		var o Overlay2
+		if err := o.Set("root:self,size=1g"); err != nil {
+			t.Fatal(err)
+		}
+		want := o
+		if err := o.Set("all:memory,invalid=1g"); err == nil {
+			t.Fatal("Set succeeded, want error")
+		}
+		if o != want {
+			t.Errorf("got %#v, want %#v", o, want)
 		}
 	})
 }

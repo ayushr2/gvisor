@@ -552,8 +552,9 @@ type memFD struct {
 
 	inode *memInode
 	mm    *mm.MemoryManager
-	// mu guards the fields below.
-	mu     sync.Mutex `state:"nosave"`
+	mu    sync.Mutex `state:"nosave"`
+
+	// +checklocks:mu
 	offset int64
 }
 
@@ -568,6 +569,8 @@ func (fd *memFD) Init(m *vfs.Mount, d *kernfs.Dentry, inode *memInode, flags uin
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
@@ -638,6 +641,8 @@ func (fd *memFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Write(ctx context.Context, dst usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	fd.mu.Lock()
 	n, err := fd.PWrite(ctx, dst, fd.offset, opts)
@@ -647,6 +652,8 @@ func (fd *memFD) Write(ctx context.Context, dst usermem.IOSequence, opts vfs.Wri
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
+//
+// +checklocksexclude:fd.mu
 func (fd *memFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	fd.mu.Lock()
 	n, err := fd.PRead(ctx, dst, fd.offset, opts)
@@ -825,7 +832,14 @@ var _ dynamicInode = (*taskStatData)(nil)
 //
 // +checklocksexclude:s.task.mu
 func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "%d ", s.pidns.IDOfTask(s.task))
+	pid := s.pidns.IDOfTask(s.task)
+	if pid == 0 {
+		// Linux returns ESRCH for /proc/[pid]/stat once the task is gone.
+		// IDOfTask is 0 after the TID mapping is removed; use that return so
+		// the check shares IDOfTask's owner.mu read lock.
+		return linuxerr.ESRCH
+	}
+	fmt.Fprintf(buf, "%d ", pid)
 	fmt.Fprintf(buf, "(%s) ", s.task.Name())
 	fmt.Fprintf(buf, "%c ", s.task.StateStatus()[0])
 	ppid := kernel.ThreadID(0)
@@ -836,7 +850,11 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfProcessGroup(s.task.ThreadGroup().ProcessGroup()))
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfSession(s.task.ThreadGroup().Session()))
 	fmt.Fprintf(buf, "0 0 " /* tty_nr tpgid */)
-	fmt.Fprintf(buf, "0 " /* flags */)
+	flags := 0
+	if s.task.ExitState() >= kernel.TaskExitInitiated {
+		flags |= linux.PF_EXITING
+	}
+	fmt.Fprintf(buf, "%d ", flags)
 	fmt.Fprintf(buf, "0 0 0 0 " /* minflt cminflt majflt cmajflt */)
 	var cputime usage.CPUStats
 	if s.tgstats {
@@ -1057,6 +1075,15 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "VmData:\t%d kB\n", data>>10)
 
 	fmt.Fprintf(buf, "Threads:\t%d\n", s.task.ThreadGroup().Count())
+	// Signal masks are rendered as in Linux's fs/proc/array.c:task_sig().
+	// SigQ is omitted since the sentry does not account queued signals per
+	// user.
+	fmt.Fprintf(buf, "SigPnd:\t%016x\n", s.task.TaskPendingSignals())
+	fmt.Fprintf(buf, "ShdPnd:\t%016x\n", s.task.ThreadGroup().PendingSignals())
+	fmt.Fprintf(buf, "SigBlk:\t%016x\n", s.task.SignalMask())
+	ignored, caught := s.task.ThreadGroup().IgnoredAndCaughtSignals()
+	fmt.Fprintf(buf, "SigIgn:\t%016x\n", ignored)
+	fmt.Fprintf(buf, "SigCgt:\t%016x\n", caught)
 	fmt.Fprintf(buf, "CapInh:\t%016x\n", creds.InheritableCaps)
 	fmt.Fprintf(buf, "CapPrm:\t%016x\n", creds.PermittedCaps)
 	fmt.Fprintf(buf, "CapEff:\t%016x\n", creds.EffectiveCaps)
@@ -1711,7 +1738,12 @@ func (d *childrenData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	children := d.task.Children()
 	var childrenTIDs []int
 	for childTask := range children {
-		childrenTIDs = append(childrenTIDs, int(d.pidns.IDOfTask(childTask)))
+		tid := d.pidns.IDOfTask(childTask)
+		if tid == 0 {
+			// Reaped children have tid 0. Linux never reports 0 here.
+			continue
+		}
+		childrenTIDs = append(childrenTIDs, int(tid))
 	}
 
 	// The TIDs need to be in sorted order in accordance with the Linux implementation.

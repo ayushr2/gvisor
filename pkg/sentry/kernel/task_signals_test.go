@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // TestInitSignalDiscarded verifies the discard rule that keeps a PID namespace's
@@ -222,6 +224,33 @@ func TestForcedSignalsToInit(t *testing.T) {
 	}
 }
 
+// fakeCgroup2FS is a minimal Cgroup2FS double for tests that construct a bare
+// *Kernel without going through Kernel.Init(). It lets
+// sendSignalTimerLocked's t.k.Cgroup2FS().EverMounted() call return false
+// instead of dereferencing the nil k.cgroupRegistry.v2fs that a real Init()
+// would otherwise have set up. Every other embedded method is unimplemented
+// (nil) and would panic if called, but EverMounted() returning false means
+// sendSignalTimerLocked never calls any of them.
+type fakeCgroup2FS struct {
+	vfs.FilesystemImpl
+	Cgroup2FS
+}
+
+func (fakeCgroup2FS) EverMounted() bool { return false }
+
+// sharedFakeRegistry backs Kernel.cgroupRegistry for tests below that
+// construct a bare *Kernel. It's read-only (EverMounted() always returns
+// false), so sharing one instance across sub-tests is safe.
+var sharedFakeRegistry = func() *CgroupRegistry {
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(context.Background()); err != nil {
+		panic(err)
+	}
+	fs := &vfs.Filesystem{}
+	fs.Init(vfsObj, nil /* fsType, never queried */, fakeCgroup2FS{})
+	return &CgroupRegistry{v2fs: fs}
+}()
+
 // TestDeliverSignalToInit verifies that sendSignalTimerLocked correctly applies
 // initSignalDiscarded to discard unhandled signals to PID namespace init (PID 1)
 // or permit delivery when appropriate.
@@ -259,6 +288,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 1. Under SignalUnkillableLinux, unforced peer SIGKILL to init is discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		if err := task.SendSignal(peerKill); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -271,6 +301,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 2. Discarding with an IntervalTimer calls signalRejectedLocked on the timer.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		timer := &IntervalTimer{}
 		task.tg.signalHandlers.mu.Lock()
@@ -290,6 +321,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 3. Peer unhandled SIGTERM to init is discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		if err := task.SendSignal(peerTerm); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -302,6 +334,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 4. Under SignalUnkillableNone, peer SIGKILL to init is NOT discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableNone}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		if err := task.SendSignal(peerKill); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -314,6 +347,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 5. Signals to non-init process (PID 2) are NOT discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, nonInitTG)
 		if err := task.SendSignal(peerKill); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -326,6 +360,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 6. Traced tasks are exempt and do not have signals discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		task.ptraceTracer.Store(&Task{})
 		if err := task.SendSignal(peerKill); err != nil {
@@ -339,6 +374,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 7. Forced SIGKILL (SI_KERNEL) to init is NOT discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		task := newTask(k, initTG)
 		if err := task.SendSignal(forcedKill); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -351,6 +387,7 @@ func TestDeliverSignalToInit(t *testing.T) {
 	// 8. Handled signals are NOT discarded.
 	{
 		k := &Kernel{signalUnkillable: SignalUnkillableLinux}
+		k.cgroupRegistry = sharedFakeRegistry
 		handledTG := &ThreadGroup{
 			signalHandlers: NewSignalHandlers(),
 		}
@@ -364,6 +401,43 @@ func TestDeliverSignalToInit(t *testing.T) {
 		}
 		if task.pendingSignals.pendingSet.Load() == 0 {
 			t.Errorf("handled peer SIGTERM was discarded, want delivered")
+		}
+	}
+}
+
+func TestDumpGoroutinesSignal(t *testing.T) {
+	// When DumpGoroutinesSignal is set, external signal should dump goroutines
+	// and be consumed without forwarding to globalInit.
+	{
+		k := &Kernel{dumpGoroutinesSignal: linux.SIGUSR1}
+		// If it were forwarded, with globalInit == nil it would panic.
+		// Since it is consumed, sendExternalSignal returns cleanly.
+		k.sendExternalSignal(&linux.SignalInfo{Signo: int32(linux.SIGUSR1)}, "test")
+	}
+
+	// When DumpGoroutinesSignal is 0 (disabled), external SIGUSR1 should be forwarded
+	// to globalInit.
+	{
+		k := &Kernel{dumpGoroutinesSignal: 0}
+		k.cgroupRegistry = sharedFakeRegistry
+		taskSet := &TaskSet{}
+		pidns := &PIDNamespace{owner: taskSet}
+		initTG := &ThreadGroup{
+			signalHandlers: NewSignalHandlers(),
+		}
+		initTG.pidns = pidns
+		initTG.pidWithinNS.Store(int32(initTID))
+		task := &Task{k: k}
+		task.tg = initTG
+		initTG.leader = task
+		prefix := ""
+		task.logPrefix.Store(&prefix)
+		task.signalMask.Store(^uint64(0))
+		k.globalInit = initTG
+
+		k.sendExternalSignal(&linux.SignalInfo{Signo: int32(linux.SIGUSR1)}, "test")
+		if task.pendingSignals.pendingSet.Load() == 0 && initTG.pendingSignals.pendingSet.Load() == 0 {
+			t.Errorf("SIGUSR1 was not delivered to globalInit when dumpGoroutinesSignal is 0")
 		}
 	}
 }

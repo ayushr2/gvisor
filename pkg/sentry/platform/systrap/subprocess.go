@@ -22,8 +22,10 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -339,7 +341,7 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // newSubprocess returns a usable subprocess.
 //
 // This will either be a newly created subprocess, or one from the global pool.
-// The create function will be called in the latter case, which is guaranteed
+// The create function will be called in the former case, which is guaranteed
 // to happen with the runtime thread locked.
 //
 // seccompNotify indicates a ways of communications with syscall threads.
@@ -347,10 +349,13 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // seccomp-unotify can't be used for the source pool process, because it is a
 // parent of all other stub processes, but only one filter can be installed
 // with SECCOMP_FILTER_FLAG_NEW_LISTENER.
-func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool) (*subprocess, error) {
+//
+// disablePatching prevents this subprocess from patching syscall
+// instructions in the application's address space.
+func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool, disablePatching bool) (*subprocess, error) {
 	if sp := globalPool.fetchAvailable(); sp != nil {
 		sp.subprocessRefs.InitRefs()
-		sp.usertrap = usertrap.New()
+		sp.usertrap = usertrap.New(disablePatching)
 		return sp, nil
 	}
 
@@ -396,7 +401,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	}()
 
 	sp.unmap()
-	sp.usertrap = usertrap.New()
+	sp.usertrap = usertrap.New(disablePatching)
 	sp.mapSharedRegions()
 	sp.mapPrivateRegions()
 
@@ -850,12 +855,12 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	// Reset necessary registers.
 	regs := &ac.StateData().Regs
 	s.resetSysemuRegs(regs)
-	ctx := c.sharedContext
+	ctx := c.sharedContext.Load()
 	ctx.shared.Regs = regs.PtraceRegs
-	restoreArchSpecificState(ctx.shared, ac)
+	s.restoreArchSpecificState(ctx.shared, ac)
 
 	// Check for interrupts, and ensure that future interrupts signal the context.
-	if !c.interrupt.Enable(c.sharedContext) {
+	if !c.interrupt.Enable() {
 		// Pending interrupt; simulate.
 		ctx.clearInterrupt()
 		c.signalInfo = linux.SignalInfo{Signo: int32(platform.SignalInterrupt)}
@@ -906,7 +911,7 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 
 	// Copy register state locally.
 	regs.PtraceRegs = ctx.shared.Regs
-	retrieveArchSpecificState(ctx.shared, ac)
+	s.retrieveArchSpecificState(ctx.shared, ac)
 	c.needToPullFullState = true
 	// We have a signal. We verify however, that the signal was
 	// either delivered from the kernel or from this process. We
@@ -1090,10 +1095,11 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 }
 
 func (s *subprocess) PullFullState(c *platformContext, ac *arch.Context64) error {
-	if !c.sharedContext.isActiveInSubprocess(s) {
+	sc := c.sharedContext.Load()
+	if !sc.isActiveInSubprocess(s) {
 		panic("Attempted to PullFullState for context that is not used in subprocess")
 	}
-	saveFPState(c.sharedContext, ac)
+	saveFPState(sc, ac)
 	return nil
 }
 
@@ -1277,19 +1283,34 @@ func (s *subprocess) PostFork() {
 	s.usertrap.PostFork() // +checklocksforce: PreFork acquires, above.
 }
 
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
+func (s *subprocess) UserModifiedGS(ctx pkgcontext.Context, mm platform.MemoryManager) error {
+	if s.usertrap == nil || s.usertrap.Disabled() {
+		return nil
+	}
+
+	if err := s.usertrap.UnpatchSyscalls(ctx, mm); err != nil {
+		s.kill()
+		return err
+	}
+
+	return nil
+}
+
 // activateContext activates the context in this subprocess.
 // No-op if the context is already active within the subprocess; if not,
 // deactivates it from its last subprocess.
 func (s *subprocess) activateContext(c *platformContext) error {
-	if !c.sharedContext.isActiveInSubprocess(s) {
-		c.sharedContext.release()
-		c.sharedContext = nil
+	if !c.sharedContext.Load().isActiveInSubprocess(s) {
+		if sc := c.sharedContext.Swap(nil); sc != nil {
+			sc.release()
+		}
 
 		shared, err := s.getSharedContext()
 		if err != nil {
 			return err
 		}
-		c.sharedContext = shared
+		c.sharedContext.Store(shared)
 	}
 	return nil
 }

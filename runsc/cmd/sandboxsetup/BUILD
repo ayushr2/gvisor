@@ -21,6 +21,7 @@ go_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/amdgpu",
         "//pkg/cpuid",
         "//pkg/fd",
         "//pkg/log",
@@ -43,5 +44,5 @@ go_test(
     name = "sandboxsetup_test",
     size = "small",
     srcs = ["gofer_mount_test.go"],
-    library = ":sandboxsetup",
+    embed = [":sandboxsetup"],
 )

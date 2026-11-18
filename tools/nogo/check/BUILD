@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -13,6 +13,7 @@ go_library(
         "check.go",
         "findings.go",
     ],
+    importpath = "gvisor.dev/gvisor/tools/nogo/check",
     visibility = ["//tools/nogo:__subpackages__"],
     deps = [
         "//runsc/flag",
@@ -57,5 +58,16 @@ go_library(
         "@org_golang_x_tools//go/analysis/passes/unsafeptr:go_default_library",
         "@org_golang_x_tools//go/analysis/passes/unusedresult:go_default_library",
         "@org_golang_x_tools//go/gcexportdata:go_default_library",
+    ],
+)
+
+go_test(
+    name = "check_test",
+    size = "small",
+    srcs = ["check_test.go"],
+    embed = [":check"],
+    deps = [
+        "//tools/nogo/flags",
+        "@org_golang_x_tools//go/analysis:go_default_library",
     ],
 )

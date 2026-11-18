@@ -17,9 +17,13 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/cleanup"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -44,6 +48,9 @@ type Create struct {
 	// true.
 	consoleSocket string
 
+	// passFDs are host FDs exposed to the sandboxed application.
+	passFDs sandboxsetup.FDMappings
+
 	// userLog is the path to send user-visible logs to. This log is different
 	// from debug logs. The former is meant to be consumed by the users and should
 	// contain only information that is relevant to the person running the
@@ -56,6 +63,10 @@ type Create struct {
 	// be opened with O_DIRECT.
 	fsRestoreImagePath string
 	fsRestoreDirect    bool
+
+	// noRootContainer creates a sandbox with no root container: the spec holds
+	// sandbox-wide settings only and containers are added afterwards.
+	noRootContainer bool
 
 	// spec is the cached OCI spec.
 	spec *specs.Spec
@@ -78,12 +89,40 @@ func (*Create) Usage() string {
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (c *Create) SetFlags(f *flag.FlagSet) {
+	f.Var(&c.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.StringVar(&c.bundleDir, "bundle", "", "path to the root of the bundle directory, defaults to the current directory")
 	f.StringVar(&c.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
 	f.StringVar(&c.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&c.userLog, "user-log", "", "filename to send user-visible logs to. Empty means no logging.")
 	f.StringVar(&c.fsRestoreImagePath, "fs-restore-image-path", "", "path to filesystem checkpoint to restore")
 	f.BoolVar(&c.fsRestoreDirect, "fs-restore-direct", false, "open files in fs-restore-image-path with O_DIRECT")
+	f.BoolVar(&c.noRootContainer, "no-root-container", false, "create a sandbox with no root container; the bundle spec describes only the sandbox and containers are added later as subcontainers")
+}
+
+// passFiles takes ownership of the descriptors supplied by --pass-fd. The
+// caller must close them after donating them to the new sandbox.
+func (c *Create) passFiles() (map[int]*os.File, func(), error) {
+	files := make(map[int]*os.File, len(c.passFDs))
+	hostFiles := make(map[int]*os.File, len(c.passFDs))
+	var cu cleanup.Cleanup
+	defer cu.Clean()
+	for _, mapping := range c.passFDs {
+		file, ok := hostFiles[mapping.Host]
+		if !ok {
+			file = os.NewFile(uintptr(mapping.Host), "")
+			if file == nil {
+				return nil, nil, fmt.Errorf("creating file from descriptor %d", mapping.Host)
+			}
+			hostFiles[mapping.Host] = file
+			cu.Add(func() {
+				if err := file.Close(); err != nil {
+					log.Debugf("Closing passed FD %d: %v", mapping.Host, err)
+				}
+			})
+		}
+		files[mapping.Guest] = file
+	}
+	return files, cu.Release(), nil
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -98,7 +137,7 @@ func (c *Create) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs
 	if c.bundleDir == "" {
 		c.bundleDir = getwdOrDie()
 	}
-	spec, err := specutils.ReadSpec(c.bundleDir, conf)
+	spec, err := specutils.ReadSpec(c.bundleDir, specutils.SpecOpts{Conf: conf, NoRootContainer: c.noRootContainer})
 	if err != nil {
 		return cid, nil, fmt.Errorf("reading spec: %w", err)
 	}
@@ -123,6 +162,11 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 	if err != nil {
 		return util.Errorf("FetchSpec: %v", err)
 	}
+	files, closeFiles, err := c.passFiles()
+	if err != nil {
+		return util.Errorf("preparing passed files: %v", err)
+	}
+	defer closeFiles()
 
 	// Create the container. A new sandbox will be created for the
 	// container unless the metadata specifies that it should be run in an
@@ -134,8 +178,10 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 		ConsoleSocket:      c.consoleSocket,
 		PIDFile:            c.pidFile,
 		UserLog:            c.userLog,
+		PassFiles:          files,
 		FSRestoreImagePath: c.fsRestoreImagePath,
 		FSRestoreDirect:    c.fsRestoreDirect,
+		NoRootContainer:    c.noRootContainer,
 	}
 	if _, err := container.New(conf, contArgs); err != nil {
 		return util.Errorf("creating container: %v", err)

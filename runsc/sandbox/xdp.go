@@ -34,7 +34,6 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/sandbox/bpf"
-	xdpcmd "gvisor.dev/gvisor/tools/xdp/cmd"
 )
 
 // This file supports XDP in gVisor. It is not compiled in by default.
@@ -57,8 +56,8 @@ import (
 // TODO(b/240191988): IPv6 support.
 // TODO(b/240191988): Merge redundant code with CreateLinksAndRoutes once
 // features are finalized.
-func createRedirectInterfacesAndRoutes(conn *urpc.Client, conf *config.Config) error {
-	args, iface, err := prepareRedirectInterfaceArgs(boot.BindRunsc, conf)
+func createRedirectInterfacesAndRoutes(conn *urpc.Client, conf *config.Config, disableIPv6 bool) error {
+	args, iface, err := prepareRedirectInterfaceArgs(boot.BindRunsc, conf, disableIPv6)
 	if err != nil {
 		return fmt.Errorf("failed to generate redirect interface args: %w", err)
 	}
@@ -80,6 +79,8 @@ func createRedirectInterfacesAndRoutes(conn *urpc.Client, conf *config.Config) e
 		return err
 	}
 
+	// Keep this synchronous: the sentry must initialize the socket's UMEM
+	// and rings before runsc binds it below.
 	log.Infof("Setting up network, config: %+v", args)
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &args, nil); err != nil {
 		return fmt.Errorf("creating links and routes: %w", err)
@@ -88,7 +89,7 @@ func createRedirectInterfacesAndRoutes(conn *urpc.Client, conf *config.Config) e
 	// Insert socket into eBPF map. Note that sockets are automatically
 	// removed from eBPF maps when released. See net/xdp/xsk.c:xsk_release
 	// and net/xdp/xsk.c:xsk_delete_from_maps.
-	mapPath := xdpcmd.RedirectMapPath(iface.Name)
+	mapPath := xdp.RedirectMapPath(iface.Name)
 	pinnedMap, err := ebpf.LoadPinnedMap(mapPath, nil)
 	if err != nil {
 		return fmt.Errorf("failed to load pinned map %s: %w", mapPath, err)
@@ -115,15 +116,13 @@ func createRedirectInterfacesAndRoutes(conn *urpc.Client, conf *config.Config) e
 // process two interfaces: the loopback and the interface we've been told to
 // bind to. This all takes place in the netns where the runsc binary is run,
 // *not* the netns passed to the container.
-func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config) (boot.CreateLinksAndRoutesArgs, net.Interface, error) {
+func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config, disableIPv6 bool) (boot.CreateLinksAndRoutesArgs, net.Interface, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return boot.CreateLinksAndRoutesArgs{}, net.Interface{}, fmt.Errorf("querying interfaces: %w", err)
 	}
 
-	args := boot.CreateLinksAndRoutesArgs{
-		DisconnectOk: conf.NetDisconnectOk,
-	}
+	var args boot.CreateLinksAndRoutesArgs
 	var netIface net.Interface
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
@@ -138,7 +137,7 @@ func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config) (boot.
 
 		// We build our own loopback device.
 		if iface.Flags&net.FlagLoopback != 0 {
-			link, err := loopbackLink(conf, iface, allAddrs)
+			link, err := loopbackLink(conf, iface, allAddrs, disableIPv6)
 			if err != nil {
 				return boot.CreateLinksAndRoutesArgs{}, net.Interface{}, fmt.Errorf("getting loopback link for iface %q: %w", iface.Name, err)
 			}
@@ -187,7 +186,7 @@ func prepareRedirectInterfaceArgs(bind boot.BindOpt, conf *config.Config) (boot.
 		}
 
 		// Scrape routes.
-		routes, defv4, defv6, err := routesForIface(iface)
+		routes, defv4, defv6, err := routesForIface(iface, disableIPv6)
 		if err != nil {
 			return boot.CreateLinksAndRoutesArgs{}, net.Interface{}, fmt.Errorf("getting routes for interface %q: %v", iface.Name, err)
 		}
@@ -314,9 +313,9 @@ func createSocketXDP(iface net.Interface) ([]*os.File, error) {
 // TODO(b/240191988): Merge redundant code with CreateLinksAndRoutes once
 // features are finalized.
 // TODO(b/240191988): Cleanup / GC of pinned BPF objects.
-func createXDPTunnel(conn *urpc.Client, nsPath string, conf *config.Config) error {
+func createXDPTunnel(conn *urpc.Client, nsPath string, conf *config.Config, disableIPv6 bool) error {
 	// Get the setup for the sentry nic. We need the host neighbors and routes.
-	args, hostIface, err := prepareRedirectInterfaceArgs(boot.BindSentry, conf)
+	args, hostIface, err := prepareRedirectInterfaceArgs(boot.BindSentry, conf, disableIPv6)
 	if err != nil {
 		return fmt.Errorf("failed to generate tunnel interface args: %w", err)
 	}
@@ -443,7 +442,7 @@ func createXDPTunnel(conn *urpc.Client, nsPath string, conf *config.Config) erro
 	}
 
 	// Insert veth into host eBPF map.
-	hostMapPath := xdpcmd.TunnelHostMapPath(hostIface.Name)
+	hostMapPath := xdp.TunnelHostMapPath(hostIface.Name)
 	pinnedHostMap, err := ebpf.LoadPinnedMap(hostMapPath, nil)
 	if err != nil {
 		return fmt.Errorf("failed to load pinned host map %s: %w", hostMapPath, err)
@@ -493,10 +492,10 @@ func createXDPTunnel(conn *urpc.Client, nsPath string, conf *config.Config) erro
 	}
 
 	var (
-		vethPinDir      = xdpcmd.RedirectPinDir(vethIface.Name)
-		vethMapPath     = xdpcmd.TunnelVethMapPath(vethIface.Name)
-		vethProgramPath = xdpcmd.TunnelVethProgramPath(vethIface.Name)
-		vethLinkPath    = xdpcmd.TunnelVethLinkPath(vethIface.Name)
+		vethPinDir      = xdp.RedirectPinDir(vethIface.Name)
+		vethMapPath     = xdp.TunnelVethMapPath(vethIface.Name)
+		vethProgramPath = xdp.TunnelVethProgramPath(vethIface.Name)
+		vethLinkPath    = xdp.TunnelVethLinkPath(vethIface.Name)
 	)
 
 	// Create directory /sys/fs/bpf/<device name>/.

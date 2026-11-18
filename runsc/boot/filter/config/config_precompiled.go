@@ -115,6 +115,9 @@ func optionsToPrecompile() ([]Options, error) {
 			return opts, nil
 		},
 
+		// AMD GPU configurations use runtime compilation to avoid doubling
+		// every precompiled combination for this experimental device proxy.
+
 		// Expand TPUProxy vs not.
 		func(opt Options) ([]Options, error) {
 			tpuProxyYes := opt
@@ -148,6 +151,10 @@ func optionsToPrecompile() ([]Options, error) {
 
 // PrecompiledPrograms returns the set of seccomp programs to precompile.
 func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
+	return precompiledPrograms(precompiledseccomp.Parallelism())
+}
+
+func precompiledPrograms(parallelism int) ([]precompiledseccomp.Program, error) {
 	opts, err := optionsToPrecompile()
 	if err != nil {
 		return nil, err
@@ -155,6 +162,7 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 	programs := make([]precompiledseccomp.Program, len(opts))
 	var programsMu sync.Mutex
 	var errGroup errgroup.Group
+	errGroup.SetLimit(parallelism)
 	for i, opt := range opts {
 		i, opt := i, opt
 		errGroup.Go(func() error {

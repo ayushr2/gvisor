@@ -13,6 +13,7 @@ go_library(
         "cgroup_v2_unsafe.go",
         "systemd.go",
     ],
+    importpath = "gvisor.dev/gvisor/runsc/cgroup",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
@@ -35,7 +36,7 @@ go_test(
         "cgroup_v2_test.go",
         "systemd_test.go",
     ],
-    library = ":cgroup",
+    embed = [":cgroup"],
     tags = ["local"],
     deps = [
         "//pkg/test/testutil",
@@ -44,5 +45,6 @@ go_test(
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

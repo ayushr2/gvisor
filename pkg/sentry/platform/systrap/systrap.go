@@ -56,6 +56,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
@@ -140,9 +141,9 @@ type platformContext struct {
 
 	// sharedContext is everything related to this platformContext that is resident in
 	// shared memory with the stub thread.
-	// sharedContext is only accessed on the Task goroutine, therefore it is not
-	// mutex protected.
-	sharedContext *sharedContext
+	// sharedContext is only written on the Task goroutine, but atomic because
+	// NotifyInterrupt may read it from any goroutines.
+	sharedContext atomic.Pointer[sharedContext]
 
 	// needRestoreFPState indicates that the FPU state has been changed by
 	// the Sentry and has to be updated on the stub thread.
@@ -225,17 +226,23 @@ func (c *platformContext) Interrupt() {
 // Preempt implements platform.Context.Preempt.
 func (c *platformContext) Preempt() {}
 
+// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
+func (c *platformContext) NotifyInterrupt() {
+	if sc := c.sharedContext.Load(); sc != nil {
+		sc.NotifyInterrupt()
+	}
+}
+
 // Release releases all platform resources used by the platformContext.
 func (c *platformContext) Release() {
-	if c.sharedContext != nil {
-		c.sharedContext.release()
-		c.sharedContext = nil
+	if sc := c.sharedContext.Swap(nil); sc != nil {
+		sc.release()
 	}
 }
 
 // PrepareSleep implements platform.Context.PrepareSleep.
 func (c *platformContext) PrepareSleep() {
-	ctx := c.sharedContext
+	ctx := c.sharedContext.Load()
 	if ctx == nil {
 		return
 	}
@@ -319,7 +326,8 @@ func New(opts platform.Options) (*Systrap, error) {
 
 		// Create the source process for the global pool. This must be
 		// done before initializing any other processes.
-		source, err := newSubprocess(createStub, mf, false)
+		usesSeccompNotify := false
+		source, err := newSubprocess(createStub, mf, usesSeccompNotify, disableSyscallPatching)
 		if err != nil {
 			stubErr = fmt.Errorf("initialize systrap: %w", err)
 			return
@@ -373,16 +381,32 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
-	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+//
+// In mm.Fork, the child process's AddressSpace and MemoryManager must be
+// synchronized to ensure a consistent view of syscall patching. Even though a
+// concurrent ARCH_SET_GS may set mm.gsInUse just after reading it for
+// opts.DisableSyscallPatching, that is ok. The flag is only set once the
+// parent process's syscalls have already been unpatched, so the child process
+// will either:
+//   - see the flag before and inherit an unpatched address space.
+//   - miss it, unpatch completes, and inherit a clean address space with
+//     usertrap enabled.
+//
+// This is ok as the calling thread never set its own GS register. The child
+// process/thread inherits an accurate value with a completely patchable
+// address space.
+func (p *Systrap) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
+	return newSubprocess(globalPool.source.createStub, p.memoryFile, true /* usesSeccomNotify */, opts.DisableSyscallPatching)
 }
 
 // NewContext returns an interruptible platformContext.
 func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
-	return &platformContext{
+	c := &platformContext{
 		needRestoreFPState:  true,
 		needToPullFullState: false,
 	}
+	c.interrupt.Dst = c
+	return c
 }
 
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount.

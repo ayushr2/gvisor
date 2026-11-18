@@ -35,6 +35,13 @@ go_library(
 go_test(
     name = "metricserver_test",
     srcs = ["metricserver_test.go"],
-    library = ":metricserver",
-    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
+    embed = [":metricserver"],
+    deps = [
+        "//pkg/metric:metric_go_proto",
+        "//runsc/container",
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
 )

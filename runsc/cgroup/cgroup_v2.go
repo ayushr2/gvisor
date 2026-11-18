@@ -290,6 +290,9 @@ func (c *cgroupV2) CloneIntoCgroup() (*os.File, error) {
 func readCPUQuotaAndPeriod(path string) (int64, int64, error) {
 	cpuMax, err := getValue(path, cpuLimitCgroup)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, -1, nil
+		}
 		return -1, -1, err
 	}
 	return parseCPUQuotaAndPeriod(cpuMax)
@@ -309,7 +312,7 @@ func (c *cgroupV2) CPUQuota() (int64, error) {
 		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
 			return -1, parentErr
 		}
-		if parentErr == nil {
+		if parentErr == nil && parentQuota != -1 {
 			quota = parentQuota
 		}
 	}
@@ -329,7 +332,7 @@ func (c *cgroupV2) CPUPeriod() (int64, error) {
 		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
 			return -1, parentErr
 		}
-		if parentErr == nil {
+		if parentErr == nil && parentPeriod != -1 {
 			period = parentPeriod
 		}
 	}
@@ -689,27 +692,12 @@ type io2 struct {
 	mandatory
 }
 
-func (*io2) generateProperties(spec *specs.LinuxResources) ([]dbus.Property, error) {
-	props := []dbus.Property{}
-	if spec == nil || spec.BlockIO == nil {
-		return props, nil
-	}
-	io := spec.BlockIO
-	if io != nil {
-		if io.Weight != nil && *io.Weight != 0 {
-			ioWeight := convertBlkIOToIOWeightValue(*io.Weight)
-			props = append(props, newProp("IOWeight", ioWeight))
-		}
-		for _, dev := range io.WeightDevice {
-			val := fmt.Sprintf("%d:%d %d", dev.Major, dev.Minor, *dev.Weight)
-			props = append(props, newProp("IODeviceWeight", val))
-		}
-		props = addIOProps(props, "IOReadBandwidthMax", io.ThrottleReadBpsDevice)
-		props = addIOProps(props, "IOWriteBandwidthMax", io.ThrottleWriteBpsDevice)
-		props = addIOProps(props, "IOReadIOPSMax", io.ThrottleReadIOPSDevice)
-		props = addIOProps(props, "IOWriteIOPSMax", io.ThrottleWriteIOPSDevice)
-	}
-	return props, nil
+func (*io2) generateProperties(*specs.LinuxResources) ([]dbus.Property, error) {
+	// Systemd's IOWeight-to-BFQ mapping differs from our cgroupfs mapping:
+	// https://github.com/systemd/systemd/blob/b3d8fc43e/src/basic/cgroup-util.h#L100-L112
+	// Apply I/O resources directly after creating or updating the scope, using
+	// the same filesystem translation as other cgroup v2 users.
+	return nil, nil
 }
 
 func (*io2) set(spec *specs.LinuxResources, path string) error {
@@ -725,7 +713,7 @@ func (*io2) set(spec *specs.LinuxResources, path string) error {
 
 	// If BFQ IO scheduler is available, use it.
 	if blkio.Weight != nil || len(blkio.WeightDevice) > 0 {
-		bfq, err = os.Open(filepath.Join(path, "io.bfq.weight"))
+		bfq, err = os.OpenFile(filepath.Join(path, "io.bfq.weight"), os.O_RDWR, 0)
 		if err == nil {
 			defer bfq.Close()
 		} else if !os.IsNotExist(err) {
@@ -902,12 +890,13 @@ func bfqDeviceWeightSupported(bfq *os.File) bool {
 	}
 
 	buf := make([]byte, 32)
-	if _, err := bfq.Read(buf); err != nil {
+	n, err := bfq.Read(buf)
+	if err != nil {
 		return false
 	}
-	// If only a single number (default weight) if read back, we have older
+	// If only a single number (default weight) is read back, we have an older
 	// kernel.
-	_, err := strconv.ParseInt(string(bytes.TrimSpace(buf)), 10, 64)
+	_, err = strconv.ParseInt(string(bytes.TrimSpace(buf[:n])), 10, 64)
 	return err != nil
 }
 

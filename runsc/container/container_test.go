@@ -1580,6 +1580,75 @@ func TestSignalUnkillablePolicyForcedSignals(t *testing.T) {
 	}
 }
 
+// TestNoRootContainerRejectsRootArgs checks that Args describing a root
+// container process or its rootfs are refused rather than dropped.
+func TestNoRootContainerRejectsRootArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    Args
+		wantErr string
+	}{
+		{
+			name:    "console socket",
+			args:    Args{ConsoleSocket: "/tmp/console.sock"},
+			wantErr: "ConsoleSocket cannot be set with NoRootContainer",
+		},
+		{
+			name:    "fs restore image path",
+			args:    Args{FSRestoreImagePath: "/tmp/image"},
+			wantErr: "FSRestoreImagePath cannot be set with NoRootContainer",
+		},
+		{
+			name:    "pass files",
+			args:    Args{PassFiles: map[int]*os.File{3: os.Stdin}},
+			wantErr: "PassFiles and ExecFile cannot be set with NoRootContainer",
+		},
+		{
+			name:    "exec file",
+			args:    Args{ExecFile: os.Stdin},
+			wantErr: "PassFiles and ExecFile cannot be set with NoRootContainer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := testutil.TestConfig(t)
+			rootDir, cleanupRoot, err := testutil.SetupRootDir()
+			if err != nil {
+				t.Fatalf("error creating root dir: %v", err)
+			}
+			defer cleanupRoot()
+			conf.RootDir = rootDir
+
+			// A sandbox spec has no process and no rootfs.
+			spec := &specs.Spec{
+				Version: specs.Version,
+				Annotations: map[string]string{
+					specutils.ContainerdContainerTypeAnnotation: specutils.ContainerdContainerTypeSandbox,
+				},
+			}
+			bundleDir, cleanupBundle, err := testutil.SetupBundleDir(spec)
+			if err != nil {
+				t.Fatalf("error setting up bundle: %v", err)
+			}
+			defer cleanupBundle()
+
+			args := tc.args
+			args.ID = testutil.RandomContainerID()
+			args.Spec = spec
+			args.BundleDir = bundleDir
+			args.NoRootContainer = true
+
+			c, err := New(conf, args)
+			if err == nil {
+				c.Destroy()
+				t.Fatalf("New() succeeded, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("New() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // startHostinetSRServer starts a TCP server and returns its address, a
 // channel signaled when it observes a connection closing, and a stop func.
 func startHostinetSRServer(t *testing.T) (string, chan struct{}, func()) {
@@ -3179,6 +3248,85 @@ func TestUserLog(t *testing.T) {
 	}
 	if want := "Unsupported syscall sched_rr_get_interval("; !strings.Contains(string(out), want) {
 		t.Errorf("user log file doesn't contain %q, out: %s", want, string(out))
+	}
+}
+
+// TestOCISeccompErrnoRet checks that an OCI seccomp profile's `errnoRet` is
+// honored end-to-end: the errno the application observes must be the one
+// named in the profile, and a rule that omits `errnoRet` must still default
+// to EPERM. This is the pattern glibc >= 2.34 relies on to fall back from
+// clone3(2) to clone(2): it only does so when clone3 fails with ENOSYS.
+// See gvisor.dev/issue/14688.
+func TestOCISeccompErrnoRet(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.OCISeccomp = true
+
+	// getsid(2) and getpgid(2) are both fully implemented by the sentry and
+	// are not on the Go runtime's startup path, so the only way test_app can
+	// observe a failure for either is through the seccomp filter below.
+	enosys := uint(unix.ENOSYS)
+	spec.Linux = &specs.Linux{
+		Seccomp: &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{
+				{
+					Names:    []string{"getsid"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &enosys,
+				},
+				{
+					// No ErrnoRet: must default to EPERM, like runc.
+					Names:  []string{"getpgid"},
+					Action: specs.ActErrno,
+				},
+			},
+		},
+	}
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		sysno int
+		want  error
+	}{
+		{name: "errno_ret_honored", sysno: unix.SYS_GETSID, want: unix.ENOSYS},
+		{name: "no_errno_ret_defaults_to_eperm", sysno: unix.SYS_GETPGID, want: unix.EPERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// test_app's "syscall" subcommand always exits 0; it prints the
+			// errno it observed, which is what we assert on.
+			out, err := executeCombinedOutput(conf, cont, nil, app, "syscall", "--syscall="+strconv.Itoa(tc.sysno))
+			if err != nil {
+				t.Fatalf("error executing test_app: %v", err)
+			}
+			if want := fmt.Sprintf("failed: %v", tc.want); !strings.Contains(string(out), want) {
+				t.Errorf("syscall(%d) output %q does not contain %q", tc.sysno, out, want)
+			}
+		})
 	}
 }
 
@@ -5862,6 +6010,116 @@ func TestSpecValidationForCapabilities(t *testing.T) {
 	if err := specutils.RestoreValidateSpec(oldSpecs, newSpecs, conf); err != nil {
 		t.Errorf("spec validation failed, got: %v, want: nil", err)
 	}
+}
+
+// TestSaveRestoreExecReconfigure checkpoints a sandbox twice with a
+// save/restore binary configured, and then checkpoints it again after a
+// restore. The hook configuration is stored in the kernel and outlives both a
+// single checkpoint and a restore, so every checkpoint must be able to
+// reconfigure it.
+func TestSaveRestoreExecReconfigure(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding dir: %q, %v", dir, err)
+	}
+
+	// The hook records the mode it was invoked with so that the test can tell
+	// whether it ran on every checkpoint.
+	hookLog := filepath.Join(dir, "hook.log")
+	hookPath := filepath.Join(dir, "hook.sh")
+	hook := fmt.Sprintf("#!/bin/sh\necho ${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE} >> %q\n", hookLog)
+	if err := os.WriteFile(hookPath, []byte(hook), 0777); err != nil {
+		t.Fatalf("error writing hook: %v", err)
+	}
+	checkpointOpts := sandbox.CheckpointOpts{
+		Resume:                 true,
+		SaveRestoreExecArgv:    hookPath,
+		SaveRestoreExecTimeout: control.DefaultSaveRestoreExecTimeout,
+	}
+	imageDir := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.Mkdir(path, 0777); err != nil {
+			t.Fatalf("error creating image dir: %v", err)
+		}
+		return path
+	}
+	wantHookLog := func(want string) {
+		got, err := os.ReadFile(hookLog)
+		if err != nil {
+			t.Fatalf("error reading hook log: %v", err)
+		}
+		if string(got) != want {
+			t.Errorf("save/restore binary invocations: got %q, want %q", got, want)
+		}
+	}
+
+	spec, conf := sleepSpecConf(t)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	checkpointOpts.SaveRestoreExecContainerID = cont.ID
+	var lastImage string
+	for i := 0; i < 2; i++ {
+		lastImage = imageDir(fmt.Sprintf("image%d", i))
+		if err := cont.Checkpoint(conf, lastImage, checkpointOpts); err != nil {
+			t.Fatalf("checkpoint %d failed: %v", i+1, err)
+		}
+	}
+	wantHookLog("save\nresume\nsave\nresume\n")
+	cont.Destroy()
+
+	// Restore the last checkpoint and checkpoint it once more. The restored
+	// kernel still holds the configuration from before the checkpoint.
+	spec2, _ := sleepSpecConf(t)
+	_, bundleDir2, cleanup2, err := testutil.SetupContainer(spec2, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup2()
+
+	cont2, err := New(conf, Args{
+		ID:        args.ID,
+		Spec:      spec2,
+		BundleDir: bundleDir2,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, lastImage, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring: %v", err)
+	}
+	// Restore does not wait for its hook to finish. Wait before starting another
+	// checkpoint so that the save and restore hooks cannot run concurrently.
+	if err := cont2.WaitRestore(); err != nil {
+		t.Fatalf("error waiting for restore: %v", err)
+	}
+	checkpointOpts.SaveRestoreExecContainerID = cont2.ID
+	if err := cont2.Checkpoint(conf, imageDir("image-restored"), checkpointOpts); err != nil {
+		t.Fatalf("checkpoint after restore failed: %v", err)
+	}
+	wantHookLog("save\nresume\nsave\nresume\nrestore\nsave\nresume\n")
 }
 
 func TestMarkerFile(t *testing.T) {

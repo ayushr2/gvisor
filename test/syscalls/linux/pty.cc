@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -480,19 +481,46 @@ TEST(BasicPtyTest, NewInstance) {
 TEST(BasicPtyTest, SetMode) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
-  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("devpts_test", dir.path(), "devpts", 0,
-            "newinstance,mode=0600,ptmxmode=0620", 0));
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
-      Open(JoinPath(dir.path()), O_RDONLY | O_DIRECTORY));
-  mount.Release();
+  const struct {
+    const char* options;
+    mode_t mode;
+    uid_t uid;
+    gid_t gid;
+  } cases[] = {
+      {"", 0600, geteuid(), getegid()},
+      {",mode=0622", 0622, geteuid(), getegid()},
+      {",uid=123", 0600, 123, getegid()},
+      {",mode=0620,gid=5", 0620, geteuid(), 5},
+  };
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.options);
+    auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount("devpts_test", dir.path(), "devpts", 0,
+              absl::StrCat("newinstance,ptmxmode=0620", test.options), 0));
+    FileDescriptor fd =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_RDONLY | O_DIRECTORY));
 
-  struct stat st;
-  ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
-  EXPECT_EQ(st.st_mode, 0600 | S_IFDIR);
-  ASSERT_THAT(fstatat(fd.get(), "ptmx", &st, 0), SyscallSucceeds());
-  EXPECT_EQ(st.st_mode, 0620 | S_IFCHR);
+    struct stat st;
+    ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+    EXPECT_EQ(st.st_mode, 0755 | S_IFDIR);
+    EXPECT_EQ(st.st_uid, 0);
+    EXPECT_EQ(st.st_gid, 0);
+    ASSERT_THAT(fstatat(fd.get(), "ptmx", &st, 0), SyscallSucceeds());
+    EXPECT_EQ(st.st_mode, 0620 | S_IFCHR);
+    EXPECT_EQ(st.st_uid, geteuid());
+    EXPECT_EQ(st.st_gid, getegid());
+
+    FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(JoinPath(dir.path(), "ptmx"), O_RDWR | O_NOCTTY));
+    int index = -1;
+    ASSERT_THAT(ioctl(master.get(), TIOCGPTN, &index), SyscallSucceeds());
+    ASSERT_THAT(fstatat(fd.get(), std::to_string(index).c_str(), &st, 0),
+                SyscallSucceeds());
+    EXPECT_EQ(st.st_mode, test.mode | S_IFCHR);
+    EXPECT_EQ(st.st_uid, test.uid);
+    EXPECT_EQ(st.st_gid, test.gid);
+  }
 }
 
 TEST(BasicPtyTest, OpenDevTTY) {
@@ -1028,6 +1056,60 @@ TEST_F(PtyTest, TCSETSFTermiosONLCR) {
   char buf[3] = {};
   ExpectReadable(master_, 2, buf);
   EXPECT_STREQ(buf, "\r\n");
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSFFlushesOnlyReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "input";
+  constexpr char kOutput[] = "output";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_THAT(WriteFd(replica_.get(), kOutput, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(master_.get(), sizeof(kOutput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  char buf[sizeof(kOutput)] = {};
+  ExpectFinished(replica_);
+  EXPECT_THAT(ReadFd(master_.get(), buf, sizeof(kOutput) - 1),
+              SyscallSucceedsWithValue(sizeof(kOutput) - 1));
+  EXPECT_EQ(memcmp(buf, kOutput, sizeof(kOutput) - 1), 0);
+  ExpectFinished(master_);
+}
+
+TEST_F(PtyTest, TCSETSFOnMasterFlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(master_.get(), TCGETS, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(master_.get(), TCSETSF, &t), SyscallSucceeds());
+
+  ExpectFinished(replica_);
+}
+
+TEST_F(PtyTest, TCSETSF2FlushesReplicaInput) {
+  DisableCanonicalAndEcho();
+
+  constexpr char kInput[] = "pending";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput) - 1),
+              SyscallSucceedsWithValue(sizeof(kInput) - 1));
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), sizeof(kInput) - 1));
+
+  struct kernel_termios2 t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS2, &t), SyscallSucceeds());
+  ASSERT_THAT(ioctl(replica_.get(), TCSETSF2, &t), SyscallSucceeds());
 
   ExpectFinished(replica_);
 }
@@ -2848,6 +2930,33 @@ TEST_F(JobControlTest, SigwinchOnWindowSizeChange) {
   ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
   ASSERT_TRUE(WIFEXITED(wstatus));
   EXPECT_EQ(WEXITSTATUS(wstatus), 42);
+}
+
+TEST_F(PtyTest, PositionalIO) {
+  char buf[32] = {};
+  struct iovec iov = {
+      .iov_base = buf,
+      .iov_len = sizeof(buf),
+  };
+
+  // Positional I/O on master should return ESPIPE.
+  EXPECT_THAT(pread(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(master_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(master_.get(), &iov, 1, 0), SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(master_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+
+  // Positional I/O on replica should return ESPIPE.
+  EXPECT_THAT(pread(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwrite(replica_.get(), buf, sizeof(buf), 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(preadv(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
+  EXPECT_THAT(pwritev(replica_.get(), &iov, 1, 0),
+              SyscallFailsWithErrno(ESPIPE));
 }
 
 }  // namespace

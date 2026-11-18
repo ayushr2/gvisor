@@ -30,7 +30,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/cleanup"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -1090,269 +1089,662 @@ func TestSplitFSCheckpointRestore(t *testing.T) {
 	}
 	conf.Overlay2.Set("all:dir=" + overlayDir)
 
-	dir, err := os.MkdirTemp(testutil.TmpDir(), "split-checkpoint-test")
+	for _, tc := range []struct {
+		name       string
+		splitPath  string
+		wantPrefix string
+	}{
+		{
+			name:       "DefaultFilePrefix",
+			splitPath:  "all-tmpfs",
+			wantPrefix: checkpointfiles.FSCheckpointDir,
+		},
+		{
+			name:       "DirectoryPrefix",
+			splitPath:  "custom/=all-tmpfs",
+			wantPrefix: "custom/",
+		},
+		{
+			name:       "ExplicitFilePrefix",
+			splitPath:  "custom=all-tmpfs",
+			wantPrefix: "custom",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "split-checkpoint-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+
+			// The file we will write to is in TmpDir() which is bind-mounted and overlay.
+			guestFile := filepath.Join(testutil.TmpDir(), "test_file_"+tc.name)
+			script := "echo hello > '" + guestFile + "'; while true; do sleep 1; done"
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			// Wait for container to start and write the file.
+			err = testutil.Poll(func() error {
+				ws, err := execute(conf, cont, "/bin/bash", "-c", fmt.Sprintf("[ -s %q ]", guestFile))
+				if err != nil {
+					return err
+				}
+				if ws.ExitStatus() != 0 {
+					return fmt.Errorf("bash -c '[ -s %q ]' returned %d", guestFile, ws.ExitStatus())
+				}
+				return nil
+			}, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Failed to wait for %q: %v", guestFile, err)
+			}
+
+			// Verify that the file does NOT exist on the host (because of overlay).
+			// guestFile path in host is the same because TmpDir() is bind-mounted to same path.
+			if _, err := os.Stat(guestFile); !os.IsNotExist(err) {
+				t.Errorf("File leaked to host! It should be in overlay only. Path: %q", guestFile)
+			}
+
+			// Checkpoint running container with SplitFSCheckpointPaths.
+			checkpointOpts := sandbox.CheckpointOpts{
+				SplitFSCheckpointPaths: []string{tc.splitPath},
+			}
+			if err := cont.Checkpoint(conf, dir, checkpointOpts); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+
+			// Verify that the expected directory (if directory-prefixed) and files are created.
+			checkFSCheckpointFiles(t, dir, tc.wantPrefix)
+
+			// Restore into a new container with different ID.
+			args2 := Args{
+				ID:                testutil.RandomContainerID(),
+				Spec:              spec,
+				BundleDir:         bundleDir,
+				CheckpointDirPath: dir,
+			}
+			cont2, err := New(conf, args2)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+
+			if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			// Verify that the file exists and contains "hello" in the restored container.
+			stdout, err := executeCombinedOutput(conf, cont2, nil, "/bin/cat", guestFile)
+			if err != nil {
+				t.Fatalf("failed to execute cat %q: %v", guestFile, err)
+			}
+			if got := strings.TrimSpace(string(stdout)); got != "hello" {
+				t.Errorf("unexpected content of %q: got %q, want %q", guestFile, got, "hello")
+			}
+
+			// Verify again that host file still does not exist.
+			if _, err := os.Stat(guestFile); !os.IsNotExist(err) {
+				t.Errorf("File leaked to host after restore! Path: %q", guestFile)
+			}
+		})
+	}
+}
+
+// allTmpfs selects all the sandbox internal filesystems for the split
+// filesystem checkpoint.
+const allTmpfs = "all-tmpfs"
+
+// fsCheckpointFiles are the base filenames that make up the filesystem part of
+// a split checkpoint image.
+var fsCheckpointFiles = []string{
+	checkpointfiles.FSCheckpointManifestFileName,
+	checkpointfiles.FSCheckpointMultiTarFileName,
+	checkpointfiles.PagesFileName,
+	checkpointfiles.PagesMetadataFileName,
+}
+
+func prefixedFSCheckpointFiles(prefix string) []string {
+	var res []string
+	for _, name := range fsCheckpointFiles {
+		res = append(res, checkpointfiles.PrefixFileName(prefix, name))
+	}
+	return res
+}
+
+// sentryCheckpointFiles are the files that make up the Sentry part of a
+// checkpoint image. They are saved at the root of the checkpoint directory.
+var sentryCheckpointFiles = []string{
+	checkpointfiles.StateFileName,
+	checkpointfiles.PagesFileName,
+	checkpointfiles.PagesMetadataFileName,
+}
+
+// makeTempDir creates a temporary directory that is removed when the test
+// finishes. The directory is world-accessible because the sandboxed
+// application may run as a different user than the test.
+func makeTempDir(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(testutil.TmpDir(), prefix)
 	if err != nil {
-		t.Fatalf("os.MkdirTemp failed: %v", err)
+		t.Fatalf("os.MkdirTemp(%q) failed: %v", prefix, err)
 	}
-	defer os.RemoveAll(dir)
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	if err := os.Chmod(dir, 0777); err != nil {
-		t.Fatalf("error chmoding file: %q, %v", dir, err)
+		t.Fatalf("error chmoding %q: %v", dir, err)
 	}
+	return dir
+}
 
-	// The file we will write to is in TmpDir() which is bind-mounted and overlay.
-	guestFile := filepath.Join(testutil.TmpDir(), "test_file")
-	script := "echo hello > '" + guestFile + "'; while true; do sleep 1; done"
-	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+// overlayTestConfig returns a test config with overlay enabled for all gofer
+// mounts, backed by a directory filestore. Split filesystem checkpoint only
+// saves filesystems that are internal to the sandbox, so mounts must be
+// overlaid for their content to be part of the checkpoint image.
+func overlayTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	conf := testutil.TestConfig(t)
+	conf.Overlay2.Set("all:dir=" + makeTempDir(t, "overlay-dir"))
+	return conf
+}
 
+// addTmpfsMountToContainer adds a bind mount of source at dest to
+// containerSpec, together with the mount hints on rootSpec that make the
+// sandbox back the mount with a container private tmpfs. name identifies the
+// mount in the annotations and must be unique within rootSpec.
+func addTmpfsMountToContainer(rootSpec, containerSpec *specs.Spec, name, source, dest string) {
+	containerSpec.Mounts = append(containerSpec.Mounts, specs.Mount{
+		Destination: dest,
+		Type:        "bind",
+		Source:      source,
+	})
+	if rootSpec.Annotations == nil {
+		rootSpec.Annotations = make(map[string]string)
+	}
+	prefix := "dev.gvisor.spec.mount." + name
+	rootSpec.Annotations[prefix+".source"] = source
+	rootSpec.Annotations[prefix+".type"] = "tmpfs"
+	rootSpec.Annotations[prefix+".share"] = "container"
+}
+
+// addTmpfsMount adds a bind mount of source at dest to spec, together with the
+// mount hints that make the sandbox back the mount with a container private
+// tmpfs. name identifies the mount in the annotations and must be unique
+// within the spec.
+func addTmpfsMount(spec *specs.Spec, name, source, dest string) {
+	addTmpfsMountToContainer(spec, spec, name, source, dest)
+}
+
+// setupBundle creates the root and bundle directories for spec and returns the
+// bundle directory. Note that it also sets conf.RootDir, so containers created
+// afterwards all share the same root directory.
+func setupBundle(t *testing.T, conf *config.Config, spec *specs.Spec) string {
+	t.Helper()
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 	if err != nil {
 		t.Fatalf("error setting up container: %v", err)
 	}
-	defer cleanup()
+	t.Cleanup(cleanup)
+	return bundleDir
+}
 
+// newContainer creates a container for spec with a random ID. The container is
+// destroyed when the test finishes. mutateArgs, if not nil, is called to adjust
+// the container arguments before the container is created.
+func newContainer(t *testing.T, conf *config.Config, spec *specs.Spec, bundleDir string, mutateArgs func(*Args)) *Container {
+	t.Helper()
 	args := Args{
 		ID:        testutil.RandomContainerID(),
 		Spec:      spec,
 		BundleDir: bundleDir,
 	}
+	if mutateArgs != nil {
+		mutateArgs(&args)
+	}
 	cont, err := New(conf, args)
 	if err != nil {
 		t.Fatalf("error creating container: %v", err)
 	}
-	defer cont.Destroy()
+	t.Cleanup(func() { cont.Destroy() })
+	return cont
+}
+
+// startContainer creates and starts a container for spec. See newContainer.
+func startContainer(t *testing.T, conf *config.Config, spec *specs.Spec, bundleDir string, mutateArgs func(*Args)) *Container {
+	t.Helper()
+	cont := newContainer(t, conf, spec, bundleDir, mutateArgs)
 	if err := cont.Start(conf); err != nil {
 		t.Fatalf("error starting container: %v", err)
 	}
+	return cont
+}
 
-	// Wait for container to start and write the file.
-	err = testutil.Poll(func() error {
-		ws, err := execute(conf, cont, "/bin/bash", "-c", fmt.Sprintf("[ -s %q ]", guestFile))
+// waitForGuestFiles waits until all paths exist and are not empty inside the
+// container.
+func waitForGuestFiles(t *testing.T, conf *config.Config, cont *Container, paths ...string) {
+	t.Helper()
+	tests := make([]string, 0, len(paths))
+	for _, path := range paths {
+		tests = append(tests, fmt.Sprintf("[ -s %q ]", path))
+	}
+	script := strings.Join(tests, " && ")
+	err := testutil.Poll(func() error {
+		ws, err := execute(conf, cont, "/bin/bash", "-c", script)
 		if err != nil {
 			return err
 		}
 		if ws.ExitStatus() != 0 {
-			return fmt.Errorf("bash -c '[ -s %q ]' returned %d", guestFile, ws.ExitStatus())
+			return fmt.Errorf("bash -c %q returned %d", script, ws.ExitStatus())
 		}
 		return nil
 	}, 5*time.Second)
 	if err != nil {
-		t.Fatalf("Failed to wait for %q: %v", guestFile, err)
-	}
-
-	// Verify that the file does NOT exist on the host (because of overlay).
-	// guestFile path in host is the same because TmpDir() is bind-mounted to same path.
-	if _, err := os.Stat(guestFile); !os.IsNotExist(err) {
-		t.Errorf("File leaked to host! It should be in overlay only. Path: %q", guestFile)
-	}
-
-	// Checkpoint running container with SplitFSCheckpoint: true.
-	checkpointOpts := sandbox.CheckpointOpts{
-		SplitFSCheckpointPaths: []checkpoint.ResourceID{{Path: "all-tmpfs"}},
-	}
-	if err := cont.Checkpoint(conf, dir, checkpointOpts); err != nil {
-		t.Fatalf("error checkpointing container: %v", err)
-	}
-
-	// Verify that fs/ directory is created and contains the expected files.
-	fsDir := filepath.Join(dir, checkpointfiles.FSCheckpointDir)
-	if _, err := os.Stat(fsDir); os.IsNotExist(err) {
-		t.Fatalf("fs directory was not created")
-	}
-	for _, name := range []string{
-		checkpointfiles.FSCheckpointManifestFileName,
-		checkpointfiles.FSCheckpointMultiTarFileName,
-		checkpointfiles.PagesFileName,
-		checkpointfiles.PagesMetadataFileName,
-	} {
-		p := filepath.Join(fsDir, name)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			t.Errorf("expected file %q was not created", p)
-		}
-	}
-
-	// Restore into a new container with different ID.
-	args2 := Args{
-		ID:                testutil.RandomContainerID(),
-		Spec:              spec,
-		BundleDir:         bundleDir,
-		CheckpointDirPath: dir,
-	}
-	cont2, err := New(conf, args2)
-	if err != nil {
-		t.Fatalf("error creating container: %v", err)
-	}
-	defer cont2.Destroy()
-
-	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
-		t.Fatalf("error restoring container: %v", err)
-	}
-
-	// Verify that the file exists and contains "hello" in the restored container.
-	stdout, err := executeCombinedOutput(conf, cont2, nil, "/bin/cat", guestFile)
-	if err != nil {
-		t.Fatalf("failed to execute cat %q: %v", guestFile, err)
-	}
-	if got := strings.TrimSpace(string(stdout)); got != "hello" {
-		t.Errorf("unexpected content of %q: got %q, want %q", guestFile, got, "hello")
-	}
-
-	// Verify again that host file still does not exist.
-	if _, err := os.Stat(guestFile); !os.IsNotExist(err) {
-		t.Errorf("File leaked to host after restore! Path: %q", guestFile)
+		t.Fatalf("failed to wait for %v: %v", paths, err)
 	}
 }
 
-func TestSplitFSCheckpointRestoreTmpfs(t *testing.T) {
+// checkGuestFile checks that path inside the container contains want.
+func checkGuestFile(t *testing.T, conf *config.Config, cont *Container, path, want string) {
+	t.Helper()
+	stdout, err := executeCombinedOutput(conf, cont, nil, "/bin/cat", path)
+	if err != nil {
+		t.Fatalf("failed to execute cat %q: %v", path, err)
+	}
+	if got := strings.TrimSpace(string(stdout)); got != want {
+		t.Errorf("unexpected content of %q: got %q, want %q", path, got, want)
+	}
+}
+
+// checkHostFilesAbsent checks that paths don't exist on the host. Files written
+// to a filesystem that is internal to the sandbox, e.g. overlay or tmpfs, must
+// never be visible to the host.
+func checkHostFilesAbsent(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("file leaked to host, it should only exist inside the sandbox: %q", path)
+		}
+	}
+}
+
+// checkFSCheckpointFiles checks that the filesystem part of a split checkpoint
+// image with the given prefix was created inside checkpointDir.
+func checkFSCheckpointFiles(t *testing.T, checkpointDir, prefix string) {
+	t.Helper()
+	if strings.HasSuffix(prefix, "/") {
+		fsDir := filepath.Join(checkpointDir, prefix)
+		if _, err := os.Stat(fsDir); err != nil {
+			t.Fatalf("filesystem checkpoint directory %q was not created: %v", fsDir, err)
+		}
+	}
+	for _, name := range prefixedFSCheckpointFiles(prefix) {
+		path := filepath.Join(checkpointDir, name)
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("expected file %q was not created: %v", path, err)
+		}
+	}
+}
+
+// copyCheckpointFiles copies names from srcDir into a new temporary directory
+// and returns it. Files that don't exist in srcDir are skipped. This is used to
+// break a checkpoint image apart into its filesystem and Sentry parts.
+func copyCheckpointFiles(t *testing.T, srcDir, dstPrefix string, names []string) string {
+	t.Helper()
+	dstDir := makeTempDir(t, dstPrefix)
+	for _, name := range names {
+		src := filepath.Join(srcDir, name)
+		data, err := os.ReadFile(src)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("failed to read %q: %v", src, err)
+		}
+		dst := filepath.Join(dstDir, name)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			t.Fatalf("failed to create directory %q: %v", filepath.Dir(dst), err)
+		}
+		if err := os.WriteFile(dst, data, 0644); err != nil {
+			t.Fatalf("failed to write %q: %v", dst, err)
+		}
+	}
+	return dstDir
+}
+
+// TestPartialSplitFSCheckpointRestore tests that only the mounts listed in
+// SplitFSCheckpointPaths are saved into the filesystem image, while the
+// remaining ones are saved with the Sentry state:
+//  1. Start a container with two tmpfs mounts and write a file to each of them.
+//  2. Checkpoint it, passing only the first mount to the split filesystem
+//     checkpoint. The second mount is saved as part of the Sentry state.
+//  3. Restore into a new container and check that both files were restored,
+//     i.e. that the two halves of the image are consistent with each other.
+func TestPartialSplitFSCheckpointRestore(t *testing.T) {
 	// We only run this test if checkpoint/restore is supported.
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint not supported")
 	}
 
-	conf := testutil.TestConfig(t)
+	const tmpfsMount1 = "/tmpfs-split"
+	const tmpfsMount2 = "/tmpfs-sentry"
 
-	// Enable overlay with a directory filestore for all gofer mounts.
-	overlayDir, err := os.MkdirTemp(testutil.TmpDir(), "overlay-dir")
-	if err != nil {
-		t.Fatalf("failed to create overlay directory: %v", err)
-	}
-	defer os.RemoveAll(overlayDir)
-	if err := os.Chmod(overlayDir, 0777); err != nil {
-		t.Fatalf("error chmoding overlay directory: %v", err)
-	}
-	conf.Overlay2.Set("all:dir=" + overlayDir)
-
-	dir, err := os.MkdirTemp(testutil.TmpDir(), "split-checkpoint-tmpfs-test")
-	if err != nil {
-		t.Fatalf("os.MkdirTemp failed: %v", err)
-	}
-	defer os.RemoveAll(dir)
-	if err := os.Chmod(dir, 0777); err != nil {
-		t.Fatalf("error chmoding file: %q, %v", dir, err)
-	}
-
-	// Create a host directory that will be bind-mounted and then turned into tmpfs via hint.
-	tmpfsSourceDir, err := os.MkdirTemp(testutil.TmpDir(), "tmpfs-source")
-	if err != nil {
-		t.Fatalf("failed to create tmpfs source directory: %v", err)
-	}
-	defer os.RemoveAll(tmpfsSourceDir)
-	if err := os.Chmod(tmpfsSourceDir, 0777); err != nil {
-		t.Fatalf("error chmoding tmpfs source directory: %v", err)
-	}
-
-	tmpfsMount := "/tmpfs-mount"
-	guestFile := filepath.Join(tmpfsMount, "test_file")
-	script := "echo hello > '" + guestFile + "'; while true; do sleep 1; done"
-	spec := testutil.NewSpecWithArgs("bash", "-c", script)
-
-	// Add bind mount.
-	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: tmpfsMount,
-		Type:        "bind",
-		Source:      tmpfsSourceDir,
-	})
-
-	// Add mount hints to turn it into tmpfs with private memory file (via overlay).
-	spec.Annotations = map[string]string{
-		"dev.gvisor.spec.mount.test-tmpfs.source": tmpfsSourceDir,
-		"dev.gvisor.spec.mount.test-tmpfs.type":   "tmpfs",
-		"dev.gvisor.spec.mount.test-tmpfs.share":  "container",
-	}
-
-	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
-	if err != nil {
-		t.Fatalf("error setting up container: %v", err)
-	}
-	defer cleanup()
-
-	args := Args{
-		ID:        testutil.RandomContainerID(),
-		Spec:      spec,
-		BundleDir: bundleDir,
-	}
-	cont, err := New(conf, args)
-	if err != nil {
-		t.Fatalf("error creating container: %v", err)
-	}
-	defer cont.Destroy()
-	if err := cont.Start(conf); err != nil {
-		t.Fatalf("error starting container: %v", err)
-	}
-
-	// Wait for container to start and write the file.
-	err = testutil.Poll(func() error {
-		ws, err := execute(conf, cont, "/bin/bash", "-c", fmt.Sprintf("[ -s %q ]", guestFile))
-		if err != nil {
-			return err
-		}
-		if ws.ExitStatus() != 0 {
-			return fmt.Errorf("bash -c '[ -s %q ]' returned %d", guestFile, ws.ExitStatus())
-		}
-		return nil
-	}, 5*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to wait for %q: %v", guestFile, err)
-	}
-
-	// Verify that the file does NOT exist on the host (because of tmpfs).
-	hostFile := filepath.Join(tmpfsSourceDir, "test_file")
-	if _, err := os.Stat(hostFile); !os.IsNotExist(err) {
-		t.Errorf("File leaked to host! It should be in tmpfs only. Path: %q", hostFile)
-	}
-
-	// Checkpoint running container with SplitFSCheckpoint: true.
-	checkpointOpts := sandbox.CheckpointOpts{
-		SplitFSCheckpointPaths: []checkpoint.ResourceID{{Path: "all-tmpfs"}},
-	}
-	if err := cont.Checkpoint(conf, dir, checkpointOpts); err != nil {
-		t.Fatalf("error checkpointing container: %v", err)
-	}
-
-	// Verify that fs/ directory is created and contains the expected files.
-	fsDir := filepath.Join(dir, checkpointfiles.FSCheckpointDir)
-	if _, err := os.Stat(fsDir); os.IsNotExist(err) {
-		t.Fatalf("fs directory was not created")
-	}
-	for _, name := range []string{
-		checkpointfiles.FSCheckpointManifestFileName,
-		checkpointfiles.FSCheckpointMultiTarFileName,
-		checkpointfiles.PagesFileName,
-		checkpointfiles.PagesMetadataFileName,
+	for _, tc := range []struct {
+		name       string
+		splitPath  string
+		wantPrefix string
+	}{
+		{
+			name:       "DirectoryPrefix",
+			splitPath:  "fs/=" + tmpfsMount1,
+			wantPrefix: checkpointfiles.FSCheckpointDir + "/",
+		},
+		{
+			name:       "FilePrefix",
+			splitPath:  tmpfsMount1,
+			wantPrefix: checkpointfiles.FSCheckpointDir,
+		},
 	} {
-		p := filepath.Join(fsDir, name)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			t.Errorf("expected file %q was not created", p)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			conf := overlayTestConfig(t)
+			checkpointDir := makeTempDir(t, "partial-split-checkpoint-test")
+
+			tmpfsSourceDir1 := makeTempDir(t, "tmpfs-source-1")
+			tmpfsSourceDir2 := makeTempDir(t, "tmpfs-source-2")
+			guestFile1 := filepath.Join(tmpfsMount1, "split_file")
+			guestFile2 := filepath.Join(tmpfsMount2, "sentry_file")
+			hostFile1 := filepath.Join(tmpfsSourceDir1, "split_file")
+			hostFile2 := filepath.Join(tmpfsSourceDir2, "sentry_file")
+
+			script := fmt.Sprintf("echo split_data > %q; echo sentry_data > %q; while true; do sleep 1; done", guestFile1, guestFile2)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			addTmpfsMount(spec, "tmpfs1", tmpfsSourceDir1, tmpfsMount1)
+			addTmpfsMount(spec, "tmpfs2", tmpfsSourceDir2, tmpfsMount2)
+			bundleDir := setupBundle(t, conf, spec)
+
+			cont := startContainer(t, conf, spec, bundleDir, nil)
+			waitForGuestFiles(t, conf, cont, guestFile1, guestFile2)
+			checkHostFilesAbsent(t, hostFile1, hostFile2)
+
+			// Checkpoint the running container with only tmpfsMount1 saved into the
+			// filesystem image.
+			checkpointOpts := sandbox.CheckpointOpts{
+				SplitFSCheckpointPaths: []string{tc.splitPath},
+			}
+			if err := cont.Checkpoint(conf, checkpointDir, checkpointOpts); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			checkFSCheckpointFiles(t, checkpointDir, tc.wantPrefix)
+
+			// Restore into a new container, relying on auto-detection of the split
+			// filesystem image.
+			cont2 := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+				args.CheckpointDirPath = checkpointDir
+			})
+			if err := cont2.Restore(conf, checkpointDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			checkGuestFile(t, conf, cont2, guestFile1, "split_data")
+			checkGuestFile(t, conf, cont2, guestFile2, "sentry_data")
+			checkHostFilesAbsent(t, hostFile1, hostFile2)
+		})
+	}
+}
+
+// TestSplitFSCheckpointRestoreOnlyFS tests that the filesystem image of a split
+// checkpoint can be consumed independently from the Sentry image. It
+// checkpoints a container with a tmpfs mount, copies the filesystem image into
+// a directory of its own, and then exercises the ways of restoring it:
+//   - StartFreshWithOnlyFS: a brand new container, running a different
+//     application and no Sentry image, is started with the filesystem image. It
+//     must see the files that the checkpointed container had written.
+//   - RestoreWithIsolatedFS: a container is restored from a Sentry image that
+//     doesn't contain the filesystem image, which is passed separately.
+//   - RestoreWithExplicitPrefixPath: a container is restored by passing
+//     <dir>/<prefix> explicitly to FSRestoreImagePath.
+func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
+	// We only run this test if checkpoint/restore is supported.
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
 	}
 
-	// Restore into a new container with different ID (relying on auto-detection of split filesystem).
-	args2 := Args{
-		ID:                testutil.RandomContainerID(),
-		Spec:              spec,
-		BundleDir:         bundleDir,
-		CheckpointDirPath: dir,
-	}
-	cont2, err := New(conf, args2)
-	if err != nil {
-		t.Fatalf("error creating container: %v", err)
-	}
-	defer cont2.Destroy()
+	for _, tc := range []struct {
+		name       string
+		splitPath  string
+		wantPrefix string
+	}{
+		{
+			name:       "DirectoryPrefix",
+			splitPath:  "fs/=" + allTmpfs,
+			wantPrefix: checkpointfiles.FSCheckpointDir + "/",
+		},
+		{
+			name:       "FilePrefix",
+			splitPath:  allTmpfs,
+			wantPrefix: checkpointfiles.FSCheckpointDir,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := overlayTestConfig(t)
+			checkpointDir := makeTempDir(t, "split-checkpoint-test")
 
-	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
-		t.Fatalf("error restoring container: %v", err)
+			// Create a host directory that is bind-mounted and then turned into a
+			// tmpfs through mount hints.
+			tmpfsSourceDir := makeTempDir(t, "tmpfs-source")
+			const tmpfsMount = "/tmpfs-mount"
+			guestFile := filepath.Join(tmpfsMount, "test_file")
+
+			script := fmt.Sprintf("echo hello > %q; while true; do sleep 1; done", guestFile)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			addTmpfsMount(spec, "test-tmpfs", tmpfsSourceDir, tmpfsMount)
+			bundleDir := setupBundle(t, conf, spec)
+
+			cont := startContainer(t, conf, spec, bundleDir, nil)
+			waitForGuestFiles(t, conf, cont, guestFile)
+
+			checkpointOpts := sandbox.CheckpointOpts{
+				SplitFSCheckpointPaths: []string{tc.splitPath},
+			}
+			if err := cont.Checkpoint(conf, checkpointDir, checkpointOpts); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+
+			// Copy the filesystem image into a directory that holds nothing else.
+			checkFSCheckpointFiles(t, checkpointDir, tc.wantPrefix)
+			onlyFSDir := copyCheckpointFiles(t, checkpointDir, "only-fs-dir", prefixedFSCheckpointFiles(tc.wantPrefix))
+
+			t.Run("StartFreshWithOnlyFS", func(t *testing.T) {
+				// The fresh container runs a different application and is started from
+				// scratch, i.e. no Sentry state is restored.
+				specFresh := testutil.NewSpecWithArgs("sleep", "100")
+				addTmpfsMount(specFresh, "test-tmpfs", tmpfsSourceDir, tmpfsMount)
+				bundleDirFresh := setupBundle(t, conf, specFresh)
+
+				contFresh := startContainer(t, conf, specFresh, bundleDirFresh, func(args *Args) {
+					args.FSRestoreImagePath = onlyFSDir
+				})
+				if err := contFresh.WaitFSRestore(); err != nil {
+					t.Fatalf("error waiting for filesystem restore: %v", err)
+				}
+
+				// The file written by the checkpointed container must be visible in the
+				// freshly started container.
+				checkGuestFile(t, conf, contFresh, guestFile, "hello")
+			})
+
+			t.Run("RestoreWithIsolatedFS", func(t *testing.T) {
+				// Copy the Sentry image into a directory that doesn't contain the
+				// filesystem image, which is passed to the container separately.
+				sentryOnlyDir := copyCheckpointFiles(t, checkpointDir, "sentry-only-dir", sentryCheckpointFiles)
+
+				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+					args.FSRestoreImagePath = onlyFSDir
+				})
+				if err := contRestore.Restore(conf, sentryOnlyDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+					t.Fatalf("error restoring container with isolated fs checkpoint: %v", err)
+				}
+
+				checkGuestFile(t, conf, contRestore, guestFile, "hello")
+			})
+
+			t.Run("RestoreWithExplicitPrefixPath", func(t *testing.T) {
+				sentryOnlyDir := copyCheckpointFiles(t, checkpointDir, "sentry-only-dir-explicit", sentryCheckpointFiles)
+
+				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+					args.FSRestoreImagePath = filepath.Join(onlyFSDir, tc.wantPrefix)
+				})
+				if err := contRestore.Restore(conf, sentryOnlyDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+					t.Fatalf("error restoring container with explicit <dir>/<prefix> fs checkpoint: %v", err)
+				}
+
+				checkGuestFile(t, conf, contRestore, guestFile, "hello")
+			})
+		})
+	}
+}
+
+// TestCheckpointRestoreTUN tests that a TUN device created inside a container
+// is preserved across multiple checkpoint (with resume) and restore cycles
+// along with its addresses and routes, and can be modified after each restore.
+func TestCheckpointRestoreTUN(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
 	}
 
-	// Verify that the file exists and contains "hello" in the restored container.
-	stdout, err := executeCombinedOutput(conf, cont2, nil, "/bin/cat", guestFile)
-	if err != nil {
-		t.Fatalf("failed to execute cat %q: %v", guestFile, err)
-	}
-	if got := strings.TrimSpace(string(stdout)); got != "hello" {
-		t.Errorf("unexpected content of %q: got %q, want %q", guestFile, got, "hello")
-	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			spec, _ := sleepSpecConf(t)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
 
-	// Verify again that host file still does not exist.
-	if _, err := os.Stat(hostFile); !os.IsNotExist(err) {
-		t.Errorf("File leaked to host after restore! Path: %q", hostFile)
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			// Create a persistent TUN interface and configure IPv4 and IPv6
+			// addresses before checkpointing.
+			setupCmd := "ip tuntap add dev tun0 mode tun && ip addr add 10.0.0.1/24 dev tun0 && ip addr add fd00::1/64 dev tun0 && ip link set tun0 up && ip addr show dev tun0"
+			out, err := executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", setupCmd)
+			if err != nil {
+				t.Fatalf("failed to set up tun0 before checkpoint: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), "10.0.0.1/24") || !strings.Contains(string(out), "fd00::1/64") {
+				t.Fatalf("unexpected tun0 addresses before checkpoint: %s", out)
+			}
+
+			checkpointDir := makeTempDir(t, "checkpoint-tun-test")
+			if err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{Resume: true}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+
+			// Verify tun0 is still intact in the resumed original container.
+			out, err = executeCombinedOutput(conf, cont, nil, "/bin/sh", "-c", "ip addr show dev tun0")
+			if err != nil {
+				t.Fatalf("failed to query tun0 after resume: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), "10.0.0.1/24") || !strings.Contains(string(out), "fd00::1/64") {
+				t.Fatalf("unexpected tun0 addresses after resume: %s", out)
+			}
+			cont.Destroy()
+
+			args2 := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont2, err := New(conf, args2)
+			if err != nil {
+				t.Fatalf("error creating restored container: %v", err)
+			}
+			defer cont2.Destroy()
+
+			if err := cont2.Restore(conf, checkpointDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			// Verify tun0 and its addresses are preserved after restore, and that
+			// addresses can be added/removed and new TUN devices can be created.
+			verifyCmd := "ip addr show dev tun0 && ip addr add 10.0.0.2/24 dev tun0 && ip addr del 10.0.0.1/24 dev tun0 && ip addr add fd00::2/64 dev tun0 && ip addr del fd00::1/64 dev tun0 && ip tuntap add dev tun1 mode tun && ip addr show dev tun0 && ip link show dev tun1"
+			out, err = executeCombinedOutput(conf, cont2, nil, "/bin/sh", "-c", verifyCmd)
+			if err != nil {
+				t.Fatalf("failed to verify tun0 after restore: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), "10.0.0.2/24") || !strings.Contains(string(out), "fd00::2/64") {
+				t.Fatalf("expected updated addresses on tun0 after restore, got: %s", out)
+			}
+
+			// Checkpoint the restored container a second time with Resume: true.
+			checkpointDir2 := makeTempDir(t, "checkpoint-tun-test-2")
+			if err := cont2.Checkpoint(conf, checkpointDir2, sandbox.CheckpointOpts{Resume: true}); err != nil {
+				t.Fatalf("error checkpointing restored container: %v", err)
+			}
+
+			// Verify tun0 and tun1 are still intact in cont2 after the second checkpoint+resume.
+			out, err = executeCombinedOutput(conf, cont2, nil, "/bin/sh", "-c", "ip addr show dev tun0 && ip link show dev tun1")
+			if err != nil {
+				t.Fatalf("failed to query tun0/tun1 after second resume: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), "10.0.0.2/24") || !strings.Contains(string(out), "fd00::2/64") {
+				t.Fatalf("unexpected tun0 addresses after second resume: %s", out)
+			}
+			cont2.Destroy()
+
+			args3 := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont3, err := New(conf, args3)
+			if err != nil {
+				t.Fatalf("error creating second restored container: %v", err)
+			}
+			defer cont3.Destroy()
+
+			if err := cont3.Restore(conf, checkpointDir2, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container a second time: %v", err)
+			}
+
+			// Verify tun0 and tun1 are preserved across the second restore and can be modified.
+			verifyCmd2 := "ip addr show dev tun0 && ip link show dev tun1 && ip addr add 10.0.0.3/24 dev tun0 && ip addr del 10.0.0.2/24 dev tun0 && ip addr add fd00::3/64 dev tun0 && ip addr del fd00::2/64 dev tun0 && ip addr add 10.0.1.1/24 dev tun1 && ip link set tun1 up && ip addr show dev tun0 && ip addr show dev tun1"
+			out, err = executeCombinedOutput(conf, cont3, nil, "/bin/sh", "-c", verifyCmd2)
+			if err != nil {
+				t.Fatalf("failed to verify tun0/tun1 after second restore: %v (output: %s)", err, out)
+			}
+			if !strings.Contains(string(out), "10.0.0.3/24") || !strings.Contains(string(out), "fd00::3/64") || !strings.Contains(string(out), "10.0.1.1/24") {
+				t.Fatalf("expected updated addresses on tun0/tun1 after second restore, got: %s", out)
+			}
+		})
 	}
 }

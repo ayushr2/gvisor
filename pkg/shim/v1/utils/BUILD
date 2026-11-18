@@ -13,6 +13,7 @@ go_library(
         "utils.go",
         "volumes.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/shim/v1/utils",
     visibility = [
         "//visibility:public",
     ],
@@ -31,10 +32,11 @@ go_test(
         "fuse_test.go",
         "volumes_test.go",
     ],
-    library = ":utils",
+    embed = [":utils"],
     deps = [
         "//runsc/specutils",
         "@com_github_mohae_deepcopy//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

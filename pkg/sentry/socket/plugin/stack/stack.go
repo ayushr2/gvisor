@@ -35,6 +35,9 @@ type Stack struct {
 	notifier *Notifier
 }
 
+// Socket creation, event registration/removal, and socket release must not
+// run while stack.notifier.mu is held. checklocks cannot express these
+// exclusions through a pointer-valued global.
 var stack *Stack
 
 // Init implements plugin.PluginStack.Init.
@@ -45,11 +48,6 @@ func (s *Stack) Init(args *plugin.InitStackArgs) error {
 	s.notifier = NewNotifier()
 	stack = s
 	return nil
-}
-
-// PreInit implements plugin.PluginStack.PreInit.
-func (s *Stack) PreInit(args *plugin.PreInitStackArgs) (string, []int, error) {
-	return cgo.PreInitStack(args.Pid)
 }
 
 // Interfaces implements inet.Stack.Interfaces.

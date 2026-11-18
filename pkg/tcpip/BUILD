@@ -42,7 +42,6 @@ go_library(
         "stdclock.go",
         "stdclock_state.go",
         "tcpip.go",
-        "tcpip_state.go",
         "timer.go",
     ],
     visibility = ["//visibility:public"],
@@ -127,7 +126,7 @@ go_test(
         "errors_test.go",
         "tcpip_test.go",
     ],
-    library = ":tcpip",
+    embed = [":tcpip"],
     deps = [
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",

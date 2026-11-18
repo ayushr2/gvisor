@@ -21,6 +21,7 @@ go_library(
         "//pkg/sentry/socket/netlink",
         "//pkg/sentry/socket/netlink/nlmsg",
         "//pkg/syserr",
+        "//pkg/tcpip/header",
     ],
 )
 
@@ -30,12 +31,13 @@ go_test(
     srcs = [
         "protocol_test.go",
     ],
-    library = ":route",
+    embed = [":route"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/marshal/primitive",
         "//pkg/sentry/inet",
         "//pkg/sentry/socket/netlink/nlmsg",
         "//pkg/syserr",
+        "//pkg/tcpip/header",
     ],
 )

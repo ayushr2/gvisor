@@ -45,7 +45,10 @@ syscall_test(
     test = "//test/syscalls/linux:alarm_test",
 )
 
+# TODO: b/405441712 - Re-enable save for this test once save and restore is
+# supported for syscall unpatching.
 syscall_test(
+    save = False,
     test = "//test/syscalls/linux:arch_prctl_test",
 )
 
@@ -560,6 +563,8 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_hostinet = True,
+    # Host-network sockets also need descriptors in the sentry.
+    args = ["--host-nofile=131072"],
     # Takes too long under gotsan to run.
     tags = ["nogotsan"],
     test = "//test/syscalls/linux:ping_socket_test",
@@ -570,6 +575,10 @@ syscall_test(
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:pipe_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:pointer_auth_test",
 )
 
 syscall_test(
@@ -1184,6 +1193,7 @@ syscall_test(
 syscall_test(
     add_fusefs = True,
     add_overlay = True,
+    requires_atime = True,
     test = "//test/syscalls/linux:stat_times_test",
 )
 
@@ -1196,6 +1206,7 @@ syscall_test(
 syscall_test(
     add_fusefs = True,
     add_overlay = True,
+    requires_atime = True,
     test = "//test/syscalls/linux:symlink_test",
 )
 
@@ -1260,10 +1271,6 @@ syscall_test(
 )
 
 syscall_test(
-    # TODO(b/318948806): tun.tunEndpoint is leaked.
-    leak_check = False,
-    # TODO(b/110961832): /dev/net/tun does not support S/R.
-    save = False,
     test = "//test/syscalls/linux:tuntap_test",
 )
 
