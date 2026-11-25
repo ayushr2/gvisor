@@ -1182,7 +1182,7 @@ func ParseMountOptions(opts []string) *vfs.MountOptions {
 	// Note: update mountHint.CheckCompatible when more options are added.
 	for _, o := range opts {
 		switch o {
-		case "ro":
+		case "ro", "rro":
 			mountOpts.ReadOnly = true
 		case "noatime":
 			mountOpts.Flags.NoATime = true
