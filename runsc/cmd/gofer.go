@@ -78,14 +78,8 @@ var goferUdsOpenCaps = &specs.LinuxCapabilities{
 // goferSyncFDs contains file descriptors that are used for synchronization
 // of the Gofer startup process against other processes.
 type goferSyncFDs struct {
-	// chrootFD is a file descriptor that is used to wait until container
-	// filesystem related setup is done. This setup involves creating files and
-	// mounts in the Gofer process's mount namespace and needs to be done before
-	// the Gofer chroots.
+	// chrootFD synchronizes filestore creation and NVIDIA hook mounts with runsc.
 	chrootFD int
-
-	// gpuFD synchronizes GPU setup at the prepared rootfs instead of chrootFD.
-	gpuFD int
 
 	// usernsFD is a file descriptor that is used to wait until
 	// user namespace ID mappings are established in the Gofer's userns.
@@ -203,7 +197,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	lisafsNeeded := lisafsNeededForDirectFSSuppression(spec, mountHints, rootfsHint, g.mountConfs)
 
-	g.syncFDs.syncChroot()
 	g.syncFDs.syncUsernsForRootless(uint32(g.uid), uint32(g.gid))
 
 	// Only pass the FD if the gofer will actually need it.
@@ -226,11 +219,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if spawnUnmounter {
 			umounter = openProcUmounter()
 		}
-		var configureGPU func() error
-		if g.syncFDs.gpuFD >= 0 {
-			configureGPU = g.syncFDs.configureGPU
-		}
-		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, configureGPU, containerID, g.bundleDir); err != nil {
+		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, g.syncFDs.syncChroot, containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
 	}
@@ -610,8 +599,7 @@ func makeRPCMountOpener(goferToHostRPC *urpc.Client) sandboxsetup.MountOpener {
 
 // setFlags sets sync FD flags on the given FlagSet.
 func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
-	f.IntVar(&g.chrootFD, "sync-chroot-fd", -1, "file descriptor that the gofer waits on until container filesystem setup is done")
-	f.IntVar(&g.gpuFD, "sync-gpu-fd", -1, "replaces --sync-chroot-fd for GPU setup. The gofer writes one byte when the rootfs is ready and reads one byte when runsc finishes GPU setup.")
+	f.IntVar(&g.chrootFD, "sync-chroot-fd", -1, "socket on which the gofer waits for filestore setup and signals rootfs readiness for the NVIDIA hook")
 	f.IntVar(&g.usernsFD, "sync-userns-fd", -1, "file descriptor the gofer waits on until userns mappings are set up")
 	f.IntVar(&g.procMountFD, "proc-mount-sync-fd", -1, "file descriptor that the gofer writes to when /proc isn't needed anymore and can be unmounted")
 }
@@ -621,7 +609,6 @@ func (g *goferSyncFDs) setFlags(f *flag.FlagSet) {
 func (g *goferSyncFDs) flags() map[string]string {
 	return map[string]string{
 		"sync-chroot-fd":     fmt.Sprintf("%d", g.chrootFD),
-		"sync-gpu-fd":        fmt.Sprintf("%d", g.gpuFD),
 		"sync-userns-fd":     fmt.Sprintf("%d", g.usernsFD),
 		"proc-mount-sync-fd": fmt.Sprintf("%d", g.procMountFD),
 	}
@@ -688,30 +675,23 @@ func (g *goferSyncFDs) syncUsernsForRootless(uid, gid uint32) {
 	g.usernsFD = -1
 }
 
-// configureGPU signals that the rootfs is ready for the NVIDIA toolkit and
-// waits for runsc to finish setting up the filesystem.
-func (g *goferSyncFDs) configureGPU() error {
-	f := os.NewFile(uintptr(g.gpuFD), "GPU setup sync FD")
-	defer f.Close()
-	g.gpuFD = -1
-	var ready [1]byte
-	if _, err := f.Write(ready[:]); err != nil {
-		return err
-	}
-	_, err := io.ReadFull(f, ready[:])
-	return err
-}
-
-// syncChroot waits on chrootFD to be closed.
-// Used for synchronization during container filesystem setup which is done
-// from the non-gofer process.
-// This function is a no-op if chrootFD is -1.
-func (g *goferSyncFDs) syncChroot() {
+// syncChroot signals when the rootfs is ready for the NVIDIA toolkit, if
+// requested, and waits for runsc to finish opening the filestores.
+func (g *goferSyncFDs) syncChroot(gpuHook bool) error {
 	if g.chrootFD < 0 {
-		return
+		return nil
 	}
-	if err := sandboxsetup.WaitForFD(g.chrootFD, "chroot sync FD"); err != nil {
-		util.Fatalf("failed to sync on chroot FD: %v", err)
-	}
+	f := os.NewFile(uintptr(g.chrootFD), "chroot sync FD")
+	defer f.Close()
 	g.chrootFD = -1
+	var msg [1]byte
+	if gpuHook {
+		if _, err := f.Write(msg[:]); err != nil {
+			return fmt.Errorf("signaling gofer rootfs readiness: %w", err)
+		}
+	}
+	if _, err := io.ReadFull(f, msg[:]); err != nil {
+		return fmt.Errorf("waiting for runsc to finish filesystem setup: %w", err)
+	}
+	return nil
 }

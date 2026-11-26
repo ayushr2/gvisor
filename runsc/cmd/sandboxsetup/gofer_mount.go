@@ -105,10 +105,11 @@ func WriteMounts(mountsFD int, mounts []specutils.ResolvedMount) error {
 // spec.Root.Path with all the bind-mounts in place.
 //
 // To satisfy all of these requirements, this is the approach we take:
-//  1. We create a new tmpfs mount at /proc/fs and bind-mount host /proc at
+//  1. Create a staging tmpfs at /proc/fs and bind-mount host /proc at
 //     /proc/fs/proc.
-//  2. Bind-mount the rootfs at /proc/fs/root, or at spec.Root.Path if GPU
-//     setup or createContainer hooks need it there. Configure GPUs if requested.
+//  2. Bind the lisafs root at /proc/fs/root, or at spec.Root.Path if the
+//     NVIDIA toolkit or createContainer hooks need it there. Wait for runsc
+//     to configure the toolkit if requested and finish opening filestores.
 //  3. With createContainer hooks, install the OCI mounts at spec.Root.Path,
 //     run the hooks, then copy the tree to /proc/fs/root. Otherwise, copy any
 //     GPU-prepared root to /proc/fs/root before installing the OCI mounts there.
@@ -124,11 +125,12 @@ func WriteMounts(mountsFD int, mounts []specutils.ResolvedMount) error {
 // mountConfs must be indexed such that mountConfs[0] is the root filesystem
 // configuration and subsequent entries correspond to spec mounts with
 // mount configs.
-func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.GoferMountConf, devIoFD int, mountOpener MountOpener, configureGPU func() error, containerID string, bundleDir string) error {
+func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.GoferMountConf, devIoFD int, mountOpener MountOpener, syncChroot func(gpuHook bool) error, containerID string, bundleDir string) error {
 	rootfsConf := mountConfs[0]
 	hasCreateContainerHooks := spec.Hooks != nil && len(spec.Hooks.CreateContainer) > 0
 	runCreateHooks := rootfsConf.ShouldUseLisafs() && hasCreateContainerHooks
-	needsSpecRoot := rootfsConf.ShouldUseLisafs() && (hasCreateContainerHooks || configureGPU != nil)
+	gpuHook := rootfsConf.ShouldUseLisafs() && specutils.GPUFunctionalityRequestedViaHook(spec, conf)
+	needsSpecRoot := runCreateHooks || gpuHook
 	if needsSpecRoot {
 		root, err := filepath.EvalSymlinks(spec.Root.Path)
 		if err != nil {
@@ -190,6 +192,14 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 		}
 		goferRootFs = "/proc/fs/root"
 		procPath = "/proc/fs/proc"
+	} else if rootfsConf.ShouldUseLisafs() && !gpuHook && syncChroot != nil {
+		// Without staging, the root is bound over itself. Let runsc open
+		// writable filestores on the original mount so the new bind can
+		// later be remounted read-only.
+		if err := syncChroot(false); err != nil {
+			return err
+		}
+		syncChroot = nil
 	}
 
 	// Prefer the named staging path. If spec.Root.Path is "/", a self-bind
@@ -207,10 +217,10 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 		if err := setGoferTreeAttrs(unix.AT_FDCWD, root, conf.CharacterDevicePolicy, false); err != nil {
 			return fmt.Errorf("setting rootfs mount attributes: %w", err)
 		}
-		if configureGPU != nil {
-			if err := configureGPU(); err != nil {
-				return fmt.Errorf("configuring GPU mounts: %w", err)
-			}
+	}
+	if syncChroot != nil {
+		if err := syncChroot(gpuHook); err != nil {
+			return err
 		}
 	}
 

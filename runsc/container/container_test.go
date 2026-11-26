@@ -5828,6 +5828,7 @@ func TestRootfsEROFS(t *testing.T) {
 	spec.Annotations[sentryapi.RootfsPrefix+"overlay"] = config.NoOverlay.String()
 
 	conf := testutil.TestConfig(t)
+	conf.Overlay2.Set("all:self")
 	mountDir, err := os.MkdirTemp(testutil.TmpDir(), "mount_dir")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp() failed: %v", err)
@@ -5838,7 +5839,7 @@ func TestRootfsEROFS(t *testing.T) {
 		// Case 1: EROFS rootfs without any other gofer mount.
 		nil,
 
-		// Case 2: EROFS rootfs with a LISAFS backed gofer mount.
+		// Case 2: EROFS rootfs with a lisafs mount that needs a filestore.
 		{
 			{
 				Type:        "bind",

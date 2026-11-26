@@ -2062,19 +2062,21 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		}
 	}
 
-	// Create synchronization FD for chroot.
+	// runsc and the gofer share this socket for two parts of startup.
+	//
+	//   - Only the NVIDIA hook needs a readiness signal. The gofer sends it
+	//     when the toolkit can mount driver libraries and devices at
+	//     spec.Root.Path.
+	//   - runsc opens overlay filestores through /proc/<gofer-pid>/root while
+	//     the mount sources are reachable and writable. It then releases the
+	//     gofer to install the OCI mounts and call pivot_root(2).
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	chrootSyncSandEnd := os.NewFile(uintptr(fds[0]), "chroot sync runsc FD")
-	chrootSyncGoferEnd := os.NewFile(uintptr(fds[1]), "chroot sync gofer FD")
-	syncFlag := "sync-chroot-fd"
-	if configureGPU {
-		syncFlag = "sync-gpu-fd"
-	}
-	donations.DonateAndClose(syncFlag, chrootSyncGoferEnd)
-	defer chrootSyncSandEnd.Close()
+	chrootSync := os.NewFile(uintptr(fds[0]), "chroot sync runsc FD")
+	defer chrootSync.Close()
+	donations.DonateAndClose("sync-chroot-fd", os.NewFile(uintptr(fds[1]), "chroot sync gofer FD"))
 
 	donations.Transfer(cmd, nextFD)
 
@@ -2092,6 +2094,8 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 	log.Infof("Gofer started, PID: %d", cmd.Process.Pid)
 	c.GoferPid.Store(cmd.Process.Pid)
 	c.goferIsChild = true
+	// Close runsc's copies of the gofer endpoints so peers can observe its exit.
+	donations.Close()
 	if c.GoferPidIdentity, err = specutils.ProcessIdentity(cmd.Process.Pid); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -2107,40 +2111,31 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		}
 	}
 
-	// Set up and synchronize rootless mode userns mappings.
+	// Install the rootless gofer's user namespace mappings.
 	if setUserMappings {
 		if err := sandbox.SetUserMappings(c.Spec, cmd.Process.Pid); err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
+	if usernsSync != nil {
+		usernsSync.Close()
+	}
 
+	var msg [1]byte
 	if configureGPU {
-		// The gofer needs its user namespace mappings to prepare the rootfs.
-		if usernsSync != nil {
-			usernsSync.Close()
-		}
-		// Close our copy of the peer so a gofer setup error unblocks the read.
-		chrootSyncGoferEnd.Close()
-		var ready [1]byte
-		if _, err := io.ReadFull(chrootSyncSandEnd, ready[:]); err != nil {
+		if _, err := io.ReadFull(chrootSync, msg[:]); err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("waiting for gofer rootfs: %w", err)
 		}
 		if err := nvproxySetup(c.Spec, conf, c.GoferPid.Load()); err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("setting up nvproxy for gofer: %w", err)
 		}
 	}
-
-	// Create gofer filestore files with the Gofer's mount namespaces while
-	// chrootSyncSandEnd is still open.
 	goferFilestores, err = c.createGoferFilestores(conf.GetOverlay2(), mountHints)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("creating gofer filestore files: %w", err)
 	}
-
-	if configureGPU {
-		if _, err := chrootSyncSandEnd.Write([]byte{1}); err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("releasing gofer after GPU setup: %w", err)
-		}
+	if _, err := chrootSync.Write(msg[:]); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("releasing gofer after filestore setup: %w", err)
 	}
 	cu.Release()
 	return sandEnds, goferFilestores, devSandEnd, mountsSand, nil
