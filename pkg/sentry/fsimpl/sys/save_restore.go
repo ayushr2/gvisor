@@ -69,12 +69,15 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 		"cpu":  cpuDir(ctx, fs, creds),
 		"node": fs.buildNUMATopology(ctx, creds, kernel.KernelFromContext(ctx).ApplicationCores()),
 	}
+	virtualSub := make(map[string]kernfs.Inode)
+	fs.addDMIDirs(ctx, creds, classSub, virtualSub)
+	fs.addNetDirs(ctx, creds, nil, classSub, virtualSub)
 	devicesSub := map[string]kernfs.Inode{
-		"system": fs.newDir(ctx, creds, defaultSysDirMode, systemSub),
+		"system":  fs.newDir(ctx, creds, defaultSysDirMode, systemSub),
+		"virtual": fs.newDir(ctx, creds, defaultSysDirMode, virtualSub),
 	}
 	busSub := make(map[string]kernfs.Inode)
 	kernelSub := kernelDir(ctx, fs, creds)
-	fs.addDMIDirs(ctx, creds, classSub, devicesSub)
 
 	sysDevicesPath := path.Join(fs.testSysfsPathPrefix, sysDevicesMainPath)
 	iommuGroupsPath := path.Join(fs.testSysfsPathPrefix, iommuGroupSysPath)

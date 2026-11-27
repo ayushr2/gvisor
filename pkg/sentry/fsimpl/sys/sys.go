@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -85,6 +86,16 @@ type filesystem struct {
 	// empty, the DMI directories are not created.
 	productName string
 	root        *dir
+
+	// netns is the network namespace whose interfaces are in class/net and
+	// devices/virtual/net. As in Linux, it is the network namespace of the
+	// task that mounts the filesystem. netns is nil if there is no network
+	// namespace. Immutable.
+	netns *inet.Namespace
+
+	// staticNetDevs contains the names of the static children of class/net.
+	// Network interfaces of netns with these names are not shown.
+	staticNetDevs map[string]struct{}
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -140,6 +151,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"node": fs.buildNUMATopology(ctx, creds, k.ApplicationCores()),
 	}
 
+	classNet := make(map[string]kernfs.Inode)   // /sys/class/net
 	busSub := make(map[string]kernfs.Inode)     // /sys/bus
 	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
 	pciDrivers := make(map[string]kernfs.Inode) // /sys/bus/pci/drivers
@@ -207,6 +219,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for name, sub := range rdmaDirs.class {
 				classSub[name] = sub
 			}
+			classNet = rdmaDirs.classNet
 			for name, sub := range rdmaDirs.busPCIDevices {
 				pciDevices[name] = sub
 			}
@@ -227,7 +240,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	devicesSub["system"] = fs.newDir(ctx, creds, defaultSysDirMode, systemSub)
 
-	fs.addDMIDirs(ctx, creds, classSub, devicesSub)
+	virtualSub := make(map[string]kernfs.Inode) // /sys/devices/virtual
+	fs.addDMIDirs(ctx, creds, classSub, virtualSub)
+	fs.addNetDirs(ctx, creds, classNet, classSub, virtualSub)
+	devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, virtualSub)
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"bus":   fs.newDir(ctx, creds, defaultSysDirMode, busSub),
@@ -244,14 +260,19 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
 	fs.root = root.(*dir)
+	if t := kernel.TaskFromContext(ctx); t != nil {
+		fs.netns = t.GetNetworkNamespace()
+	} else if fs.netns = k.RootNetworkNamespace(); fs.netns != nil {
+		fs.netns.IncRef()
+	}
 	var rootD kernfs.Dentry
 	rootD.InitRoot(&fs.Filesystem, root)
 	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
 }
 
-// addDMIDirs adds the DMI entries to classSub (/sys/class) and devicesSub
-// (/sys/devices) if fs.productName is set.
-func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, classSub, devicesSub map[string]kernfs.Inode) {
+// addDMIDirs adds the DMI entries to classSub (/sys/class) and virtualSub
+// (/sys/devices/virtual) if fs.productName is set.
+func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, classSub, virtualSub map[string]kernfs.Inode) {
 	if len(fs.productName) == 0 {
 		return
 	}
@@ -259,11 +280,9 @@ func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, c
 	classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
 	})
-	devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-		"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fs.productName+"\n"),
-			}),
+	virtualSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fs.productName+"\n"),
 		}),
 	})
 }
@@ -414,6 +433,9 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)
+	if fs.netns != nil {
+		fs.netns.DecRef(ctx)
+	}
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.

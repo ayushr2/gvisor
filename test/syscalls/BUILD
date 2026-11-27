@@ -1266,6 +1266,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
+    test = "//test/syscalls/linux:sysfs_net_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:sysinfo_test",
 )
 

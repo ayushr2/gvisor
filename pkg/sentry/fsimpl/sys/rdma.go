@@ -57,8 +57,10 @@ type rdmaSysfsDirs struct {
 	// to be added under /sys/devices.
 	devices map[string]kernfs.Inode
 	// class maps class-directory names (infiniband, infiniband_verbs,
-	// net, pci_bus) to symlink-farm directories for /sys/class.
+	// pci_bus) to symlink-farm directories for /sys/class.
 	class map[string]kernfs.Inode
+	// classNet contains the /sys/class/net symlinks.
+	classNet map[string]kernfs.Inode
 	// busPCIDevices contains the /sys/bus/pci/devices symlinks.
 	busPCIDevices map[string]kernfs.Inode
 	// busPCIDrivers maps a kernel driver name to its
@@ -274,9 +276,7 @@ func (fs *filesystem) newRDMASysfs(ctx context.Context, creds *auth.Credentials,
 		uverbsEntries["abi_version"] = fs.newStaticFile(ctx, creds, defaultSysMode, snap.VerbsABIVersion)
 	}
 	out.class["infiniband_verbs"] = fs.newDir(ctx, creds, defaultSysDirMode, uverbsEntries)
-	if len(classNet) > 0 {
-		out.class["net"] = fs.newDir(ctx, creds, defaultSysDirMode, fs.symlinkFarm(ctx, creds, classNet))
-	}
+	out.classNet = fs.symlinkFarm(ctx, creds, classNet)
 	if len(classPCIBus) > 0 {
 		out.class["pci_bus"] = fs.newDir(ctx, creds, defaultSysDirMode, fs.symlinkFarm(ctx, creds, classPCIBus))
 	}

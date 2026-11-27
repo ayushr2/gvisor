@@ -67,6 +67,10 @@ func getInterfaces() (map[int32]inet.Interface, error) {
 				inetIF.Addr = attr.Value
 			case unix.IFLA_IFNAME:
 				inetIF.Name = string(attr.Value[:len(attr.Value)-1])
+			case unix.IFLA_MTU:
+				if len(attr.Value) >= 4 {
+					inetIF.MTU = hostarch.ByteOrder.Uint32(attr.Value)
+				}
 			}
 		}
 		ifs[ifinfo.Index] = inetIF
